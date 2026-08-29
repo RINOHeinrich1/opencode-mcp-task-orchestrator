@@ -179,16 +179,15 @@ server.registerTool("project_delete", {
 
 // === task_get ===
 server.registerTool("task_get", {
-  description: "Renvoie le détail d'une tâche (contexte + exécutions + worktree réservé).",
+  description: "Renvoie le détail d'une tâche (contexte + exécutions + participants).",
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
     const task = await getTask(taskId);
     if (!task) return err(`tâche inconnue : ${taskId}`);
     const executions = await getExecutions(taskId);
-    const worktree = await listWorktrees(task.project).find((w) => w.taskId === taskId) || null;
     const participants = await listParticipants(taskId);
-    return text(JSON.stringify({ task, executions, worktree, participants }, null, 2));
+    return text(JSON.stringify({ task, executions, participants }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -419,7 +418,7 @@ server.registerTool("lease_expired", {
 }, async ({ project }) => {
   try {
     const now = Date.now();
-    const expired = await listWorktrees(project).filter(
+    const expired = (await listWorktrees(project)).filter(
       (w) => ["RESERVED", "IN_USE"].includes(w.status) && w.leaseUntil && new Date(w.leaseUntil).getTime() < now,
     );
     return text(JSON.stringify({ count: expired.length, expired }, null, 2));
