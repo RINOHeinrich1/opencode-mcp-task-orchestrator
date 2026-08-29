@@ -164,6 +164,24 @@ CREATE TABLE IF NOT EXISTS plan_executions (
 );
 CREATE INDEX IF NOT EXISTS idx_plan_executions_plan ON plan_executions(plan_id);
 
+-- Commits rattachés à un plan (sous-tâche) — trace APPEND-ONLY.
+-- Tous les commits sont conservés, y compris ceux d'un rework (une sous-tâche
+-- peut produire plusieurs commits). Chaque commit décrit les fichiers touchés
+-- (`files` = JSON array de {path, status, additions, deletions, diff}).
+CREATE TABLE IF NOT EXISTS plan_commits (
+  id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  plan_id       TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  execution_id  TEXT,
+  branch        TEXT,
+  sha           TEXT NOT NULL,
+  message       TEXT,
+  author        TEXT,
+  committed_at  TEXT,
+  files         TEXT NOT NULL DEFAULT '[]',
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plan_commits_plan ON plan_commits(plan_id, id);
+
 CREATE TABLE IF NOT EXISTS plan_steps (
   plan_id    TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
   step_id    TEXT NOT NULL,

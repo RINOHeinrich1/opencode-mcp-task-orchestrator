@@ -649,6 +649,7 @@ export async function deleteTask(taskId) {
     await client.query("DELETE FROM plan_steps WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
     await client.query("DELETE FROM plan_incidents WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
     await client.query("DELETE FROM plan_inconsistencies WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
+    await client.query("DELETE FROM plan_commits WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
     await client.query("DELETE FROM plans WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM tasks WHERE id = $1", [taskId]);
   });
@@ -761,6 +762,63 @@ export async function applyPlanTransition({ planId, to, by, note }) {
     [to, note ?? null, nowIso(), exec.id],
   );
   return { ok: true, planId, from, to, planExecution: await getPlanExecution(planId) };
+}
+
+// --- Commits rattachés à un plan (trace append-only) -------------------------
+function rowToPlanCommit(r) {
+  if (!r) return null;
+  let files = [];
+  try { files = r.files ? JSON.parse(r.files) : []; } catch { files = []; }
+  return {
+    id: r.id,
+    planId: r.plan_id,
+    executionId: r.execution_id,
+    branch: r.branch,
+    sha: r.sha,
+    message: r.message,
+    author: r.author,
+    committedAt: r.committed_at,
+    files,
+    createdAt: r.created_at,
+  };
+}
+
+export async function addPlanCommit({ planId, executionId, branch, sha, message, author, committedAt, files }) {
+  await ensureSchema();
+  await pool().query(
+    `INSERT INTO plan_commits (plan_id, execution_id, branch, sha, message, author, committed_at, files, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [
+      planId,
+      executionId ?? null,
+      branch ?? null,
+      sha,
+      message ?? null,
+      author ?? null,
+      committedAt ?? null,
+      JSON.stringify(Array.isArray(files) ? files : []),
+      nowIso(),
+    ],
+  );
+  return listPlanCommits(planId);
+}
+
+export async function listPlanCommits(planId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM plan_commits WHERE plan_id = $1 ORDER BY id ASC", [planId]);
+  return res.rows.map(rowToPlanCommit);
+}
+
+// Commits de tous les plans d'une tâche (jointure plans → plan_commits).
+export async function listTaskPlanCommits(taskId) {
+  await ensureSchema();
+  const res = await pool().query(
+    `SELECT pc.* FROM plan_commits pc
+     JOIN plans p ON p.id = pc.plan_id
+     WHERE p.task_id = $1 ORDER BY pc.id ASC`,
+    [taskId],
+  );
+  return res.rows.map(rowToPlanCommit);
 }
 
 // --- Résolution de décision (source de vérité unique) ------------------------

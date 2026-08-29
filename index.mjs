@@ -55,6 +55,9 @@ import {
   createPlanExecution,
   getPlanExecution,
   listPlanExecutions,
+  addPlanCommit,
+  listPlanCommits,
+  listTaskPlanCommits,
 } from "./db.mjs";
 
 const MAIL_SCRIPT = join(homedir(), ".config", "opencode", "scripts", "send-mail.mjs");
@@ -192,7 +195,8 @@ server.registerTool("task_get", {
     const executions = await getExecutions(taskId);
     const participants = await listParticipants(taskId);
     const planExecutions = await listPlanExecutions(taskId);
-    return text(JSON.stringify({ task, executions, participants, planExecutions }, null, 2));
+    const planCommits = await listTaskPlanCommits(taskId);
+    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -591,6 +595,52 @@ server.registerTool("plan_execution_create", {
   try {
     const pe = await createPlanExecution(planId);
     return text(JSON.stringify({ ok: true, planExecution: pe }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === plan_commit_add ===
+server.registerTool("plan_commit_add", {
+  description:
+    "Enregistre un commit dans la trace append-only d'un plan (sous-tâche). Tous les commits sont conservés (y compris ceux des reworks : une sous-tâche peut produire plusieurs commits). Chaque commit décrit les fichiers touchés (path, status added|modified|deleted|renamed, additions, deletions, diff).",
+  inputSchema: {
+    planId: z.string().describe("Identifiant du plan (sous-tâche)."),
+    sha: z.string().describe("SHA du commit (complet ou court)."),
+    branch: z.string().optional().describe("Branche sur laquelle le commit a été créé."),
+    message: z.string().optional().describe("Message du commit."),
+    author: z.string().optional(),
+    committedAt: z.string().optional().describe("Date ISO 8601 du commit."),
+    files: z.array(z.object({
+      path: z.string().describe("Chemin du fichier touché."),
+      status: z.string().describe("added | modified | deleted | renamed"),
+      additions: z.number().int().optional(),
+      deletions: z.number().int().optional(),
+      diff: z.string().optional().describe("Diff unifié du fichier (patch)."),
+    })).optional(),
+    taskId: z.string().optional(),
+    executionId: z.string().optional(),
+  },
+}, async ({ planId, sha, branch, message, author, committedAt, files, taskId, executionId }) => {
+  try {
+    if (!planId) return err("planId requis");
+    if (!sha) return err("sha requis");
+    const commits = await addPlanCommit({ planId, executionId, branch, sha, message, author, committedAt, files });
+    return text(JSON.stringify({ ok: true, planId, count: commits.length, commits }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === plan_commits_list ===
+server.registerTool("plan_commits_list", {
+  description:
+    "Liste les commits rattachés à un plan (sous-tâche), dans l'ordre d'ajout. Tous les commits sont conservés (y compris ceux des reworks).",
+  inputSchema: { planId: z.string() },
+}, async ({ planId }) => {
+  try {
+    const commits = await listPlanCommits(planId);
+    return text(JSON.stringify({ count: commits.length, commits }, null, 2));
   } catch (e) {
     return err(e.message);
   }
