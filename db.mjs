@@ -8,7 +8,7 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadGlobalEnv } from "../../scripts/load-env.mjs";
-import { canTransition } from "./statemachine.mjs";
+import { canTaskTransition, canPlanTransition } from "./statemachine.mjs";
 
 const { Pool } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -387,9 +387,7 @@ export async function listDeployments(taskId) {
 
 // --- Conflits de scope ----------------------------------------------------
 const ACTIVE_STATUSES = [
-  "started", "planning", "awaiting_validation", "planned", "in_progress", "validating",
-  "review", "approved", "rejected", "rework", "merge_pending", "merged", "deploy_pending", "deploying",
-  "deployed", "blocked",
+  "started", "planning", "awaiting_validation", "planned", "in_progress", "blocked",
 ];
 
 function normalizeScopePath(p) {
@@ -755,7 +753,7 @@ export async function applyPlanTransition({ planId, to, by, note }) {
     exec = await getPlanExecution(planId);
   }
   const from = exec.status;
-  if (!canTransition(from, to)) {
+  if (!canPlanTransition(from, to)) {
     throw new Error(`transition refusée (plan ${planId}) : ${from} -> ${to}`);
   }
   await pool().query(
@@ -766,10 +764,9 @@ export async function applyPlanTransition({ planId, to, by, note }) {
 }
 
 // --- Résolution de décision (source de vérité unique) ------------------------
-// Décision n°1 (revue) : une décision validation/review est résolue PAR SOUS-TÂCHE
-// (plan), indépendamment des autres. La transition d'exécution (shared) n'a lieu
-// que lorsque TOUTES les décisions du même kind sont résolues → agrégation :
-// toutes approuvées → `approved`, sinon `rejected`.
+// Décision résolue PAR SOUS-TÂCHE (plan), indépendamment des autres :
+//  - validation : agrégation au niveau TÂCHE → `planned` (toutes acceptées) / `aborted` (au moins un rejet) ;
+//  - review : transition du PLAN (`review` → `approved`/`rejected`), pas de transition tâche.
 export async function resolveDecisionAndTransition({ decisionId, status, resolution, by }) {
   await ensureSchema();
   const decision = await getDecision(decisionId);
@@ -790,9 +787,6 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
 
   const ts = nowIso();
   const by_ = by || "human";
-  let transitioned = false;
-  let from = null;
-  let to = null;
 
   await withTransaction(async (client) => {
     // Optimistic lock.
@@ -802,61 +796,47 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
     );
     if (lockRes.rowCount === 0) throw new Error(`conflit d'écriture (version) sur ${decision.taskId}`);
 
-    // 1. Résolution de la décision.
+    // Résolution de la décision.
     await client.query(
       "UPDATE decisions SET status = $1, resolved_at = $2, resolution = $3 WHERE decision_id = $4",
       [status, ts, resolution ?? null, decisionId],
     );
 
-    // 2. Événement CLOSED (remarques de la décision).
+    // Événement CLOSED (remarques).
     await client.query(
       "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'CLOSED',$4,$5)",
       [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by_, JSON.stringify({ kind: decision.kind, decisionId, status, remarks: resolution ?? null, at: ts })],
     );
-
-    // 3. Agrégation : transition d'exécution si plus aucune décision du même kind en attente.
-    const remainingRes = await client.query(
-      "SELECT COUNT(*) AS n FROM decisions WHERE task_id = $1 AND kind = $2 AND status = 'awaiting'",
-      [decision.taskId, decision.kind],
-    );
-    if (Number(remainingRes.rows[0].n) === 0) {
-      const rejectedRes = await client.query(
-        "SELECT COUNT(*) AS n FROM decisions WHERE task_id = $1 AND kind = $2 AND status = 'rejected'",
-        [decision.taskId, decision.kind],
-      );
-      const execRes = await client.query(
-        "SELECT * FROM executions WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
-        [decision.taskId],
-      );
-      const exec = execRes.rows[0];
-      if (exec) {
-        from = exec.status;
-        to = Number(rejectedRes.rows[0].n) > 0 ? "rejected" : "approved";
-        if (canTransition(from, to)) {
-          await client.query(
-            "UPDATE executions SET status = $1, checkpoint = $2, updated_at = $3 WHERE execution_id = $4",
-            [to, null, ts, exec.execution_id],
-          );
-          await client.query(
-            "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'TRANSITION',$4,$5)",
-            [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by_, JSON.stringify({ from, to, note: null })],
-          );
-          transitioned = true;
-        }
-      }
-    }
   });
 
-  // Transition du plan (sous-tâche) : review → approved/rejected, indépendamment
-  // de la tâche. La validation reste au niveau tâche (agrégation ci-dessus).
+  // Validation : agrégation au niveau TÂCHE → planned (toutes acceptées) / aborted (au moins un rejet).
+  if (decision.kind === "validation") {
+    const remaining = await pool().query(
+      "SELECT COUNT(*) AS n FROM decisions WHERE task_id = $1 AND kind = 'validation' AND status = 'awaiting'",
+      [decision.taskId],
+    );
+    if (Number(remaining.rows[0].n) === 0) {
+      const rejected = await pool().query(
+        "SELECT COUNT(*) AS n FROM decisions WHERE task_id = $1 AND kind = 'validation' AND status = 'rejected'",
+        [decision.taskId],
+      );
+      const to = Number(rejected.rows[0].n) > 0 ? "aborted" : "planned";
+      const exec = await getCurrentExecution(decision.taskId);
+      if (exec && canTaskTransition(exec.status, to)) {
+        await applyTransition({ taskId: decision.taskId, to, by: by_ });
+      }
+    }
+  }
+
+  // Review : transition du PLAN (review → approved/rejected), indépendante de la tâche.
   if (decision.kind === "review" && decision.planId) {
     try {
       const pe = await getPlanExecution(decision.planId);
-      if (pe && canTransition(pe.status, status)) {
+      if (pe && canPlanTransition(pe.status, status)) {
         await applyPlanTransition({ planId: decision.planId, to: status, by: by_, note: resolution ?? null });
       }
     } catch {}
   }
 
-  return { decision: await getDecision(decisionId), transitioned, from, to };
+  return { decision: await getDecision(decisionId), transitioned: false };
 }

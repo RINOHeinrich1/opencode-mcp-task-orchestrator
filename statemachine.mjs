@@ -1,8 +1,9 @@
-// statemachine.mjs — Machine à états du Task Registry (norme v4, socle P0/P1).
+// statemachine.mjs — Machines à états (tâche + plan).
 //
-// Seule voie de changement de statut : canTransition(from, to) doit être vrai.
-// L'orchestrateur (agent) est le seul à appliquer les transitions ; les agents
-// de fond publient des événements, jamais des états.
+// - La TÂCHE porte des phases grossières (planning / awaiting_validation / planned /
+//   in_progress / done) : `task_transition`.
+// - Le PLAN (sous-tâche) porte le cycle complet (review / merge / déploiement) :
+//   `plan_transition`. C'est lui la source de vérité de l'exécution fine.
 
 export const VALID_STATES = [
   "queued",
@@ -30,20 +31,29 @@ export const VALID_STATES = [
   "done",
 ];
 
-// Transitions autorisées : from -> [to].
-export const TRANSITIONS = {
+// Machine de la TÂCHE (phases grossières). Le détail fin vit dans le plan.
+export const TASK_TRANSITIONS = {
   queued: ["started", "blocked", "aborted"],
-  // `started` = session lancée (panneau « Lancer ») ; la planification commence
-  // quand l'orchestrateur délègue à atomic-plan (`started` → `planning`).
   started: ["planning", "blocked", "failed", "aborted", "crashed"],
   planning: ["awaiting_validation", "blocked", "failed", "aborted", "crashed"],
-  awaiting_validation: ["approved", "rejected", "aborted", "blocked"],
+  awaiting_validation: ["planned", "blocked", "aborted"],
+  planned: ["in_progress", "blocked", "aborted", "failed"],
+  in_progress: ["done", "blocked", "failed", "aborted", "crashed"],
+  done: ["rework"],
+  blocked: ["queued", "planning", "in_progress", "failed", "aborted"],
+  failed: ["queued", "in_progress"],
+  aborted: ["queued"],
+  crashed: ["in_progress", "blocked", "failed", "aborted"],
+};
+
+// Machine du PLAN (cycle complet review / merge / déploiement).
+export const PLAN_TRANSITIONS = {
   planned: ["in_progress", "blocked", "aborted", "failed"],
   in_progress: ["validating", "blocked", "failed", "aborted", "crashed"],
   validating: ["review", "rework", "failed", "crashed"],
   review: ["approved", "rejected", "blocked"],
-  approved: ["planned", "merge_pending"],
-  rejected: ["planning", "rework", "failed"],
+  approved: ["merge_pending"],
+  rejected: ["rework", "failed"],
   rework: ["in_progress", "blocked", "aborted"],
   merge_pending: ["merged", "failed", "blocked"],
   merged: ["deploy_pending", "blocked"],
@@ -52,32 +62,38 @@ export const TRANSITIONS = {
   deployed: ["post_deploy_verified", "deploy_failed"],
   post_deploy_verified: ["done"],
   deploy_failed: ["deploy_pending", "failed", "blocked"],
-  blocked: ["queued", "planning", "in_progress", "rework", "failed", "aborted", "deploy_pending"],
-  failed: ["queued", "in_progress", "rework"],
-  aborted: ["queued"],
-  crashed: ["in_progress", "blocked", "failed", "aborted"],
-  // `done` = orchestrateur terminé, en attente de recette humaine. Un rejet de
-  // recette rouvre l'exécution via `rework` (reprise nouvelle session / continuer).
   done: ["rework"],
+  blocked: ["in_progress", "rework", "failed", "aborted"],
+  failed: ["in_progress", "rework"],
+  aborted: [],
+  crashed: ["in_progress", "blocked", "failed", "aborted"],
 };
 
-// États terminaux (aucune transition sortante).
-// `done` n'est pas listé : il reste ré-ouvrable via `rework` (rejet de recette).
+// États terminaux (aucune transition sortante). `done` reste ré-ouvrable via `rework`.
 export const TERMINAL_STATES = ["aborted"];
 
 export function isValidState(s) {
   return VALID_STATES.includes(s);
 }
 
+export function canTaskTransition(from, to) {
+  return Array.isArray(TASK_TRANSITIONS[from]) && TASK_TRANSITIONS[from].includes(to);
+}
+
+export function canPlanTransition(from, to) {
+  return Array.isArray(PLAN_TRANSITIONS[from]) && PLAN_TRANSITIONS[from].includes(to);
+}
+
+// Alias rétro-compatible : `canTransition` = machine du plan.
 export function canTransition(from, to) {
-  return Array.isArray(TRANSITIONS[from]) && TRANSITIONS[from].includes(to);
+  return canPlanTransition(from, to);
 }
 
 export function isTerminal(s) {
   return TERMINAL_STATES.includes(s);
 }
 
-// Liste lisible des transitions autorisées depuis `from` (pour messages d'erreur).
+// Liste lisible des transitions autorisées depuis `from` (messages d'erreur).
 export function allowedFrom(from) {
-  return TRANSITIONS[from] || [];
+  return TASK_TRANSITIONS[from] || [];
 }

@@ -16,7 +16,7 @@ import { z } from "zod";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
-import { canTransition, isValidState, allowedFrom, VALID_STATES } from "./statemachine.mjs";
+import { canTaskTransition, isValidState, allowedFrom, VALID_STATES } from "./statemachine.mjs";
 import {
   createTask,
   getTask,
@@ -262,7 +262,7 @@ server.registerTool("task_transition", {
     const exec = await getCurrentExecution(taskId);
     if (!exec) return err(`tâche inconnue : ${taskId}`);
     if (!isValidState(to)) return err(`statut invalide : ${to}`);
-    if (!canTransition(exec.status, to)) {
+    if (!canTaskTransition(exec.status, to)) {
       return err(`transition refusée : ${exec.status} -> ${to}. Autorisé depuis ${exec.status} : ${allowedFrom(exec.status).join(", ") || "(terminal)"}`);
     }
     const r = await applyTransition({ taskId, to, by: by || "orchestrator", note });
