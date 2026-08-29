@@ -119,12 +119,12 @@ server.registerTool("task_register", {
 }, async (input) => {
   try {
     const taskId = input.taskId || newTaskId();
-    if (getTask(taskId)) return err(`tâche déjà enregistrée : ${taskId}`);
-    if (!getProject(input.project)) {
+    if (await getTask(taskId)) return err(`tâche déjà enregistrée : ${taskId}`);
+    if (!await getProject(input.project)) {
       return err(`projet inconnu : ${input.project} — enregistrer le projet avant de créer la tâche`);
     }
     const executionId = newExecutionId(taskId);
-    const task = createTask({ ...input, id: taskId, executionId });
+    const task = await createTask({ ...input, id: taskId, executionId });
     return text(JSON.stringify({ ok: true, taskId, executionId, task }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -143,7 +143,7 @@ server.registerTool("project_register", {
   },
 }, async ({ id, name, workspace, gitPath, createdBy }) => {
   try {
-    const project = registerProject({ id, name, workspace, gitPath, createdBy });
+    const project = await registerProject({ id, name, workspace, gitPath, createdBy });
     return text(JSON.stringify({ ok: true, project }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -156,7 +156,7 @@ server.registerTool("project_list", {
   inputSchema: {},
 }, async () => {
   try {
-    const projects = listProjects();
+    const projects = await listProjects();
     return text(JSON.stringify({ count: projects.length, projects }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -169,7 +169,7 @@ server.registerTool("project_delete", {
   inputSchema: { id: z.string() },
 }, async ({ id }) => {
   try {
-    const r = deleteProject(id);
+    const r = await deleteProject(id);
     if (!r) return err(`projet inconnu : ${id}`);
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) {
@@ -183,11 +183,11 @@ server.registerTool("task_get", {
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
-    const task = getTask(taskId);
+    const task = await getTask(taskId);
     if (!task) return err(`tâche inconnue : ${taskId}`);
-    const executions = getExecutions(taskId);
-    const worktree = listWorktrees(task.project).find((w) => w.taskId === taskId) || null;
-    const participants = listParticipants(taskId);
+    const executions = await getExecutions(taskId);
+    const worktree = await listWorktrees(task.project).find((w) => w.taskId === taskId) || null;
+    const participants = await listParticipants(taskId);
     return text(JSON.stringify({ task, executions, worktree, participants }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -203,8 +203,8 @@ server.registerTool("task_link_session", {
   },
 }, async ({ taskId, sessionId }) => {
   try {
-    if (!getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
-    const task = updateTaskSession(taskId, sessionId);
+    if (!await getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
+    const task = await updateTaskSession(taskId, sessionId);
     return text(JSON.stringify({ ok: true, task }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -217,8 +217,8 @@ server.registerTool("task_clear_session", {
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
-    if (!getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
-    const task = updateTaskSession(taskId, null);
+    if (!await getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
+    const task = await updateTaskSession(taskId, null);
     return text(JSON.stringify({ ok: true, task }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -231,10 +231,12 @@ server.registerTool("task_list", {
   inputSchema: { project: z.string().optional() },
 }, async ({ project }) => {
   try {
-    const tasks = listTasks({ project }).map((t) => {
-      const exec = getCurrentExecution(t.id);
-      return { taskId: t.id, project: t.project, type: t.type, priority: t.priority, status: exec?.status || "queued", request: t.request };
-    });
+    const list = await listTasks({ project });
+    const tasks = [];
+    for (const t of list) {
+      const exec = await getCurrentExecution(t.id);
+      tasks.push({ taskId: t.id, project: t.project, type: t.type, priority: t.priority, status: exec?.status || "queued", request: t.request });
+    }
     return text(JSON.stringify({ count: tasks.length, tasks }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -253,13 +255,13 @@ server.registerTool("task_transition", {
   },
 }, async ({ taskId, to, by, note }) => {
   try {
-    const exec = getCurrentExecution(taskId);
+    const exec = await getCurrentExecution(taskId);
     if (!exec) return err(`tâche inconnue : ${taskId}`);
     if (!isValidState(to)) return err(`statut invalide : ${to}`);
     if (!canTransition(exec.status, to)) {
       return err(`transition refusée : ${exec.status} -> ${to}. Autorisé depuis ${exec.status} : ${allowedFrom(exec.status).join(", ") || "(terminal)"}`);
     }
-    const r = applyTransition({ taskId, to, by: by || "orchestrator", note });
+    const r = await applyTransition({ taskId, to, by: by || "orchestrator", note });
     return text(JSON.stringify(r, null, 2));
   } catch (e) {
     return err(e.message);
@@ -278,12 +280,12 @@ server.registerTool("task_event", {
   },
 }, async ({ taskId, type, by, detail }) => {
   try {
-    const task = getTask(taskId);
+    const task = await getTask(taskId);
     if (!task) return err(`tâche inconnue : ${taskId}`);
     if (isAuditEvent(type) && task.type !== "audit") {
       return err(`événement d'audit refusé : la tâche ${taskId} est de type "${task.type}" (un audit n'est rattaché qu'à une tâche type="audit").`);
     }
-    appendEvent({
+    await appendEvent({
       eventId: `${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       taskId,
       type,
@@ -302,7 +304,7 @@ server.registerTool("events_list", {
   inputSchema: { taskId: z.string().optional(), limit: z.number().int().default(100) },
 }, async ({ taskId, limit }) => {
   try {
-    return text(JSON.stringify({ events: listEvents(taskId, limit) }, null, 2));
+    return text(JSON.stringify({ events: await listEvents(taskId, limit) }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -319,8 +321,8 @@ server.registerTool("worktree_register", {
   },
 }, async ({ worktreeId, project, path, branch }) => {
   try {
-    if (getWorktree(worktreeId)) return err(`worktree déjà enregistré : ${worktreeId}`);
-    const wt = registerWorktree({ worktreeId, project, path, branch });
+    if (await getWorktree(worktreeId)) return err(`worktree déjà enregistré : ${worktreeId}`);
+    const wt = await registerWorktree({ worktreeId, project, path, branch });
     return text(JSON.stringify({ ok: true, worktree: wt }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -333,7 +335,7 @@ server.registerTool("worktree_list", {
   inputSchema: { project: z.string().optional() },
 }, async ({ project }) => {
   try {
-    return text(JSON.stringify({ worktrees: listWorktrees(project) }, null, 2));
+    return text(JSON.stringify({ worktrees: await listWorktrees(project) }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -350,12 +352,12 @@ server.registerTool("worktree_reserve", {
   },
 }, async ({ worktreeId, taskId, agent, leaseMinutes }) => {
   try {
-    const wt = getWorktree(worktreeId);
+    const wt = await getWorktree(worktreeId);
     if (!wt) return err(`worktree inconnu : ${worktreeId}`);
     if (wt.status !== "AVAILABLE") return err(`worktree ${worktreeId} non disponible (statut ${wt.status})`);
     const now = Date.now();
     const leaseUntil = new Date(now + leaseMinutes * 60 * 1000).toISOString();
-    const updated = updateWorktree(worktreeId, {
+    const updated = await updateWorktree(worktreeId, {
       status: "RESERVED",
       agent,
       taskId,
@@ -376,10 +378,10 @@ server.registerTool("worktree_release", {
   inputSchema: { worktreeId: z.string() },
 }, async ({ worktreeId }) => {
   try {
-    const wt = getWorktree(worktreeId);
+    const wt = await getWorktree(worktreeId);
     if (!wt) return err(`worktree inconnu : ${worktreeId}`);
     if (!["RESERVED", "IN_USE"].includes(wt.status)) return err(`worktree ${worktreeId} non réservé (statut ${wt.status})`);
-    const updated = updateWorktree(worktreeId, {
+    const updated = await updateWorktree(worktreeId, {
       status: "RELEASED",
       agent: null,
       taskId: null,
@@ -399,11 +401,11 @@ server.registerTool("lease_renew", {
   inputSchema: { worktreeId: z.string(), leaseMinutes: z.number().int().default(30) },
 }, async ({ worktreeId, leaseMinutes }) => {
   try {
-    const wt = getWorktree(worktreeId);
+    const wt = await getWorktree(worktreeId);
     if (!wt) return err(`worktree inconnu : ${worktreeId}`);
     if (!["RESERVED", "IN_USE"].includes(wt.status)) return err(`worktree ${worktreeId} sans lease actif (statut ${wt.status})`);
     const leaseUntil = new Date(Date.now() + leaseMinutes * 60 * 1000).toISOString();
-    const updated = updateWorktree(worktreeId, { leaseUntil, lastHeartbeat: nowIso() });
+    const updated = await updateWorktree(worktreeId, { leaseUntil, lastHeartbeat: nowIso() });
     return text(JSON.stringify({ ok: true, worktree: updated }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -417,7 +419,7 @@ server.registerTool("lease_expired", {
 }, async ({ project }) => {
   try {
     const now = Date.now();
-    const expired = listWorktrees(project).filter(
+    const expired = await listWorktrees(project).filter(
       (w) => ["RESERVED", "IN_USE"].includes(w.status) && w.leaseUntil && new Date(w.leaseUntil).getTime() < now,
     );
     return text(JSON.stringify({ count: expired.length, expired }, null, 2));
@@ -438,8 +440,8 @@ server.registerTool("deployment_record", {
   },
 }, async ({ taskId, status, pipelineUrl, verifiedAt }) => {
   try {
-    if (!getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
-    const d = recordDeployment({ taskId, status, pipelineUrl, verifiedAt });
+    if (!await getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
+    const d = await recordDeployment({ taskId, status, pipelineUrl, verifiedAt });
     return text(JSON.stringify({ ok: true, deployment: d }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -457,7 +459,7 @@ server.registerTool("scope_conflict", {
   },
 }, async ({ project, scope, excludeTaskId }) => {
   try {
-    const r = findScopeConflicts(project, scope, excludeTaskId);
+    const r = await findScopeConflicts(project, scope, excludeTaskId);
     return text(
       JSON.stringify(
         { ok: true, conflict: r.conflicts.length > 0 || r.reservedWorktrees.length > 0, conflicts: r.conflicts, reservedWorktrees: r.reservedWorktrees },
@@ -485,8 +487,8 @@ server.registerTool("decision_request", {
   },
 }, async ({ taskId, kind, ttlMinutes, expiresAt, detail, by, sessionId }) => {
   try {
-    if (!getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
-    const d = requestDecision({ taskId, kind, expiresAt, ttlMinutes: ttlMinutes ?? 2880, detail, requestedBy: by, sessionId });
+    if (!await getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
+    const d = await requestDecision({ taskId, kind, expiresAt, ttlMinutes: ttlMinutes ?? 2880, detail, requestedBy: by, sessionId });
     return text(JSON.stringify({ ok: true, decision: d }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -504,7 +506,7 @@ server.registerTool("decision_resolve", {
   },
 }, async ({ decisionId, status, resolution, by }) => {
   try {
-    const r = resolveDecisionAndTransition({ decisionId, status, resolution, by });
+    const r = await resolveDecisionAndTransition({ decisionId, status, resolution, by });
     if (!r || !r.decision) return err(`décision inconnue : ${decisionId}`);
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) {
@@ -524,7 +526,7 @@ server.registerTool("task_recette", {
   },
 }, async ({ taskId, status, resolution, by }) => {
   try {
-    const r = resolveRecette({ taskId, status, resolution, by });
+    const r = await resolveRecette({ taskId, status, resolution, by });
     return text(JSON.stringify(r, null, 2));
   } catch (e) {
     return err(e.message);
@@ -537,7 +539,7 @@ server.registerTool("task_recette_reset", {
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
-    const task = resetRecette(taskId);
+    const task = await resetRecette(taskId);
     return text(JSON.stringify({ ok: true, taskId, recetteStatus: task.recetteStatus }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -550,7 +552,7 @@ server.registerTool("decision_expired", {
   inputSchema: { taskId: z.string().optional() },
 }, async ({ taskId }) => {
   try {
-    const list = listExpiredDecisions(taskId);
+    const list = await listExpiredDecisions(taskId);
     return text(JSON.stringify({ count: list.length, expired: list }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -569,12 +571,12 @@ server.registerTool("artifact_add", {
   },
 }, async ({ taskId, kind, title, path }) => {
   try {
-    const task = getTask(taskId);
+    const task = await getTask(taskId);
     if (!task) return err(`tâche inconnue : ${taskId}`);
     if (kind === "audit" && task.type !== "audit") {
       return err(`artefact d'audit refusé : la tâche ${taskId} est de type "${task.type}" (un audit n'est rattaché qu'à une tâche type="audit").`);
     }
-    const a = addArtifact({ taskId, kind, title, path });
+    const a = await addArtifact({ taskId, kind, title, path });
     return text(JSON.stringify({ ok: true, artifact: a }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -587,7 +589,7 @@ server.registerTool("artifact_list", {
   inputSchema: { taskId: z.string().optional() },
 }, async ({ taskId }) => {
   try {
-    const artifacts = listArtifacts(taskId);
+    const artifacts = await listArtifacts(taskId);
     return text(JSON.stringify({ count: artifacts.length, artifacts }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -605,8 +607,8 @@ server.registerTool("participant_add", {
   },
 }, async ({ taskId, agent, role }) => {
   try {
-    if (!getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
-    const participants = registerParticipant({ taskId, agent, role });
+    if (!await getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
+    const participants = await registerParticipant({ taskId, agent, role });
     return text(JSON.stringify({ ok: true, taskId, participants }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -619,7 +621,7 @@ server.registerTool("task_delete", {
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
-    const r = deleteTask(taskId);
+    const r = await deleteTask(taskId);
     if (!r) return err(`tâche inconnue : ${taskId}`);
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) {

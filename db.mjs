@@ -1,138 +1,98 @@
-// db.mjs — Couche SQLite du Task Registry.
+// db.mjs — Couche PostgreSQL du Task Registry.
 // Écriture atomique (transaction), optimistic lock (colonne version),
 // journal append-only (events).
-import Database from "better-sqlite3";
-import { mkdirSync, readFileSync } from "node:fs";
+import pg from "pg";
+import Database from "better-sqlite3"; // lecture seule d'opencode.db (chaîne de sessions)
+import { readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadGlobalEnv } from "../../scripts/load-env.mjs";
 import { canTransition } from "./statemachine.mjs";
 
+const { Pool } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = join(homedir(), ".config", "opencode", "task-registry");
 
-// Charge le .env global (~/.config/opencode/.env) AVANT de résoudre DB_PATH,
-// afin que TASK_REGISTRY_DB (chemin/connexion de la base partagée) soit pris
-// en compte sans écraser un éventuel env déjà défini.
+// Charge le .env global AVANT de résoudre DATABASE_URL.
 loadGlobalEnv();
-const DB_PATH = process.env.TASK_REGISTRY_DB || join(DATA_DIR, "registry.db");
+const DATABASE_URL =
+  process.env.DATABASE_URL || "postgres://orchestrator:orchestrator@localhost:5432/task_registry";
 
-let _db = null;
+let _pool = null;
+function pool() {
+  if (_pool) return _pool;
+  _pool = new Pool({ connectionString: DATABASE_URL, max: 10 });
+  return _pool;
+}
+
+// Applique le schéma (idempotent CREATE TABLE IF NOT EXISTS) une fois par process.
+let _schemaReady = false;
+let _schemaPromise = null;
+async function ensureSchema() {
+  if (_schemaReady) return;
+  if (!_schemaPromise) {
+    _schemaPromise = (async () => {
+      await pool().query(readFileSync(join(__dirname, "schema.sql"), "utf8"));
+      _schemaReady = true;
+    })();
+  }
+  await _schemaPromise;
+}
+
+// Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
+async function withTransaction(fn) {
+  const client = await pool().connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (e) {
+    try { await client.query("ROLLBACK"); } catch {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
 
 export function nowIso() {
   return new Date().toISOString();
 }
 
-export function openDb() {
-  if (_db) return _db;
-  mkdirSync(DATA_DIR, { recursive: true });
-  _db = new Database(DB_PATH);
-  _db.pragma("journal_mode = WAL");
-  _db.pragma("foreign_keys = ON");
-  _db.exec(readFileSync(join(__dirname, "schema.sql"), "utf8"));
-  migrate(_db);
-  return _db;
-}
-
-// Migrations idempotentes (colonnes ajoutées après coup).
-function migrate(db) {
-  const tcols = db.prepare("PRAGMA table_info(tasks)").all().map((c) => c.name);
-  if (!tcols.includes("session_id")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN session_id TEXT");
-  }
-  if (!tcols.includes("recette_status")) {
-    db.exec("ALTER TABLE tasks ADD COLUMN recette_status TEXT NOT NULL DEFAULT 'pending'");
-  }
-  const dcols = db.prepare("PRAGMA table_info(decisions)").all().map((c) => c.name);
-  if (!dcols.includes("permission_id")) {
-    db.exec("ALTER TABLE decisions ADD COLUMN permission_id TEXT");
-  }
-  if (!dcols.includes("detail")) {
-    db.exec("ALTER TABLE decisions ADD COLUMN detail TEXT");
-  }
-  if (!dcols.includes("requested_by")) {
-    db.exec("ALTER TABLE decisions ADD COLUMN requested_by TEXT");
-  }
-  if (!dcols.includes("session_id")) {
-    db.exec("ALTER TABLE decisions ADD COLUMN session_id TEXT");
-  }
-  const pcols = db.prepare("PRAGMA table_info(plans)").all().map((c) => c.name);
-  if (pcols.length > 0 && !pcols.includes("branch")) {
-    db.exec("ALTER TABLE plans ADD COLUMN branch TEXT");
-  }
-  migrateEventsTable(db);
-}
-
-// Répare la table `events` si elle a été créée avec un ancien schéma (task_id
-// nullable, sans FK ON DELETE CASCADE). Reconstruit la table alignée sur
-// schema.sql et purge les événements orphelins (tâche supprimée).
-function migrateEventsTable(db) {
-  const fks = db.prepare("PRAGMA foreign_key_list(events)").all();
-  if (fks.length > 0) return; // déjà conforme
-  const prev = db.pragma("foreign_keys", { simple: true });
-  db.pragma("foreign_keys = OFF");
-  try {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS events_new (
-        seq       INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_id  TEXT NOT NULL UNIQUE,
-        task_id   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-        ts        TEXT NOT NULL,
-        type      TEXT NOT NULL,
-        by        TEXT,
-        detail    TEXT
-      );
-      INSERT INTO events_new (seq, event_id, task_id, ts, type, by, detail)
-        SELECT seq, event_id, task_id, ts, type, by, detail
-        FROM events
-        WHERE task_id IS NOT NULL AND task_id IN (SELECT id FROM tasks);
-      DROP TABLE events;
-      ALTER TABLE events_new RENAME TO events;
-      CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
-    `);
-  } finally {
-    db.pragma(`foreign_keys = ${prev ? "ON" : "OFF"}`);
-  }
-}
-
 // --- Tasks ----------------------------------------------------------------
-export function createTask(task) {
-  const db = openDb();
-  const stmt = db.prepare(
+export async function createTask(task) {
+  await ensureSchema();
+  await pool().query(
     `INSERT INTO tasks
        (id, request, project, workspace, type, priority, deadline,
         budget_maxsteps, budget_maxcost, scope, acceptance_criteria,
         constraints, dependencies, created_at, created_by, session_id)
-     VALUES
-       (@id, @request, @project, @workspace, @type, @priority, @deadline,
-        @budget_maxsteps, @budget_maxcost, @scope, @acceptance_criteria,
-        @constraints, @dependencies, @created_at, @created_by, @session_id)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+    [
+      task.id,
+      task.request,
+      task.project,
+      task.workspace ?? null,
+      task.type || "feature",
+      task.priority || "normal",
+      task.deadline ?? null,
+      task.budgetMaxSteps ?? null,
+      task.budgetMaxCost ?? null,
+      task.scope ? JSON.stringify(task.scope) : null,
+      task.acceptanceCriteria ? JSON.stringify(task.acceptanceCriteria) : null,
+      task.constraints ? JSON.stringify(task.constraints) : null,
+      task.dependencies ? JSON.stringify(task.dependencies) : null,
+      nowIso(),
+      task.createdBy ?? null,
+      task.sessionId ?? null,
+    ],
   );
-  const params = {
-    id: task.id,
-    request: task.request,
-    project: task.project,
-    workspace: task.workspace ?? null,
-    type: task.type || "feature",
-    priority: task.priority || "normal",
-    deadline: task.deadline ?? null,
-    budget_maxsteps: task.budgetMaxSteps ?? null,
-    budget_maxcost: task.budgetMaxCost ?? null,
-    scope: task.scope ? JSON.stringify(task.scope) : null,
-    acceptance_criteria: task.acceptanceCriteria ? JSON.stringify(task.acceptanceCriteria) : null,
-    constraints: task.constraints ? JSON.stringify(task.constraints) : null,
-    dependencies: task.dependencies ? JSON.stringify(task.dependencies) : null,
-    created_at: nowIso(),
-    created_by: task.createdBy ?? null,
-    session_id: task.sessionId ?? null,
-  };
-  stmt.run(params);
   // Exécution initiale (statut queued).
-  db.prepare(
+  await pool().query(
     `INSERT INTO executions (execution_id, task_id, attempt, rework_count, status, started_at, updated_at)
-     VALUES (@execution_id, @task_id, 1, 0, 'queued', @ts, @ts)`,
-  ).run({ execution_id: task.executionId, task_id: task.id, ts: nowIso() });
+     VALUES ($1,$2,1,0,'queued',$3,$3)`,
+    [task.executionId, task.id, nowIso()],
+  );
   return getTask(task.id);
 }
 
@@ -160,32 +120,37 @@ function rowToTask(row) {
   };
 }
 
-export function getTask(id) {
-  return rowToTask(openDb().prepare("SELECT * FROM tasks WHERE id = ?").get(id));
+export async function getTask(id) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM tasks WHERE id = $1", [id]);
+  return rowToTask(res.rows[0]);
 }
 
 // Garde-fou (défense en profondeur) : toute opération rattachée à une tâche
 // exige une tâche préalablement enregistrée. Complète la contrainte FOREIGN KEY.
-export function assertTaskExists(taskId) {
-  if (!taskId || !getTask(taskId)) {
+export async function assertTaskExists(taskId) {
+  if (!taskId || !(await getTask(taskId))) {
     throw new Error(`tâche inconnue : ${taskId}`);
   }
 }
 
 // Retrouve la tâche créée par une session opencode donnée (dernière d'abord).
-export function findTaskBySession(sessionId) {
+export async function findTaskBySession(sessionId) {
   if (!sessionId) return null;
-  return rowToTask(
-    openDb().prepare("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT 1").get(sessionId),
+  await ensureSchema();
+  const res = await pool().query(
+    "SELECT * FROM tasks WHERE session_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [sessionId],
   );
+  return rowToTask(res.rows[0]);
 }
 
 // Remonte la chaîne parent (sous-agent → … → orchestrateur) jusqu'à trouver la
 // tâche liée à l'une des sessions de la chaîne. Permet de rattacher une demande
 // de permission émise par un sous-agent à la tâche de l'orchestrateur.
-export function findTaskBySessionChain(sessionId) {
+export async function findTaskBySessionChain(sessionId) {
   if (!sessionId) return null;
-  const direct = findTaskBySession(sessionId);
+  const direct = await findTaskBySession(sessionId);
   if (direct) return direct;
   try {
     const path = process.env.OPENCODE_DB || join(homedir(), ".local", "share", "opencode", "opencode.db");
@@ -195,7 +160,7 @@ export function findTaskBySessionChain(sessionId) {
       const row = db.prepare("SELECT parent_id FROM session WHERE id = ?").get(cur);
       if (!row || !row.parent_id) break;
       cur = row.parent_id;
-      const t = findTaskBySession(cur);
+      const t = await findTaskBySession(cur);
       if (t) return t;
     }
   } catch {
@@ -204,60 +169,54 @@ export function findTaskBySessionChain(sessionId) {
   return null;
 }
 
-export function listTasks(filter = {}) {
-  const db = openDb();
-  let rows;
+export async function listTasks(filter = {}) {
+  await ensureSchema();
+  let res;
   if (filter.project) {
-    rows = db.prepare("SELECT * FROM tasks WHERE project = ? ORDER BY created_at DESC").all(filter.project);
+    res = await pool().query("SELECT * FROM tasks WHERE project = $1 ORDER BY created_at DESC", [filter.project]);
   } else {
-    rows = db.prepare("SELECT * FROM tasks ORDER BY created_at DESC").all();
+    res = await pool().query("SELECT * FROM tasks ORDER BY created_at DESC");
   }
-  return rows.map(rowToTask);
+  return res.rows.map(rowToTask);
 }
 
 // --- Executions -----------------------------------------------------------
-export function getExecutions(taskId) {
-  return openDb()
-    .prepare("SELECT * FROM executions WHERE task_id = ? ORDER BY attempt DESC")
-    .all(taskId)
-    .map((r) => ({
-      executionId: r.execution_id,
-      taskId: r.task_id,
-      attempt: r.attempt,
-      reworkCount: r.rework_count,
-      status: r.status,
-      checkpoint: r.checkpoint,
-      startedAt: r.started_at,
-      updatedAt: r.updated_at,
-    }));
+export async function getExecutions(taskId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM executions WHERE task_id = $1 ORDER BY attempt DESC", [taskId]);
+  return res.rows.map((r) => ({
+    executionId: r.execution_id,
+    taskId: r.task_id,
+    attempt: r.attempt,
+    reworkCount: r.rework_count,
+    status: r.status,
+    checkpoint: r.checkpoint,
+    startedAt: r.started_at,
+    updatedAt: r.updated_at,
+  }));
 }
 
-export function getCurrentExecution(taskId) {
-  const list = getExecutions(taskId);
+export async function getCurrentExecution(taskId) {
+  const list = await getExecutions(taskId);
   return list[0] || null;
 }
 
-export function updateExecutionStatus(executionId, status, extra = {}) {
-  const db = openDb();
-  db.prepare(
-    `UPDATE executions SET status = @status, checkpoint = @checkpoint, updated_at = @ts
-     WHERE execution_id = @execution_id`,
-  ).run({ status, checkpoint: extra.checkpoint ?? null, ts: nowIso(), execution_id: executionId });
+export async function updateExecutionStatus(executionId, status, extra = {}) {
+  await ensureSchema();
+  await pool().query(
+    `UPDATE executions SET status = $1, checkpoint = $2, updated_at = $3 WHERE execution_id = $4`,
+    [status, extra.checkpoint ?? null, nowIso(), executionId],
+  );
 }
 
 // --- Worktrees ------------------------------------------------------------
-export function registerWorktree(wt) {
-  const db = openDb();
-  db.prepare(
-    `INSERT INTO worktrees
-       (worktree_id, project, path, branch, status)
-     VALUES (@worktree_id, @project, @path, @branch, 'AVAILABLE')`,
-  ).run({
-    worktree_id: wt.worktreeId,
-    project: wt.project,
-    path: wt.path,
-    branch: wt.branch ?? null,
-  });
+export async function registerWorktree(wt) {
+  await ensureSchema();
+  await pool().query(
+    `INSERT INTO worktrees (worktree_id, project, path, branch, status)
+     VALUES ($1,$2,$3,$4,'AVAILABLE')`,
+    [wt.worktreeId, wt.project, wt.path, wt.branch ?? null],
+  );
   return getWorktree(wt.worktreeId);
 }
 
@@ -278,124 +237,120 @@ function rowToWorktree(r) {
   };
 }
 
-export function getWorktree(id) {
-  return rowToWorktree(openDb().prepare("SELECT * FROM worktrees WHERE worktree_id = ?").get(id));
+export async function getWorktree(id) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM worktrees WHERE worktree_id = $1", [id]);
+  return rowToWorktree(res.rows[0]);
 }
 
-export function listWorktrees(project) {
-  let rows;
+export async function listWorktrees(project) {
+  await ensureSchema();
+  let res;
   if (project) {
-    rows = openDb().prepare("SELECT * FROM worktrees WHERE project = ? ORDER BY status").all(project);
+    res = await pool().query("SELECT * FROM worktrees WHERE project = $1 ORDER BY status", [project]);
   } else {
-    rows = openDb().prepare("SELECT * FROM worktrees ORDER BY project, status").all();
+    res = await pool().query("SELECT * FROM worktrees ORDER BY project, status");
   }
-  return rows.map(rowToWorktree);
+  return res.rows.map(rowToWorktree);
 }
 
-export function updateWorktree(id, fields) {
-  const db = openDb();
-  const existing = getWorktree(id);
+export async function updateWorktree(id, fields) {
+  await ensureSchema();
+  const existing = await getWorktree(id);
   if (!existing) return null;
   const next = { ...existing, ...fields };
-  db.prepare(
-    `UPDATE worktrees SET status=@status, agent=@agent, task_id=@task_id,
-       reserved_at=@reserved_at, lease_until=@lease_until, last_heartbeat=@last_heartbeat, lock=@lock
-     WHERE worktree_id=@worktree_id`,
-  ).run({
-    status: next.status,
-    agent: next.agent ?? null,
-    task_id: next.taskId ?? null,
-    reserved_at: next.reservedAt ?? null,
-    lease_until: next.leaseUntil ?? null,
-    last_heartbeat: next.lastHeartbeat ?? null,
-    lock: next.lock ?? 0,
-    worktree_id: id,
-  });
+  await pool().query(
+    `UPDATE worktrees SET status=$1, agent=$2, task_id=$3,
+       reserved_at=$4, lease_until=$5, last_heartbeat=$6, lock=$7
+     WHERE worktree_id=$8`,
+    [
+      next.status,
+      next.agent ?? null,
+      next.taskId ?? null,
+      next.reservedAt ?? null,
+      next.leaseUntil ?? null,
+      next.lastHeartbeat ?? null,
+      next.lock ?? 0,
+      id,
+    ],
+  );
   return getWorktree(id);
 }
 
 // --- Events ---------------------------------------------------------------
-export function appendEvent({ eventId, taskId, type, by, detail }) {
-  assertTaskExists(taskId);
-  const db = openDb();
-  db.prepare(
+export async function appendEvent({ eventId, taskId, type, by, detail }) {
+  await assertTaskExists(taskId);
+  await pool().query(
     `INSERT INTO events (event_id, task_id, ts, type, by, detail)
-     VALUES (@event_id, @task_id, @ts, @type, @by, @detail)`,
-  ).run({
-    event_id: eventId,
-    task_id: taskId ?? null,
-    ts: nowIso(),
-    type,
-    by: by ?? null,
-    detail: detail ? JSON.stringify(detail) : null,
-  });
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [eventId, taskId ?? null, nowIso(), type, by ?? null, detail ? JSON.stringify(detail) : null],
+  );
 }
 
-export function listEvents(taskId, limit = 100) {
-  let rows;
+export async function listEvents(taskId, limit = 100) {
+  await ensureSchema();
+  let res;
   if (taskId) {
-    rows = openDb().prepare("SELECT * FROM events WHERE task_id = ? ORDER BY seq DESC LIMIT ?").all(taskId, limit);
+    res = await pool().query("SELECT * FROM events WHERE task_id = $1 ORDER BY seq DESC LIMIT $2", [taskId, limit]);
   } else {
-    rows = openDb().prepare("SELECT * FROM events ORDER BY seq DESC LIMIT ?").all(limit);
+    res = await pool().query("SELECT * FROM events ORDER BY seq DESC LIMIT $1", [limit]);
   }
-  return rows
+  return res.rows
     .map((r) => ({ seq: r.seq, eventId: r.event_id, taskId: r.task_id, ts: r.ts, type: r.type, by: r.by, detail: r.detail ? JSON.parse(r.detail) : null }))
     .reverse();
 }
 
 // --- Transition (transaction atomique + optimistic lock + event) ----------
-export function applyTransition({ taskId, to, by, note }) {
-  const db = openDb();
-  const tx = db.transaction(() => {
-    const task = getTask(taskId);
+export async function applyTransition({ taskId, to, by, note }) {
+  await ensureSchema();
+  const result = await withTransaction(async (client) => {
+    const taskRes = await client.query("SELECT * FROM tasks WHERE id = $1", [taskId]);
+    const task = rowToTask(taskRes.rows[0]);
     if (!task) throw new Error(`tâche inconnue : ${taskId}`);
-    const exec = getCurrentExecution(taskId);
+    const execRes = await client.query(
+      "SELECT * FROM executions WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
+      [taskId],
+    );
+    const exec = execRes.rows[0];
     if (!exec) throw new Error(`aucune exécution pour la tâche : ${taskId}`);
     const from = exec.status;
 
     // Mise à jour atomique avec optimistic lock.
-    const res = db
-      .prepare("UPDATE tasks SET version = version + 1 WHERE id = ? AND version = ?")
-      .run(taskId, task.version);
-    if (res.changes === 0) throw new Error(`conflit d'écriture (version) sur ${taskId}`);
+    const lockRes = await client.query(
+      "UPDATE tasks SET version = version + 1 WHERE id = $1 AND version = $2",
+      [taskId, task.version],
+    );
+    if (lockRes.rowCount === 0) throw new Error(`conflit d'écriture (version) sur ${taskId}`);
 
-    updateExecutionStatus(exec.executionId, to, { checkpoint: note ?? exec.checkpoint });
-    appendEvent({
-      eventId: `${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      taskId,
-      type: "TRANSITION",
-      by,
-      detail: { from, to, note: note ?? null },
-    });
+    await client.query(
+      "UPDATE executions SET status = $1, checkpoint = $2, updated_at = $3 WHERE execution_id = $4",
+      [to, note ?? null, nowIso(), exec.execution_id],
+    );
+    await client.query(
+      "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'TRANSITION',$4,$5)",
+      [`${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, taskId, nowIso(), by, JSON.stringify({ from, to, note: note ?? null })],
+    );
     return { from, to };
   });
-  const result = tx();
   return {
     ok: true,
     taskId,
     from: result.from,
     to: result.to,
-    task: getTask(taskId),
-    execution: getCurrentExecution(taskId),
+    task: await getTask(taskId),
+    execution: await getCurrentExecution(taskId),
   };
 }
 
 // --- Deployments ----------------------------------------------------------
-export function recordDeployment({ taskId, status, pipelineUrl, verifiedAt }) {
-  assertTaskExists(taskId);
-  const db = openDb();
+export async function recordDeployment({ taskId, status, pipelineUrl, verifiedAt }) {
+  await assertTaskExists(taskId);
   const deploymentId = `DEP-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  db.prepare(
+  await pool().query(
     `INSERT INTO deployments (deployment_id, task_id, status, triggered_at, pipeline_url, verified_at)
-     VALUES (@deployment_id, @task_id, @status, @ts, @pipeline_url, @verified_at)`,
-  ).run({
-    deployment_id: deploymentId,
-    task_id: taskId,
-    status,
-    ts: nowIso(),
-    pipeline_url: pipelineUrl ?? null,
-    verified_at: verifiedAt ?? null,
-  });
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [deploymentId, taskId, status, nowIso(), pipelineUrl ?? null, verifiedAt ?? null],
+  );
   return getDeployment(taskId);
 }
 
@@ -412,17 +367,16 @@ function rowToDeployment(r) {
   };
 }
 
-export function getDeployment(taskId) {
-  return rowToDeployment(
-    openDb().prepare("SELECT * FROM deployments WHERE task_id = ? ORDER BY rowid DESC LIMIT 1").get(taskId),
-  );
+export async function getDeployment(taskId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM deployments WHERE task_id = $1 ORDER BY id DESC LIMIT 1", [taskId]);
+  return rowToDeployment(res.rows[0]);
 }
 
-export function listDeployments(taskId) {
-  return openDb()
-    .prepare("SELECT * FROM deployments WHERE task_id = ? ORDER BY rowid DESC")
-    .all(taskId)
-    .map(rowToDeployment);
+export async function listDeployments(taskId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM deployments WHERE task_id = $1 ORDER BY id DESC", [taskId]);
+  return res.rows.map(rowToDeployment);
 }
 
 // --- Conflits de scope ----------------------------------------------------
@@ -442,11 +396,11 @@ function scopeOverlap(a, b) {
   return na === nb || na.startsWith(nb + "/") || nb.startsWith(na + "/");
 }
 
-export function findScopeConflicts(project, scope, excludeTaskId) {
+export async function findScopeConflicts(project, scope, excludeTaskId) {
   const conflicts = [];
-  for (const t of listTasks({ project })) {
+  for (const t of await listTasks({ project })) {
     if (t.id === excludeTaskId) continue;
-    const exec = getCurrentExecution(t.id);
+    const exec = await getCurrentExecution(t.id);
     if (!exec || !ACTIVE_STATUSES.includes(exec.status)) continue;
     const tScope = t.scope || [];
     for (const sp of scope || []) {
@@ -458,57 +412,52 @@ export function findScopeConflicts(project, scope, excludeTaskId) {
       }
     }
   }
-  const reservedWorktrees = listWorktrees(project).filter(
+  const reservedWorktrees = (await listWorktrees(project)).filter(
     (w) => ["RESERVED", "IN_USE"].includes(w.status) && w.taskId !== excludeTaskId,
   );
   return { conflicts, reservedWorktrees };
 }
 
 // --- Décisions humaines ---------------------------------------------------
-export function requestDecision({ taskId, kind, expiresAt, ttlMinutes, detail, permissionId, requestedBy, sessionId }) {
-  assertTaskExists(taskId);
-  const db = openDb();
+export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, detail, permissionId, requestedBy, sessionId }) {
+  await assertTaskExists(taskId);
   // Dédoublonnage : une même permission (même permission_id) → une seule décision.
   if (permissionId) {
-    const existing = db.prepare("SELECT * FROM decisions WHERE permission_id = ? ORDER BY rowid LIMIT 1").get(permissionId);
-    if (existing) return rowToDecision(existing);
+    const existing = await pool().query(
+      "SELECT * FROM decisions WHERE permission_id = $1 ORDER BY id LIMIT 1",
+      [permissionId],
+    );
+    if (existing.rows[0]) return rowToDecision(existing.rows[0]);
   }
   const decisionId = `DEC-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const expires = expiresAt || (ttlMinutes ? new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString() : null);
-  db.prepare(
+  await pool().query(
     `INSERT INTO decisions (decision_id, task_id, kind, status, requested_at, requested_by, session_id, expires_at, detail, permission_id)
-     VALUES (@id, @task_id, @kind, 'awaiting', @ts, @requested_by, @session_id, @expires, @detail, @permission_id)`,
-  ).run({
-    id: decisionId,
-    task_id: taskId,
-    kind,
-    ts: nowIso(),
-    requested_by: requestedBy ?? null,
-    session_id: sessionId ?? null,
-    expires,
-    detail: detail ?? null,
-    permission_id: permissionId ?? null,
-  });
+     VALUES ($1,$2,$3,'awaiting',$4,$5,$6,$7,$8,$9)`,
+    [decisionId, taskId, kind, nowIso(), requestedBy ?? null, sessionId ?? null, expires, detail ?? null, permissionId ?? null],
+  );
   return getDecision(decisionId);
 }
 
 // Résout la décision associée à une permission opencode (par permission_id).
-export function resolveDecisionByPermissionId(permissionId, status, resolution) {
+export async function resolveDecisionByPermissionId(permissionId, status, resolution) {
   if (!permissionId) return null;
-  const db = openDb();
-  const row = db.prepare("SELECT decision_id FROM decisions WHERE permission_id = ? ORDER BY rowid LIMIT 1").get(permissionId);
+  await ensureSchema();
+  const row = (await pool().query("SELECT decision_id FROM decisions WHERE permission_id = $1 ORDER BY id LIMIT 1", [permissionId])).rows[0];
   if (!row) return null;
-  db.prepare("UPDATE decisions SET status = @status, resolved_at = @ts, resolution = @resolution WHERE decision_id = @id")
-    .run({ status, ts: nowIso(), resolution: resolution ?? null, id: row.decision_id });
+  await pool().query(
+    "UPDATE decisions SET status = $1, resolved_at = $2, resolution = $3 WHERE decision_id = $4",
+    [status, nowIso(), resolution ?? null, row.decision_id],
+  );
   return getDecision(row.decision_id);
 }
 
 // Retrouve une décision par permission_id (pour le dédoublonnage).
-export function findDecisionByPermissionId(permissionId) {
+export async function findDecisionByPermissionId(permissionId) {
   if (!permissionId) return null;
-  return rowToDecision(
-    openDb().prepare("SELECT * FROM decisions WHERE permission_id = ? ORDER BY rowid LIMIT 1").get(permissionId),
-  );
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM decisions WHERE permission_id = $1 ORDER BY id LIMIT 1", [permissionId]);
+  return rowToDecision(res.rows[0]);
 }
 
 function rowToDecision(r) {
@@ -530,46 +479,53 @@ function rowToDecision(r) {
   };
 }
 
-export function getDecision(decisionId) {
-  return rowToDecision(openDb().prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId));
+export async function getDecision(decisionId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM decisions WHERE decision_id = $1", [decisionId]);
+  return rowToDecision(res.rows[0]);
 }
 
-export function resolveDecision(decisionId, status, resolution) {
-  openDb()
-    .prepare("UPDATE decisions SET status = @status, resolved_at = @ts, resolution = @resolution WHERE decision_id = @id")
-    .run({ status, ts: nowIso(), resolution: resolution ?? null, id: decisionId });
+export async function resolveDecision(decisionId, status, resolution) {
+  await ensureSchema();
+  await pool().query(
+    "UPDATE decisions SET status = $1, resolved_at = $2, resolution = $3 WHERE decision_id = $4",
+    [status, nowIso(), resolution ?? null, decisionId],
+  );
   return getDecision(decisionId);
 }
 
-export function listExpiredDecisions(taskId) {
+export async function listExpiredDecisions(taskId) {
+  await ensureSchema();
   const now = Date.now();
-  const rows = taskId
-    ? openDb().prepare("SELECT * FROM decisions WHERE task_id = ? AND status = 'awaiting'").all(taskId)
-    : openDb().prepare("SELECT * FROM decisions WHERE status = 'awaiting'").all();
-  return rows
+  const res = taskId
+    ? await pool().query("SELECT * FROM decisions WHERE task_id = $1 AND status = 'awaiting'", [taskId])
+    : await pool().query("SELECT * FROM decisions WHERE status = 'awaiting'");
+  return res.rows
     .map(rowToDecision)
     .filter((d) => d.expiresAt && new Date(d.expiresAt).getTime() < now);
 }
 
-export function escalateDecision(decisionId) {
-  openDb().prepare("UPDATE decisions SET escalations = escalations + 1 WHERE decision_id = ?").run(decisionId);
+export async function escalateDecision(decisionId) {
+  await ensureSchema();
+  await pool().query("UPDATE decisions SET escalations = escalations + 1 WHERE decision_id = $1", [decisionId]);
   return getDecision(decisionId);
 }
 
 // --- Artifacts (documents/livrables liés à une tâche) ----------------------
-export function addArtifact({ taskId, kind, title, path }) {
-  assertTaskExists(taskId);
-  const db = openDb();
+export async function addArtifact({ taskId, kind, title, path }) {
+  await assertTaskExists(taskId);
   // Idempotence : renvoyer l'artifact existant si (task_id, kind, path) identique.
-  const existing = db
-    .prepare("SELECT * FROM artifacts WHERE task_id = ? AND kind = ? AND path = ? ORDER BY rowid LIMIT 1")
-    .get(taskId, kind, path);
+  const existing = (await pool().query(
+    "SELECT * FROM artifacts WHERE task_id = $1 AND kind = $2 AND path = $3 ORDER BY id LIMIT 1",
+    [taskId, kind, path],
+  )).rows[0];
   if (existing) return rowToArtifact(existing);
   const artifactId = `ART-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  db.prepare(
+  await pool().query(
     `INSERT INTO artifacts (artifact_id, task_id, kind, title, path, created_at)
-     VALUES (@id, @task_id, @kind, @title, @path, @ts)`,
-  ).run({ id: artifactId, task_id: taskId, kind, title: title ?? null, path, ts: nowIso() });
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [artifactId, taskId, kind, title ?? null, path, nowIso()],
+  );
   return getArtifact(artifactId);
 }
 
@@ -585,126 +541,121 @@ function rowToArtifact(r) {
   };
 }
 
-export function getArtifact(artifactId) {
-  return rowToArtifact(openDb().prepare("SELECT * FROM artifacts WHERE artifact_id = ?").get(artifactId));
+export async function getArtifact(artifactId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM artifacts WHERE artifact_id = $1", [artifactId]);
+  return rowToArtifact(res.rows[0]);
 }
 
-export function listArtifacts(taskId) {
-  const rows = taskId
-    ? openDb().prepare("SELECT * FROM artifacts WHERE task_id = ? ORDER BY rowid DESC").all(taskId)
-    : openDb().prepare("SELECT * FROM artifacts ORDER BY rowid DESC").all();
-  return rows.map(rowToArtifact);
+export async function listArtifacts(taskId) {
+  await ensureSchema();
+  const res = taskId
+    ? await pool().query("SELECT * FROM artifacts WHERE task_id = $1 ORDER BY id DESC", [taskId])
+    : await pool().query("SELECT * FROM artifacts ORDER BY id DESC");
+  return res.rows.map(rowToArtifact);
 }
 
-export function deleteArtifact(artifactId) {
-  openDb().prepare("DELETE FROM artifacts WHERE artifact_id = ?").run(artifactId);
+export async function deleteArtifact(artifactId) {
+  await ensureSchema();
+  await pool().query("DELETE FROM artifacts WHERE artifact_id = $1", [artifactId]);
 }
 
 // --- Participants ----------------------------------------------------------
-export function registerParticipant({ taskId, agent, role }) {
-  assertTaskExists(taskId);
-  const db = openDb();
-  db.prepare(
+export async function registerParticipant({ taskId, agent, role }) {
+  await assertTaskExists(taskId);
+  await pool().query(
     `INSERT INTO participants (task_id, agent, role, joined_at)
-     VALUES (@task_id, @agent, @role, @ts)
-     ON CONFLICT(task_id, agent) DO UPDATE SET role = COALESCE(@role, role)`,
-  ).run({ task_id: taskId, agent, role: role ?? null, ts: nowIso() });
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT(task_id, agent) DO UPDATE SET role = COALESCE(EXCLUDED.role, participants.role)`,
+    [taskId, agent, role ?? null, nowIso()],
+  );
   return listParticipants(taskId);
 }
 
-export function listParticipants(taskId) {
-  return openDb()
-    .prepare("SELECT * FROM participants WHERE task_id = ? ORDER BY joined_at ASC")
-    .all(taskId)
-    .map((r) => ({ taskId: r.task_id, agent: r.agent, role: r.role, joinedAt: r.joined_at }));
+export async function listParticipants(taskId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM participants WHERE task_id = $1 ORDER BY joined_at ASC", [taskId]);
+  return res.rows.map((r) => ({ taskId: r.task_id, agent: r.agent, role: r.role, joinedAt: r.joined_at }));
 }
 
 // --- Session de tâche (lien session opencode lancée par le panneau) --------
-export function updateTaskSession(taskId, sessionId) {
-  assertTaskExists(taskId);
-  openDb().prepare("UPDATE tasks SET session_id = @session_id WHERE id = @id")
-    .run({ session_id: sessionId ?? null, id: taskId });
+export async function updateTaskSession(taskId, sessionId) {
+  await assertTaskExists(taskId);
+  await pool().query("UPDATE tasks SET session_id = $1 WHERE id = $2", [sessionId ?? null, taskId]);
   return getTask(taskId);
 }
 
 // --- Projets (entité de première classe — enregistrement explicite) --------
-function hasTable(db, name) {
-  return !!db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name);
-}
-
 function rowToProject(r) {
   if (!r) return null;
   return { id: r.id, name: r.name, workspace: r.workspace, gitPath: r.git_path, createdAt: r.created_at, createdBy: r.created_by };
 }
 
-export function registerProject({ id, name, workspace, gitPath, createdBy }) {
-  const db = openDb();
-  db.prepare(
+export async function registerProject({ id, name, workspace, gitPath, createdBy }) {
+  await ensureSchema();
+  await pool().query(
     `INSERT INTO projects (id, name, workspace, git_path, created_at, created_by)
-     VALUES (@id, @name, @workspace, @git_path, @ts, @created_by)
-     ON CONFLICT(id) DO UPDATE SET name = @name, workspace = @workspace, git_path = @git_path`,
-  ).run({ id, name, workspace: workspace ?? null, git_path: gitPath ?? null, ts: nowIso(), created_by: createdBy ?? null });
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, workspace = EXCLUDED.workspace, git_path = EXCLUDED.git_path`,
+    [id, name, workspace ?? null, gitPath ?? null, nowIso(), createdBy ?? null],
+  );
   return getProject(id);
 }
 
-export function getProject(id) {
-  return rowToProject(openDb().prepare("SELECT * FROM projects WHERE id = ?").get(id));
+export async function getProject(id) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM projects WHERE id = $1", [id]);
+  return rowToProject(res.rows[0]);
 }
 
-export function listProjects() {
-  return openDb().prepare("SELECT * FROM projects ORDER BY name ASC").all().map(rowToProject);
+export async function listProjects() {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM projects ORDER BY name ASC");
+  return res.rows.map(rowToProject);
 }
 
 // Garde : toute tâche doit référencer un projet existant (règle "projet obligatoire").
-export function assertProjectExists(project) {
-  if (!project || !getProject(project)) {
+export async function assertProjectExists(project) {
+  if (!project || !(await getProject(project))) {
     throw new Error(`projet inconnu : ${project} — enregistrer le projet avant de créer la tâche`);
   }
 }
 
 // Supprime un projet du registre (les tâches existantes gardent leur chaîne `project`).
-export function deleteProject(id) {
-  const db = openDb();
-  const existing = getProject(id);
+export async function deleteProject(id) {
+  await ensureSchema();
+  const existing = await getProject(id);
   if (!existing) return null;
-  db.prepare("DELETE FROM projects WHERE id = ?").run(id);
+  await pool().query("DELETE FROM projects WHERE id = $1", [id]);
   return { id, deleted: true };
 }
 
 // --- Suppression physique d'une tâche et de tout son rattaché ---------------
-export function deleteTask(taskId) {
-  const db = openDb();
-  if (!getTask(taskId)) return null;
-  const tx = db.transaction(() => {
-    db.prepare("DELETE FROM events WHERE task_id = ?").run(taskId);
-    db.prepare("DELETE FROM executions WHERE task_id = ?").run(taskId);
-    db.prepare("DELETE FROM deployments WHERE task_id = ?").run(taskId);
-    db.prepare("DELETE FROM decisions WHERE task_id = ?").run(taskId);
-    db.prepare("DELETE FROM artifacts WHERE task_id = ?").run(taskId);
-    db.prepare("DELETE FROM worktrees WHERE task_id = ?").run(taskId);
-    if (hasTable(db, "plans")) {
-      db.prepare("DELETE FROM plan_steps WHERE plan_id IN (SELECT id FROM plans WHERE task_id = ?)").run(taskId);
-      db.prepare("DELETE FROM plan_incidents WHERE plan_id IN (SELECT id FROM plans WHERE task_id = ?)").run(taskId);
-      db.prepare("DELETE FROM plan_inconsistencies WHERE plan_id IN (SELECT id FROM plans WHERE task_id = ?)").run(taskId);
-      db.prepare("DELETE FROM plans WHERE task_id = ?").run(taskId);
-    }
-    db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
+export async function deleteTask(taskId) {
+  await ensureSchema();
+  if (!(await getTask(taskId))) return null;
+  await withTransaction(async (client) => {
+    await client.query("DELETE FROM events WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM executions WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM deployments WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM decisions WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM artifacts WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM worktrees WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM plan_steps WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
+    await client.query("DELETE FROM plan_incidents WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
+    await client.query("DELETE FROM plan_inconsistencies WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
+    await client.query("DELETE FROM plans WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM tasks WHERE id = $1", [taskId]);
   });
-  tx();
   return { taskId, deleted: true };
 }
 
 // --- Recette (acceptation humaine après déploiement) ------------------------
-// Colonne `recette_status` INDÉPENDANTE du statut d'exécution : `done` reste
-// terminal côté orchestrateur ; la recette (pending → approved/rejected) est
-// tranchée par l'humain après test sur la plateforme, et tracée comme une
-// décision kind="recette" (choix « Décision humaine »).
-
-export function resolveRecette({ taskId, status, resolution, by }) {
-  const db = openDb();
-  const task = getTask(taskId);
+export async function resolveRecette({ taskId, status, resolution, by }) {
+  await ensureSchema();
+  const task = await getTask(taskId);
   if (!task) throw new Error(`tâche inconnue : ${taskId}`);
-  const exec = getCurrentExecution(taskId);
+  const exec = await getCurrentExecution(taskId);
   if (!exec || exec.status !== "done") {
     throw new Error(`recette impossible : la tâche ${taskId} doit être au statut "done" (actuel : ${exec?.status || "inconnu"})`);
   }
@@ -714,85 +665,69 @@ export function resolveRecette({ taskId, status, resolution, by }) {
   const by_ = by || "human";
   let decisionId = null;
 
-  const tx = db.transaction(() => {
-    // optimistic lock
-    const lockRes = db.prepare("UPDATE tasks SET version = version + 1 WHERE id = ? AND version = ?")
-      .run(taskId, task.version);
-    if (lockRes.changes === 0) throw new Error(`conflit d'écriture (version) sur ${taskId}`);
+  await withTransaction(async (client) => {
+    const lockRes = await client.query(
+      "UPDATE tasks SET version = version + 1 WHERE id = $1 AND version = $2",
+      [taskId, task.version],
+    );
+    if (lockRes.rowCount === 0) throw new Error(`conflit d'écriture (version) sur ${taskId}`);
 
-    // décision recette : réutilise l'awaiting existante, sinon en crée une (tracée).
-    const existing = db.prepare(
-      "SELECT decision_id FROM decisions WHERE task_id = ? AND kind = 'recette' AND status = 'awaiting' ORDER BY rowid LIMIT 1",
-    ).get(taskId);
+    const existing = (await client.query(
+      "SELECT decision_id FROM decisions WHERE task_id = $1 AND kind = 'recette' AND status = 'awaiting' ORDER BY id LIMIT 1",
+      [taskId],
+    )).rows[0];
     if (existing) {
       decisionId = existing.decision_id;
-      db.prepare("UPDATE decisions SET status = @status, resolved_at = @ts, resolution = @resolution WHERE decision_id = @id")
-        .run({ status, ts, resolution: resolution ?? null, id: decisionId });
+      await client.query(
+        "UPDATE decisions SET status = $1, resolved_at = $2, resolution = $3 WHERE decision_id = $4",
+        [status, ts, resolution ?? null, decisionId],
+      );
     } else {
       decisionId = `DEC-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-      db.prepare(
+      await client.query(
         `INSERT INTO decisions (decision_id, task_id, kind, status, requested_at, requested_by, session_id, expires_at, detail, permission_id)
-         VALUES (@id, @task_id, 'recette', @status, @ts, @by, NULL, NULL, @detail, NULL)`,
-      ).run({
-        id: decisionId,
-        task_id: taskId,
-        status,
-        ts,
-        by: by_,
-        detail: "Validation de recette (acceptation humaine après déploiement)",
-      });
+         VALUES ($1,$2,'recette',$3,$4,$5,NULL,NULL,$6,NULL)`,
+        [decisionId, taskId, status, ts, by_, "Validation de recette (acceptation humaine après déploiement)"],
+      );
     }
 
-    // colonne recette_status (source d'affichage du panneau)
-    db.prepare("UPDATE tasks SET recette_status = @status WHERE id = @id")
-      .run({ status, id: taskId });
+    await client.query("UPDATE tasks SET recette_status = $1 WHERE id = $2", [status, taskId]);
 
-    // événement CLOSED (remarques de recette)
-    db.prepare("INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES (@eid, @tid, @ts, 'CLOSED', @by, @detail)")
-      .run({
-        eid: `${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        tid: taskId,
-        ts,
-        by: by_,
-        detail: JSON.stringify({ kind: "recette", status, remarks: resolution ?? null, at: ts }),
-      });
+    await client.query(
+      "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'CLOSED',$4,$5)",
+      [`${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, taskId, ts, by_, JSON.stringify({ kind: "recette", status, remarks: resolution ?? null, at: ts })],
+    );
   });
-  tx();
 
-  return { ok: true, taskId, recetteStatus: status, decisionId, task: getTask(taskId) };
+  return { ok: true, taskId, recetteStatus: status, decisionId, task: await getTask(taskId) };
 }
 
 // Remet la recette à `pending` (début d'une reprise après rejet de recette).
-export function resetRecette(taskId) {
-  const db = openDb();
-  if (!getTask(taskId)) throw new Error(`tâche inconnue : ${taskId}`);
-  db.prepare("UPDATE tasks SET recette_status = 'pending' WHERE id = ?").run(taskId);
+export async function resetRecette(taskId) {
+  await ensureSchema();
+  if (!(await getTask(taskId))) throw new Error(`tâche inconnue : ${taskId}`);
+  await pool().query("UPDATE tasks SET recette_status = 'pending' WHERE id = $1", [taskId]);
   return getTask(taskId);
 }
 
 // --- Résolution de décision couplée à la transition (source de vérité unique) ---
-// Décision n°1 : la résolution humaine (approved/rejected) provoque une transition
-// atomique vers le statut correspondant + un événement CLOSED portant les remarques.
-// S'applique aux décisions kind ∈ {validation, review} ; les permissions (flux
-// permission-hook) restent résolues sans transition via resolveDecisionByPermissionId.
-export function resolveDecisionAndTransition({ decisionId, status, resolution, by }) {
-  const db = openDb();
-  const decision = getDecision(decisionId);
+export async function resolveDecisionAndTransition({ decisionId, status, resolution, by }) {
+  await ensureSchema();
+  const decision = await getDecision(decisionId);
   if (!decision) throw new Error(`décision inconnue : ${decisionId}`);
   if (!["approved", "rejected"].includes(status)) throw new Error(`statut de décision invalide : ${status}`);
   if (decision.status !== "awaiting") return { decision, transitioned: false };
   if (decision.kind === "permission") {
-    resolveDecision(decisionId, status, resolution);
-    return { decision: getDecision(decisionId), transitioned: false };
+    await resolveDecision(decisionId, status, resolution);
+    return { decision: await getDecision(decisionId), transitioned: false };
   }
   if (decision.kind === "recette") {
-    // La recette ne touche PAS au statut d'exécution (colonne recette_status).
-    const r = resolveRecette({ taskId: decision.taskId, status, resolution, by });
-    return { decision: getDecision(decisionId), transitioned: false, recetteStatus: r.recetteStatus };
+    const r = await resolveRecette({ taskId: decision.taskId, status, resolution, by });
+    return { decision: await getDecision(decisionId), transitioned: false, recetteStatus: r.recetteStatus };
   }
 
-  const task = getTask(decision.taskId);
-  const exec = getCurrentExecution(decision.taskId);
+  const task = await getTask(decision.taskId);
+  const exec = await getCurrentExecution(decision.taskId);
   if (!task || !exec) throw new Error(`tâche ou exécution introuvable pour la décision : ${decisionId}`);
 
   const from = exec.status;
@@ -800,24 +735,29 @@ export function resolveDecisionAndTransition({ decisionId, status, resolution, b
   if (!canTransition(from, to)) throw new Error(`transition refusée : ${from} -> ${to} (décision ${decisionId})`);
 
   const ts = nowIso();
-  const tx = db.transaction(() => {
-    // 1. optimistic lock sur la tâche
-    const lockRes = db.prepare("UPDATE tasks SET version = version + 1 WHERE id = ? AND version = ?")
-      .run(decision.taskId, task.version);
-    if (lockRes.changes === 0) throw new Error(`conflit d'écriture (version) sur ${decision.taskId}`);
-    // 2. résolution de la décision
-    db.prepare("UPDATE decisions SET status = @status, resolved_at = @ts, resolution = @resolution WHERE decision_id = @id")
-      .run({ status, ts, resolution: resolution ?? null, id: decisionId });
-    // 3. transition d'exécution
-    db.prepare("UPDATE executions SET status = @status, checkpoint = @checkpoint, updated_at = @ts WHERE execution_id = @execution_id")
-      .run({ status: to, checkpoint: null, ts, execution_id: exec.executionId });
-    // 4. événement TRANSITION
-    db.prepare("INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES (@eid, @tid, @ts, 'TRANSITION', @by, @detail)")
-      .run({ eid: `${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, tid: decision.taskId, ts, by: by || "human", detail: JSON.stringify({ from, to, note: null }) });
-    // 5. événement CLOSED (remarques de clôture)
-    db.prepare("INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES (@eid, @tid, @ts, 'CLOSED', @by, @detail)")
-      .run({ eid: `${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, tid: decision.taskId, ts, by: by || "human", detail: JSON.stringify({ remarks: resolution ?? null, at: ts }) });
+  await withTransaction(async (client) => {
+    const lockRes = await client.query(
+      "UPDATE tasks SET version = version + 1 WHERE id = $1 AND version = $2",
+      [decision.taskId, task.version],
+    );
+    if (lockRes.rowCount === 0) throw new Error(`conflit d'écriture (version) sur ${decision.taskId}`);
+
+    await client.query(
+      "UPDATE decisions SET status = $1, resolved_at = $2, resolution = $3 WHERE decision_id = $4",
+      [status, ts, resolution ?? null, decisionId],
+    );
+    await client.query(
+      "UPDATE executions SET status = $1, checkpoint = $2, updated_at = $3 WHERE execution_id = $4",
+      [to, null, ts, exec.executionId],
+    );
+    await client.query(
+      "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'TRANSITION',$4,$5)",
+      [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by || "human", JSON.stringify({ from, to, note: null })],
+    );
+    await client.query(
+      "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'CLOSED',$4,$5)",
+      [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by || "human", JSON.stringify({ remarks: resolution ?? null, at: ts })],
+    );
   });
-  tx();
-  return { decision: getDecision(decisionId), transitioned: true, from, to };
+  return { decision: await getDecision(decisionId), transitioned: true, from, to };
 }

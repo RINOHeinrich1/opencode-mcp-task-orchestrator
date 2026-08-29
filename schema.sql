@@ -1,7 +1,7 @@
--- Task Registry — schéma SQLite (idempotent)
+-- Task Registry — schéma PostgreSQL (idempotent)
 -- Source de vérité LOGIQUE de l'orchestration (l'état PHYSIQUE reste Git).
-
-PRAGMA foreign_keys = ON;
+-- Types : TEXT (chaînes/ISO 8601/JSON sérialisé), INTEGER, et IDENTITY pour les
+-- séquences (remplace rowid/AUTOINCREMENT de SQLite).
 
 -- Contexte immuable d'une tâche (le "quoi").
 CREATE TABLE IF NOT EXISTS tasks (
@@ -26,12 +26,11 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 -- Projets : entité de première classe (enregistrement explicite).
--- Toute tâche doit référencer un projet existant (règle "projet obligatoire").
 CREATE TABLE IF NOT EXISTS projects (
-  id          TEXT PRIMARY KEY,                    -- identifiant du projet (ex: oniria)
-  name        TEXT NOT NULL,                       -- nom lisible
-  workspace   TEXT,                                -- workspace Coder associé
-  git_path    TEXT,                                -- chemin du dépôt git (hôte ou /home/coder)
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  workspace   TEXT,
+  git_path    TEXT,
   created_at  TEXT NOT NULL,
   created_by  TEXT
 );
@@ -67,7 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_worktrees_project ON worktrees(project);
 
 -- Journal d'événements append-only (dédupliqué par event_id).
 CREATE TABLE IF NOT EXISTS events (
-  seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+  seq       INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   event_id  TEXT NOT NULL UNIQUE,
   task_id   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   ts        TEXT NOT NULL,
@@ -79,6 +78,7 @@ CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 
 -- Déploiements (suivi CI/CD d'une tâche).
 CREATE TABLE IF NOT EXISTS deployments (
+  id             INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
   deployment_id  TEXT PRIMARY KEY,
   task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   status         TEXT NOT NULL DEFAULT 'deploy_pending',
@@ -89,29 +89,30 @@ CREATE TABLE IF NOT EXISTS deployments (
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_task ON deployments(task_id);
 
--- Décisions humaines (validation de plan, review/merge) avec échéance & escalade.
+-- Décisions humaines (validation de plan, review/merge, recette) avec échéance & escalade.
 CREATE TABLE IF NOT EXISTS decisions (
-  decision_id  TEXT PRIMARY KEY,
-  task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  kind         TEXT NOT NULL DEFAULT 'validation',  -- validation | review | permission
-  status       TEXT NOT NULL DEFAULT 'awaiting',    -- awaiting | approved | rejected | expired
-  requested_at TEXT NOT NULL,
-  requested_by TEXT,                                -- sous-agent à l'origine de la demande
-  session_id   TEXT,                                -- session opencode de la demande
-  expires_at   TEXT,
-  escalations  INTEGER NOT NULL DEFAULT 0,
-  resolved_at  TEXT,
-  resolution   TEXT,
-  detail       TEXT,                                -- contexte (plan, résumé, commande…)
-  permission_id TEXT                                -- permission opencode (dédoublonnage)
+  id             INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
+  decision_id    TEXT PRIMARY KEY,
+  task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind           TEXT NOT NULL DEFAULT 'validation',  -- validation | review | permission | recette
+  status         TEXT NOT NULL DEFAULT 'awaiting',    -- awaiting | approved | rejected | expired
+  requested_at   TEXT NOT NULL,
+  requested_by   TEXT,
+  session_id     TEXT,
+  expires_at     TEXT,
+  escalations    INTEGER NOT NULL DEFAULT 0,
+  resolved_at    TEXT,
+  resolution     TEXT,
+  detail         TEXT,
+  permission_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_task ON decisions(task_id);
 
 -- Participants d'une tâche (agents enregistrés comme participants).
 CREATE TABLE IF NOT EXISTS participants (
   task_id   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  agent     TEXT NOT NULL,                          -- nom de l'agent (atomic-plan, build-notify, ...)
-  role      TEXT,                                   -- planner | executor | auditor | orchestrator
+  agent     TEXT NOT NULL,
+  role      TEXT,
   joined_at TEXT NOT NULL,
   PRIMARY KEY (task_id, agent)
 );
@@ -119,39 +120,39 @@ CREATE INDEX IF NOT EXISTS idx_participants_task ON participants(task_id);
 
 -- Artifacts (documents/livrables liés à une tâche : plan, audit, rapport...).
 CREATE TABLE IF NOT EXISTS artifacts (
+  id          INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
   artifact_id TEXT PRIMARY KEY,
   task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   kind        TEXT NOT NULL,              -- plan | audit | report | autre
   title       TEXT,
-  path        TEXT NOT NULL,              -- chemin absolu (hôte) du fichier
+  path        TEXT NOT NULL,
   created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 
 -- ===========================================================================
 -- Plans d'action (granularité atomique) — persistance des plans gérés par
--- l'agent `atomic-plan` et le MCP `plan-manager`. Source de vérité de la
--- persistance des plans (nature du plan inchangée : seul le support change).
+-- l'agent `atomic-plan` et le MCP `plan-manager`.
 -- Miroir: mcp/plan-manager/db.mjs (CREATE IF NOT EXISTS identiques).
 -- ===========================================================================
 
 CREATE TABLE IF NOT EXISTS plans (
   id            TEXT PRIMARY KEY,                 -- planId (ex: Plan-<objectif>-<date>)
-  task_id       TEXT REFERENCES tasks(id) ON DELETE CASCADE, -- tâche orchestrée (optionnel)
-  objective     TEXT NOT NULL,                    -- objectif du plan
-  file          TEXT,                             -- chemin relatif du fichier plan (.md, artefact email)
-  absolute_path TEXT,                             -- chemin absolu (hôte) du fichier plan
+  task_id       TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+  objective     TEXT NOT NULL,
+  file          TEXT,
+  absolute_path TEXT,
   deliverables  TEXT,                             -- JSON array de livrables
   status        TEXT NOT NULL DEFAULT 'active',   -- active | completed
-  branch        TEXT,                             -- branche git de la sous-tâche (renseignée par build-notify)
+  branch        TEXT,
   created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plans_task ON plans(task_id);
 
 CREATE TABLE IF NOT EXISTS plan_steps (
   plan_id    TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
-  step_id    TEXT NOT NULL,                       -- ex: A001
-  position   INTEGER NOT NULL DEFAULT 0,          -- ordre d'apparition
+  step_id    TEXT NOT NULL,
+  position   INTEGER NOT NULL DEFAULT 0,
   status     TEXT NOT NULL DEFAULT 'todo',        -- todo | in_progress | done | blocked | skipped
   note       TEXT,
   updated_at TEXT,
@@ -160,13 +161,14 @@ CREATE TABLE IF NOT EXISTS plan_steps (
 CREATE INDEX IF NOT EXISTS idx_plan_steps_plan ON plan_steps(plan_id);
 
 CREATE TABLE IF NOT EXISTS plan_incidents (
+  seq         INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
   id          TEXT PRIMARY KEY,                   -- INC-###
   plan_id     TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
   step_id     TEXT,
-  severity    TEXT NOT NULL DEFAULT 'medium',     -- low | medium | high | critical
+  severity    TEXT NOT NULL DEFAULT 'medium',
   title       TEXT NOT NULL,
   description TEXT NOT NULL,
-  status      TEXT NOT NULL DEFAULT 'open',       -- open | resolved
+  status      TEXT NOT NULL DEFAULT 'open',
   created_at  TEXT NOT NULL,
   resolved_at TEXT,
   resolution  TEXT
@@ -174,12 +176,13 @@ CREATE TABLE IF NOT EXISTS plan_incidents (
 CREATE INDEX IF NOT EXISTS idx_plan_incidents_plan ON plan_incidents(plan_id);
 
 CREATE TABLE IF NOT EXISTS plan_inconsistencies (
+  seq             INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
   id              TEXT PRIMARY KEY,               -- INCO-###
   plan_id         TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
   step_id         TEXT,
   related_plan_id TEXT,
   description     TEXT NOT NULL,
-  status          TEXT NOT NULL DEFAULT 'open',   -- open
+  status          TEXT NOT NULL DEFAULT 'open',
   created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plan_inconsistencies_plan ON plan_inconsistencies(plan_id);
