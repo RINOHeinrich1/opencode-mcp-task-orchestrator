@@ -710,7 +710,11 @@ export async function resetRecette(taskId) {
   return getTask(taskId);
 }
 
-// --- Résolution de décision couplée à la transition (source de vérité unique) ---
+// --- Résolution de décision (source de vérité unique) ------------------------
+// Décision n°1 (revue) : une décision validation/review est résolue PAR SOUS-TÂCHE
+// (plan), indépendamment des autres. La transition d'exécution (shared) n'a lieu
+// que lorsque TOUTES les décisions du même kind sont résolues → agrégation :
+// toutes approuvées → `approved`, sinon `rejected`.
 export async function resolveDecisionAndTransition({ decisionId, status, resolution, by }) {
   await ensureSchema();
   const decision = await getDecision(decisionId);
@@ -727,37 +731,66 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
   }
 
   const task = await getTask(decision.taskId);
-  const exec = await getCurrentExecution(decision.taskId);
-  if (!task || !exec) throw new Error(`tâche ou exécution introuvable pour la décision : ${decisionId}`);
-
-  const from = exec.status;
-  const to = status; // "approved" | "rejected"
-  if (!canTransition(from, to)) throw new Error(`transition refusée : ${from} -> ${to} (décision ${decisionId})`);
+  if (!task) throw new Error(`tâche introuvable pour la décision : ${decisionId}`);
 
   const ts = nowIso();
+  const by_ = by || "human";
+  let transitioned = false;
+  let from = null;
+  let to = null;
+
   await withTransaction(async (client) => {
+    // Optimistic lock.
     const lockRes = await client.query(
       "UPDATE tasks SET version = version + 1 WHERE id = $1 AND version = $2",
       [decision.taskId, task.version],
     );
     if (lockRes.rowCount === 0) throw new Error(`conflit d'écriture (version) sur ${decision.taskId}`);
 
+    // 1. Résolution de la décision.
     await client.query(
       "UPDATE decisions SET status = $1, resolved_at = $2, resolution = $3 WHERE decision_id = $4",
       [status, ts, resolution ?? null, decisionId],
     );
-    await client.query(
-      "UPDATE executions SET status = $1, checkpoint = $2, updated_at = $3 WHERE execution_id = $4",
-      [to, null, ts, exec.executionId],
-    );
-    await client.query(
-      "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'TRANSITION',$4,$5)",
-      [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by || "human", JSON.stringify({ from, to, note: null })],
-    );
+
+    // 2. Événement CLOSED (remarques de la décision).
     await client.query(
       "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'CLOSED',$4,$5)",
-      [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by || "human", JSON.stringify({ remarks: resolution ?? null, at: ts })],
+      [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by_, JSON.stringify({ kind: decision.kind, decisionId, status, remarks: resolution ?? null, at: ts })],
     );
+
+    // 3. Agrégation : transition d'exécution si plus aucune décision du même kind en attente.
+    const remainingRes = await client.query(
+      "SELECT COUNT(*) AS n FROM decisions WHERE task_id = $1 AND kind = $2 AND status = 'awaiting'",
+      [decision.taskId, decision.kind],
+    );
+    if (Number(remainingRes.rows[0].n) === 0) {
+      const rejectedRes = await client.query(
+        "SELECT COUNT(*) AS n FROM decisions WHERE task_id = $1 AND kind = $2 AND status = 'rejected'",
+        [decision.taskId, decision.kind],
+      );
+      const execRes = await client.query(
+        "SELECT * FROM executions WHERE task_id = $1 ORDER BY attempt DESC LIMIT 1",
+        [decision.taskId],
+      );
+      const exec = execRes.rows[0];
+      if (exec) {
+        from = exec.status;
+        to = Number(rejectedRes.rows[0].n) > 0 ? "rejected" : "approved";
+        if (canTransition(from, to)) {
+          await client.query(
+            "UPDATE executions SET status = $1, checkpoint = $2, updated_at = $3 WHERE execution_id = $4",
+            [to, null, ts, exec.execution_id],
+          );
+          await client.query(
+            "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'TRANSITION',$4,$5)",
+            [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by_, JSON.stringify({ from, to, note: null })],
+          );
+          transitioned = true;
+        }
+      }
+    }
   });
-  return { decision: await getDecision(decisionId), transitioned: true, from, to };
+
+  return { decision: await getDecision(decisionId), transitioned, from, to };
 }
