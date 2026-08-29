@@ -51,6 +51,10 @@ import {
   resolveDecisionAndTransition,
   resolveRecette,
   resetRecette,
+  applyPlanTransition,
+  createPlanExecution,
+  getPlanExecution,
+  listPlanExecutions,
 } from "./db.mjs";
 
 const MAIL_SCRIPT = join(homedir(), ".config", "opencode", "scripts", "send-mail.mjs");
@@ -179,7 +183,7 @@ server.registerTool("project_delete", {
 
 // === task_get ===
 server.registerTool("task_get", {
-  description: "Renvoie le détail d'une tâche (contexte + exécutions + participants).",
+  description: "Renvoie le détail d'une tâche (contexte + exécutions + participants + exécutions des plans).",
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
@@ -187,7 +191,8 @@ server.registerTool("task_get", {
     if (!task) return err(`tâche inconnue : ${taskId}`);
     const executions = await getExecutions(taskId);
     const participants = await listParticipants(taskId);
-    return text(JSON.stringify({ task, executions, participants }, null, 2));
+    const planExecutions = await listPlanExecutions(taskId);
+    return text(JSON.stringify({ task, executions, participants, planExecutions }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -483,11 +488,12 @@ server.registerTool("decision_request", {
     detail: z.string().optional().describe("Contexte/détail de la décision (ex: nom du plan, résumé des changements)."),
     by: z.string().optional().describe("Sous-agent à l'origine de la demande (ex: atomic-plan, build-notify)."),
     sessionId: z.string().optional().describe("Session opencode de la demande."),
+    planId: z.string().optional().describe("Plan (sous-tâche) rattaché à la décision."),
   },
-}, async ({ taskId, kind, ttlMinutes, expiresAt, detail, by, sessionId }) => {
+}, async ({ taskId, kind, ttlMinutes, expiresAt, detail, by, sessionId, planId }) => {
   try {
-    if (!await getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
-    const d = await requestDecision({ taskId, kind, expiresAt, ttlMinutes: ttlMinutes ?? 2880, detail, requestedBy: by, sessionId });
+    if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
+    const d = await requestDecision({ taskId, kind, expiresAt, ttlMinutes: ttlMinutes ?? 2880, detail, requestedBy: by, sessionId, planId });
     return text(JSON.stringify({ ok: true, decision: d }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -540,6 +546,51 @@ server.registerTool("task_recette_reset", {
   try {
     const task = await resetRecette(taskId);
     return text(JSON.stringify({ ok: true, taskId, recetteStatus: task.recetteStatus }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === plan_transition ===
+server.registerTool("plan_transition", {
+  description:
+    "Transitionne l'exécution d'un plan (sous-tâche) — cycle de vie indépendant : planned → in_progress → validating → review → approved → merge_pending → merged → deploy… → done (+ rework/blocked/failed/aborted).",
+  inputSchema: {
+    planId: z.string(),
+    to: z.string().describe(`Statut cible (parmi ${VALID_STATES.join(", ")}).`),
+    by: z.string().optional(),
+    note: z.string().optional(),
+  },
+}, async ({ planId, to, by, note }) => {
+  try {
+    const r = await applyPlanTransition({ planId, to, by: by || "orchestrator", note });
+    return text(JSON.stringify(r, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === plan_execution_get ===
+server.registerTool("plan_execution_get", {
+  description: "Renvoie l'exécution courante d'un plan (statut, tentative).",
+  inputSchema: { planId: z.string() },
+}, async ({ planId }) => {
+  try {
+    const pe = await getPlanExecution(planId);
+    return text(JSON.stringify({ planExecution: pe }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === plan_execution_create ===
+server.registerTool("plan_execution_create", {
+  description: "Crée l'exécution d'un plan (statut initial 'planned').",
+  inputSchema: { planId: z.string() },
+}, async ({ planId }) => {
+  try {
+    const pe = await createPlanExecution(planId);
+    return text(JSON.stringify({ ok: true, planExecution: pe }, null, 2));
   } catch (e) {
     return err(e.message);
   }

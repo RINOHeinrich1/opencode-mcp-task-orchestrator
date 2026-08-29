@@ -33,10 +33,16 @@ async function ensureSchema() {
   if (!_schemaPromise) {
     _schemaPromise = (async () => {
       await pool().query(readFileSync(join(__dirname, "schema.sql"), "utf8"));
+      await migrate();
       _schemaReady = true;
     })();
   }
   await _schemaPromise;
+}
+
+// Migrations idempotentes (colonnes ajoutées après coup).
+async function migrate() {
+  await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS plan_id TEXT");
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -419,7 +425,7 @@ export async function findScopeConflicts(project, scope, excludeTaskId) {
 }
 
 // --- Décisions humaines ---------------------------------------------------
-export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, detail, permissionId, requestedBy, sessionId }) {
+export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, detail, permissionId, requestedBy, sessionId, planId }) {
   await assertTaskExists(taskId);
   // Dédoublonnage : une même permission (même permission_id) → une seule décision.
   if (permissionId) {
@@ -432,9 +438,9 @@ export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, det
   const decisionId = `DEC-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const expires = expiresAt || (ttlMinutes ? new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString() : null);
   await pool().query(
-    `INSERT INTO decisions (decision_id, task_id, kind, status, requested_at, requested_by, session_id, expires_at, detail, permission_id)
-     VALUES ($1,$2,$3,'awaiting',$4,$5,$6,$7,$8,$9)`,
-    [decisionId, taskId, kind, nowIso(), requestedBy ?? null, sessionId ?? null, expires, detail ?? null, permissionId ?? null],
+    `INSERT INTO decisions (decision_id, task_id, kind, status, requested_at, requested_by, session_id, expires_at, detail, permission_id, plan_id)
+     VALUES ($1,$2,$3,'awaiting',$4,$5,$6,$7,$8,$9,$10)`,
+    [decisionId, taskId, kind, nowIso(), requestedBy ?? null, sessionId ?? null, expires, detail ?? null, permissionId ?? null, planId ?? null],
   );
   return getDecision(decisionId);
 }
@@ -476,6 +482,7 @@ function rowToDecision(r) {
     resolution: r.resolution,
     detail: r.detail,
     permissionId: r.permission_id,
+    planId: r.plan_id,
   };
 }
 
@@ -710,6 +717,54 @@ export async function resetRecette(taskId) {
   return getTask(taskId);
 }
 
+// --- Exécution d'un plan (sous-tâche, cycle de vie INDÉPENDANT) --------------
+export async function getPlanExecution(planId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM plan_executions WHERE plan_id = $1 ORDER BY id DESC LIMIT 1", [planId]);
+  const r = res.rows[0];
+  if (!r) return null;
+  return { id: r.id, planId: r.plan_id, attempt: r.attempt, status: r.status, checkpoint: r.checkpoint, startedAt: r.started_at, updatedAt: r.updated_at };
+}
+
+export async function createPlanExecution(planId) {
+  await ensureSchema();
+  await pool().query(
+    "INSERT INTO plan_executions (plan_id, attempt, status, started_at, updated_at) VALUES ($1, 1, 'planned', $2, $2)",
+    [planId, nowIso()],
+  );
+  return getPlanExecution(planId);
+}
+
+export async function listPlanExecutions(taskId) {
+  await ensureSchema();
+  const res = await pool().query(
+    `SELECT pe.* FROM plan_executions pe
+     JOIN plans p ON p.id = pe.plan_id
+     WHERE p.task_id = $1 ORDER BY pe.id DESC`,
+    [taskId],
+  );
+  return res.rows.map((r) => ({ id: r.id, planId: r.plan_id, attempt: r.attempt, status: r.status, checkpoint: r.checkpoint, startedAt: r.started_at, updatedAt: r.updated_at }));
+}
+
+// Transitionne l'exécution d'un plan (validée par la même machine à états).
+export async function applyPlanTransition({ planId, to, by, note }) {
+  await ensureSchema();
+  let exec = await getPlanExecution(planId);
+  if (!exec) {
+    await createPlanExecution(planId);
+    exec = await getPlanExecution(planId);
+  }
+  const from = exec.status;
+  if (!canTransition(from, to)) {
+    throw new Error(`transition refusée (plan ${planId}) : ${from} -> ${to}`);
+  }
+  await pool().query(
+    "UPDATE plan_executions SET status = $1, checkpoint = $2, updated_at = $3 WHERE id = $4",
+    [to, note ?? null, nowIso(), exec.id],
+  );
+  return { ok: true, planId, from, to, planExecution: await getPlanExecution(planId) };
+}
+
 // --- Résolution de décision (source de vérité unique) ------------------------
 // Décision n°1 (revue) : une décision validation/review est résolue PAR SOUS-TÂCHE
 // (plan), indépendamment des autres. La transition d'exécution (shared) n'a lieu
@@ -791,6 +846,17 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
       }
     }
   });
+
+  // Transition du plan (sous-tâche) : review → approved/rejected, indépendamment
+  // de la tâche. La validation reste au niveau tâche (agrégation ci-dessus).
+  if (decision.kind === "review" && decision.planId) {
+    try {
+      const pe = await getPlanExecution(decision.planId);
+      if (pe && canTransition(pe.status, status)) {
+        await applyPlanTransition({ planId: decision.planId, to: status, by: by_, note: resolution ?? null });
+      }
+    } catch {}
+  }
 
   return { decision: await getDecision(decisionId), transitioned, from, to };
 }

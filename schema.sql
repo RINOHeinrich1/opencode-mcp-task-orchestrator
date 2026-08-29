@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS decisions (
   resolved_at    TEXT,
   resolution     TEXT,
   detail         TEXT,
-  permission_id  TEXT
+  permission_id  TEXT,
+  plan_id        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_task ON decisions(task_id);
 
@@ -148,6 +149,20 @@ CREATE TABLE IF NOT EXISTS plans (
   created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_plans_task ON plans(task_id);
+
+-- Exécution d'un plan (sous-tâche) : cycle de vie INDÉPENDANT par plan (miroir de
+-- `executions`, mais au niveau plan). Le statut de la tâche devient un agrégat
+-- (phases grossières) ; les états fins (review/merge/déploiement) vivent ici.
+CREATE TABLE IF NOT EXISTS plan_executions (
+  id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  plan_id       TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+  attempt       INTEGER NOT NULL DEFAULT 1,
+  status        TEXT NOT NULL DEFAULT 'planned',
+  checkpoint    TEXT,
+  started_at    TEXT,
+  updated_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_plan_executions_plan ON plan_executions(plan_id);
 
 CREATE TABLE IF NOT EXISTS plan_steps (
   plan_id    TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
