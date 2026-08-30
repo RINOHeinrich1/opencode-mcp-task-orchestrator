@@ -115,6 +115,7 @@ server.registerTool("task_register", {
     project: z.string().describe("Projet cible."),
     workspace: z.string().optional().describe("Workspace Coder associé."),
     type: z.enum(["feature", "debug", "audit"]).default("feature"),
+    auditTarget: z.enum(["backend", "frontend", "both"]).optional().describe("Cible d'un audit : backend | frontend | both."),
     priority: z.enum(["low", "normal", "high", "critical"]).default("normal"),
     deadline: z.string().optional().describe("Échéance ISO 8601."),
     budgetMaxSteps: z.number().int().optional().describe("Itérations agentiques max."),

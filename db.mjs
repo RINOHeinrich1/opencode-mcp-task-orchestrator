@@ -43,6 +43,7 @@ async function ensureSchema() {
 // Migrations idempotentes (colonnes ajoutées après coup).
 async function migrate() {
   await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS plan_id TEXT");
+  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS audit_target TEXT");
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -70,16 +71,17 @@ export async function createTask(task) {
   await ensureSchema();
   await pool().query(
     `INSERT INTO tasks
-       (id, request, project, workspace, type, priority, deadline,
+       (id, request, project, workspace, type, audit_target, priority, deadline,
         budget_maxsteps, budget_maxcost, scope, acceptance_criteria,
         constraints, dependencies, created_at, created_by, session_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
     [
       task.id,
       task.request,
       task.project,
       task.workspace ?? null,
       task.type || "feature",
+      task.auditTarget ?? null,
       task.priority || "normal",
       task.deadline ?? null,
       task.budgetMaxSteps ?? null,
@@ -110,6 +112,7 @@ function rowToTask(row) {
     project: row.project,
     workspace: row.workspace,
     type: row.type,
+    auditTarget: row.audit_target ?? null,
     priority: row.priority,
     deadline: row.deadline,
     budgetMaxSteps: row.budget_maxsteps,

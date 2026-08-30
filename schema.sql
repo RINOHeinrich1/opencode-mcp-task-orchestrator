@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   project        TEXT NOT NULL,                    -- projet cible (scope)
   workspace      TEXT,                             -- workspace Coder associé
   type           TEXT NOT NULL DEFAULT 'feature',  -- feature | debug | audit
+  audit_target   TEXT,                             -- cible d'un audit : backend | frontend | both
   priority       TEXT NOT NULL DEFAULT 'normal',   -- low | normal | high | critical
   deadline       TEXT,                             -- ISO 8601
   budget_maxsteps INTEGER,                         -- itérations agentiques max
