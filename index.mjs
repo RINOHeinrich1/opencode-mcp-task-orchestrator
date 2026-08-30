@@ -32,6 +32,9 @@ import {
   getDeployment,
   listDeployments,
   findScopeConflicts,
+  recordScopeConflicts,
+  countScopeConflicts,
+  findPlanTask,
   requestDecision,
   resolveDecision,
   listExpiredDecisions,
@@ -74,6 +77,20 @@ function isAuditEvent(type) {
   return typeof type === "string" && /^AUDIT/i.test(type);
 }
 
+// Trace une erreur de transition (machine à états refusée) — KPI d'orchestration.
+async function logTransitionError({ taskId, from, to, reason, by }) {
+  if (!taskId) return;
+  try {
+    await appendEvent({
+      eventId: `${taskId}-ERR-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      taskId,
+      type: "TRANSITION_ERROR",
+      by: by || "system",
+      detail: { from: from ?? null, to, reason },
+    });
+  } catch {}
+}
+
 function stamp() {
   const d = new Date();
   const p = (n) => String(n).padStart(2, "0");
@@ -88,7 +105,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.1.0" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.2.0" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -257,6 +274,7 @@ server.registerTool("task_transition", {
     if (!exec) return err(`tâche inconnue : ${taskId}`);
     if (!isValidState(to)) return err(`statut invalide : ${to}`);
     if (!canTaskTransition(exec.status, to)) {
+      await logTransitionError({ taskId, from: exec.status, to, by: by || "orchestrator", reason: `non autorisé depuis ${exec.status}` });
       return err(`transition refusée : ${exec.status} -> ${to}. Autorisé depuis ${exec.status} : ${allowedFrom(exec.status).join(", ") || "(terminal)"}`);
     }
     const r = await applyTransition({ taskId, to, by: by || "orchestrator", note });
@@ -458,6 +476,8 @@ server.registerTool("scope_conflict", {
 }, async ({ project, scope, excludeTaskId }) => {
   try {
     const r = await findScopeConflicts(project, scope, excludeTaskId);
+    // Persistance des conflits détectés (KPI d'orchestration) — non bloquant.
+    await recordScopeConflicts({ project, scope, conflicts: r.conflicts, reservedWorktrees: r.reservedWorktrees });
     return text(
       JSON.stringify(
         { ok: true, conflict: r.conflicts.length > 0 || r.reservedWorktrees.length > 0, conflicts: r.conflicts, reservedWorktrees: r.reservedWorktrees },
@@ -560,6 +580,9 @@ server.registerTool("plan_transition", {
     const r = await applyPlanTransition({ planId, to, by: by || "orchestrator", note });
     return text(JSON.stringify(r, null, 2));
   } catch (e) {
+    // Trace une erreur de transition de plan (KPI d'orchestration).
+    const taskId = await findPlanTask(planId).catch(() => null);
+    await logTransitionError({ taskId, to, by: by || "orchestrator", reason: String((e && e.message) || e) });
     return err(e.message);
   }
 });

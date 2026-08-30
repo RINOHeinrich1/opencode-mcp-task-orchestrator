@@ -237,3 +237,17 @@ CREATE TABLE IF NOT EXISTS plan_counters (
   name  TEXT PRIMARY KEY,                         -- incident | inconsistency
   value INTEGER NOT NULL DEFAULT 0
 );
+
+-- Conflits de scope détectés (persistance pour KPI d'orchestration) —
+-- remplie par le tool `scope_conflict` (v0.2.1).
+CREATE TABLE IF NOT EXISTS scope_conflicts (
+  id                   INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  project              TEXT NOT NULL,
+  scope                TEXT NOT NULL,             -- JSON array des périmètres candidats
+  conflicting_task_id  TEXT,                      -- tâche active en conflit
+  worktree_id          TEXT,                      -- worktree réservé en conflit
+  created_at           TEXT NOT NULL,
+  status               TEXT NOT NULL DEFAULT 'open'  -- open | resolved
+);
+CREATE INDEX IF NOT EXISTS idx_scope_conflicts_project ON scope_conflicts(project);
+CREATE INDEX IF NOT EXISTS idx_scope_conflicts_id ON scope_conflicts(id);

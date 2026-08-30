@@ -425,6 +425,40 @@ export async function findScopeConflicts(project, scope, excludeTaskId) {
   return { conflicts, reservedWorktrees };
 }
 
+// --- Conflits de scope : persistance (KPI d'orchestration) -----------------
+export async function recordScopeConflicts({ project, scope, conflicts, reservedWorktrees }) {
+  await ensureSchema();
+  for (const c of conflicts || []) {
+    await pool().query(
+      `INSERT INTO scope_conflicts (project, scope, conflicting_task_id, created_at, status)
+       VALUES ($1,$2,$3,$4,'open')`,
+      [project, JSON.stringify(scope || []), c.taskId ?? null, nowIso()],
+    );
+  }
+  for (const w of reservedWorktrees || []) {
+    await pool().query(
+      `INSERT INTO scope_conflicts (project, scope, worktree_id, created_at, status)
+       VALUES ($1,$2,$3,$4,'open')`,
+      [project, JSON.stringify(scope || []), w.worktreeId ?? w.id ?? null, nowIso()],
+    );
+  }
+}
+
+export async function countScopeConflicts() {
+  await ensureSchema();
+  const r = await pool().query(
+    "SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE status = 'open')::int AS open FROM scope_conflicts",
+  );
+  return { total: r.rows[0].total, open: r.rows[0].open };
+}
+
+// Retrouve la tâche liée à un plan (pour tracer une erreur de transition de plan).
+export async function findPlanTask(planId) {
+  await ensureSchema();
+  const r = await pool().query("SELECT task_id FROM plans WHERE id = $1", [planId]);
+  return r.rows[0] ? r.rows[0].task_id : null;
+}
+
 // --- Décisions humaines ---------------------------------------------------
 export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, detail, permissionId, requestedBy, sessionId, planId }) {
   await assertTaskExists(taskId);
