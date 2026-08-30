@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS executions (
 );
 CREATE INDEX IF NOT EXISTS idx_executions_task ON executions(task_id);
 
+-- Sessions opencode liées à une tâche (une par lancement / reprise) — trace
+-- append-only. Sert au traçage de consommation par session (y compris reworks).
+CREATE TABLE IF NOT EXISTS task_sessions (
+  id           INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  session_id   TEXT NOT NULL,
+  kind         TEXT NOT NULL DEFAULT 'launch',  -- launch | rework | relaunch
+  created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_sessions_task ON task_sessions(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_sessions_uniq ON task_sessions(task_id, session_id);
+
 -- Worktrees : cycle de vie + lease.
 CREATE TABLE IF NOT EXISTS worktrees (
   worktree_id    TEXT PRIMARY KEY,

@@ -590,6 +590,35 @@ export async function updateTaskSession(taskId, sessionId) {
   return getTask(taskId);
 }
 
+// Lie une session opencode à une tâche ET l'enregistre dans la trace
+// append-only `task_sessions` (une ligne par lancement/reprise).
+export async function linkTaskSession(taskId, sessionId, kind) {
+  await assertTaskExists(taskId);
+  await pool().query("UPDATE tasks SET session_id = $1 WHERE id = $2", [sessionId ?? null, taskId]);
+  if (sessionId) {
+    await pool().query(
+      `INSERT INTO task_sessions (task_id, session_id, kind, created_at)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (task_id, session_id) DO NOTHING`,
+      [taskId, sessionId, kind || "launch", nowIso()],
+    );
+  }
+  return { task: await getTask(taskId), sessions: await listTaskSessions(taskId) };
+}
+
+// Liste des sessions liées à une tâche (ordre chronologique d'ajout).
+export async function listTaskSessions(taskId) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM task_sessions WHERE task_id = $1 ORDER BY id ASC", [taskId]);
+  return res.rows.map((r) => ({
+    id: r.id,
+    taskId: r.task_id,
+    sessionId: r.session_id,
+    kind: r.kind,
+    createdAt: r.created_at,
+  }));
+}
+
 // --- Projets (entité de première classe — enregistrement explicite) --------
 function rowToProject(r) {
   if (!r) return null;
@@ -642,6 +671,7 @@ export async function deleteTask(taskId) {
   await withTransaction(async (client) => {
     await client.query("DELETE FROM events WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM executions WHERE task_id = $1", [taskId]);
+    await client.query("DELETE FROM task_sessions WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM deployments WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM decisions WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM artifacts WHERE task_id = $1", [taskId]);

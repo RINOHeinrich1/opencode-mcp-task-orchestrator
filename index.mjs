@@ -43,6 +43,8 @@ import {
   registerParticipant,
   listParticipants,
   updateTaskSession,
+  linkTaskSession,
+  listTaskSessions,
   registerProject,
   getProject,
   listProjects,
@@ -196,7 +198,8 @@ server.registerTool("task_get", {
     const participants = await listParticipants(taskId);
     const planExecutions = await listPlanExecutions(taskId);
     const planCommits = await listTaskPlanCommits(taskId);
-    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits }, null, 2));
+    const sessions = await listTaskSessions(taskId);
+    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -204,16 +207,18 @@ server.registerTool("task_get", {
 
 // === task_link_session ===
 server.registerTool("task_link_session", {
-  description: "Lie une session opencode (ex: lancée par le panneau) à une tâche existante.",
+  description:
+    "Lie une session opencode (ex: lancée par le panneau) à une tâche existante, et l'enregistre dans la trace des sessions (append-only, pour le suivi de consommation par session/rework).",
   inputSchema: {
     taskId: z.string(),
     sessionId: z.string().describe("Identifiant de session opencode à lier."),
+    kind: z.enum(["launch", "rework", "relaunch"]).optional().describe("Type de lien : launch | rework | relaunch (défaut launch)."),
   },
-}, async ({ taskId, sessionId }) => {
+}, async ({ taskId, sessionId, kind }) => {
   try {
     if (!await getTask(taskId)) return err(`tâche inconnue : ${taskId}`);
-    const task = await updateTaskSession(taskId, sessionId);
-    return text(JSON.stringify({ ok: true, task }, null, 2));
+    const r = await linkTaskSession(taskId, sessionId, kind || "launch");
+    return text(JSON.stringify({ ok: true, taskId, task: r.task, sessions: r.sessions }, null, 2));
   } catch (e) {
     return err(e.message);
   }
