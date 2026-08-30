@@ -13,9 +13,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
-import { join } from "node:path";
-import { execFileSync } from "node:child_process";
-import { homedir } from "node:os";
 import { canTaskTransition, isValidState, allowedFrom, VALID_STATES } from "./statemachine.mjs";
 import {
   createTask,
@@ -62,8 +59,6 @@ import {
   listTaskPlanCommits,
 } from "./db.mjs";
 
-const MAIL_SCRIPT = join(homedir(), ".config", "opencode", "scripts", "send-mail.mjs");
-
 function text(content) {
   return { content: [{ type: "text", text: content }] };
 }
@@ -77,17 +72,6 @@ function err(content) {
 // feature/debug (cohérent avec norme-environnement-travail §23/§25).
 function isAuditEvent(type) {
   return typeof type === "string" && /^AUDIT/i.test(type);
-}
-
-function sendMail(subject, body, attachment) {
-  try {
-    const args = ["--subject", subject, "--body", body];
-    if (attachment) args.push("--attachment", attachment);
-    execFileSync("node", [MAIL_SCRIPT, ...args], { stdio: "pipe" });
-    return { ok: true };
-  } catch (e) {
-    return { ok: false, error: String(e && e.message ? e.message : e) };
-  }
 }
 
 function stamp() {
@@ -735,19 +719,7 @@ server.registerTool("task_delete", {
   }
 });
 
-// === notify ===
-server.registerTool("notify", {
-  description: "Envoie une notification email (subject/body, pièce jointe optionnelle) via send-mail.mjs.",
-  inputSchema: {
-    subject: z.string(),
-    body: z.string(),
-    attachment: z.string().optional(),
-  },
-}, async ({ subject, body, attachment }) => {
-  const r = sendMail(subject, body, attachment);
-  return text(JSON.stringify({ ok: r.ok, error: r.error || null }, null, 2));
-});
-
+// === main ===
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
