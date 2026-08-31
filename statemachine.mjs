@@ -44,6 +44,9 @@ export const TASK_TRANSITIONS = {
   failed: ["queued", "in_progress"],
   aborted: ["queued"],
   crashed: ["in_progress", "blocked", "failed", "aborted"],
+  // Reprise après rejet humain/recette : la tâche rouverte en `rework` peut
+  // reprendre son cycle (→ in_progress/planned) puis se clôturer (→ done).
+  rework: ["planned", "in_progress", "blocked", "failed", "aborted", "done"],
 };
 
 // Machine du PLAN (cycle complet review / merge / déploiement).
