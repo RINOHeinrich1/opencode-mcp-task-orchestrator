@@ -105,7 +105,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.3.0" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.3.1" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -274,6 +274,11 @@ server.registerTool("task_transition", {
     const exec = await getCurrentExecution(taskId);
     if (!exec) return err(`tâche inconnue : ${taskId}`);
     if (!isValidState(to)) return err(`statut invalide : ${to}`);
+    // Garde (v0.5.2) : une recette déjà validée clôture la tâche — aucune transition.
+    const task = await getTask(taskId);
+    if (task && task.recetteStatus === "approved") {
+      return err(`recette déjà validée : la tâche ${taskId} est clôturée, aucune transition (${to}) n'est autorisée`);
+    }
     if (!canTaskTransition(exec.status, to)) {
       await logTransitionError({ taskId, from: exec.status, to, by: by || "orchestrator", reason: `non autorisé depuis ${exec.status}` });
       return err(`transition refusée : ${exec.status} -> ${to}. Autorisé depuis ${exec.status} : ${allowedFrom(exec.status).join(", ") || "(terminal)"}`);
@@ -507,7 +512,12 @@ server.registerTool("decision_request", {
   },
 }, async ({ taskId, kind, ttlMinutes, expiresAt, detail, by, sessionId, planId }) => {
   try {
-    if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
+    const task = await getTask(taskId);
+    if (!task) return err(`tâche inconnue : ${taskId}`);
+    // Garde (v0.5.2) : recette déjà validée → aucune nouvelle décision.
+    if (task.recetteStatus === "approved") {
+      return err(`recette déjà validée : la tâche ${taskId} est clôturée, aucune nouvelle décision (${kind}) n'est autorisée`);
+    }
     const d = await requestDecision({ taskId, kind, expiresAt, ttlMinutes: ttlMinutes ?? 2880, detail, requestedBy: by, sessionId, planId });
     return text(JSON.stringify({ ok: true, decision: d }, null, 2));
   } catch (e) {
@@ -578,6 +588,15 @@ server.registerTool("plan_transition", {
   },
 }, async ({ planId, to, by, note }) => {
   try {
+    // Garde (v0.5.2) : si la tâche liée au plan a une recette déjà validée → refus.
+    const planTaskId = await findPlanTask(planId).catch(() => null);
+    if (planTaskId) {
+      const task = await getTask(planTaskId);
+      if (task && task.recetteStatus === "approved") {
+        await logTransitionError({ taskId: planTaskId, to, by: by || "orchestrator", reason: "recette déjà validée — tâche clôturée" });
+        return err(`recette déjà validée : la tâche ${planTaskId} (plan ${planId}) est clôturée, aucune transition de plan (${to}) n'est autorisée`);
+      }
+    }
     const r = await applyPlanTransition({ planId, to, by: by || "orchestrator", note });
     return text(JSON.stringify(r, null, 2));
   } catch (e) {
