@@ -102,7 +102,62 @@ export async function createTask(task) {
      VALUES ($1,$2,1,0,'queued',$3,$3)`,
     [task.executionId, task.id, nowIso()],
   );
+  // Tâches liées éventuelles (nature de liaison).
+  for (const l of task.linkedTasks || []) {
+    if (l && l.taskId) {
+      await addTaskLink({ taskId: task.id, linkedTaskId: l.taskId, description: l.description ?? null });
+    }
+  }
   return getTask(task.id);
+}
+
+// --- Tâches liées (task_links) ----------------------------------------------
+export async function addTaskLink({ taskId, linkedTaskId, description }) {
+  await ensureSchema();
+  if (!linkedTaskId) throw new Error("linkedTaskId requis");
+  if (linkedTaskId === taskId) throw new Error("une tâche ne peut pas être liée à elle-même");
+  const target = (await pool().query("SELECT id FROM tasks WHERE id = $1", [linkedTaskId])).rows[0];
+  if (!target) throw new Error(`tâche liée inconnue : ${linkedTaskId}`);
+  await pool().query(
+    `INSERT INTO task_links (task_id, linked_task_id, description, created_at)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (task_id, linked_task_id) DO UPDATE SET description = EXCLUDED.description`,
+    [taskId, linkedTaskId, description ?? null, nowIso()],
+  );
+  return listTaskLinks(taskId);
+}
+
+export async function removeTaskLink({ taskId, linkedTaskId }) {
+  await ensureSchema();
+  await pool().query("DELETE FROM task_links WHERE task_id = $1 AND linked_task_id = $2", [taskId, linkedTaskId]);
+  return listTaskLinks(taskId);
+}
+
+// Liste des tâches liées, enrichie de l'état de la tâche liée (pour atomic-plan).
+export async function listTaskLinks(taskId) {
+  await ensureSchema();
+  const res = await pool().query(
+    `SELECT l.linked_task_id, l.description, l.created_at,
+            t.request AS linked_request, t.recette_status AS linked_recette,
+            (SELECT x.status FROM executions x WHERE x.task_id = l.linked_task_id ORDER BY attempt DESC LIMIT 1) AS linked_status,
+            (SELECT COUNT(*) FROM plans p WHERE p.task_id = l.linked_task_id) AS linked_plans,
+            (SELECT COUNT(*) FROM artifacts a WHERE a.task_id = l.linked_task_id) AS linked_artifacts
+     FROM task_links l
+     LEFT JOIN tasks t ON t.id = l.linked_task_id
+     WHERE l.task_id = $1
+     ORDER BY l.id ASC`,
+    [taskId],
+  );
+  return res.rows.map((r) => ({
+    linkedTaskId: r.linked_task_id,
+    description: r.description,
+    createdAt: r.created_at,
+    linkedRequest: r.linked_request ?? null,
+    linkedRecette: r.linked_recette ?? null,
+    linkedStatus: r.linked_status ?? null,
+    linkedPlans: Number(r.linked_plans) || 0,
+    linkedArtifacts: Number(r.linked_artifacts) || 0,
+  }));
 }
 
 function rowToTask(row) {

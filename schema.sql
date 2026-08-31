@@ -145,6 +145,18 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 
+-- Tâches liées (tâches associées à une tâche, avec nature de la liaison).
+-- Permet à atomic-plan d'exploiter les tâches sources (commits, plans, docs).
+CREATE TABLE IF NOT EXISTS task_links (
+  id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  task_id         TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  linked_task_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  description     TEXT,                     -- nature de la liaison (libre)
+  created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_links_uniq ON task_links(task_id, linked_task_id);
+
 -- ===========================================================================
 -- Plans d'action (granularité atomique) — persistance des plans gérés par
 -- l'agent `atomic-plan` et le MCP `plan-manager`.

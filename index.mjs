@@ -40,6 +40,9 @@ import {
   listExpiredDecisions,
   addArtifact,
   listArtifacts,
+  addTaskLink,
+  removeTaskLink,
+  listTaskLinks,
   registerParticipant,
   listParticipants,
   updateTaskSession,
@@ -105,7 +108,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.3.1" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.4.0" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -124,6 +127,10 @@ server.registerTool("task_register", {
     acceptanceCriteria: z.array(z.string()).optional(),
     constraints: z.array(z.string()).optional(),
     dependencies: z.array(z.string()).optional().describe("taskId dont cette tâche dépend."),
+    linkedTasks: z.array(z.object({
+      taskId: z.string().describe("taskId de la tâche associée (source)."),
+      description: z.string().optional().describe("Nature de la liaison (ex: 'c'est là que le package a été créé')."),
+    })).optional().describe("Tâches liées : tâches associées à exploiter (commits, plans, docs) pour traiter la nouvelle tâche."),
     taskId: z.string().optional(),
     sessionId: z.string().optional().describe("Session opencode qui crée la tâche (liée par le plugin permission-hook)."),
   },
@@ -202,7 +209,39 @@ server.registerTool("task_get", {
     const planExecutions = await listPlanExecutions(taskId);
     const planCommits = await listTaskPlanCommits(taskId);
     const sessions = await listTaskSessions(taskId);
-    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions }, null, 2));
+    const linkedTasks = await listTaskLinks(taskId);
+    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === task_link_add ===
+server.registerTool("task_link_add", {
+  description: "Rattache une tâche associée (source) à une tâche, avec la nature de la liaison. Les tâches liées sont exploitables par atomic-plan (commits, plans, docs).",
+  inputSchema: {
+    taskId: z.string().describe("Tâche cible (celle qui exploitera la tâche liée)."),
+    linkedTaskId: z.string().describe("taskId de la tâche associée (source)."),
+    description: z.string().optional().describe("Nature de la liaison (libre)."),
+  },
+}, async ({ taskId, linkedTaskId, description }) => {
+  try {
+    if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
+    const links = await addTaskLink({ taskId, linkedTaskId, description });
+    return text(JSON.stringify({ ok: true, taskId, links }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === task_link_remove ===
+server.registerTool("task_link_remove", {
+  description: "Retire une tâche associée d'une tâche.",
+  inputSchema: { taskId: z.string(), linkedTaskId: z.string() },
+}, async ({ taskId, linkedTaskId }) => {
+  try {
+    const links = await removeTaskLink({ taskId, linkedTaskId });
+    return text(JSON.stringify({ ok: true, taskId, links }, null, 2));
   } catch (e) {
     return err(e.message);
   }
