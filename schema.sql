@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS projects (
   name        TEXT NOT NULL,
   workspace   TEXT,
   git_path    TEXT,
+  main_branch TEXT,                              -- branche principale (garde déploiement)
   created_at  TEXT NOT NULL,
   created_by  TEXT
 );

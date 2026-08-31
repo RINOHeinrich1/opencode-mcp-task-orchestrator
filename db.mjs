@@ -44,6 +44,7 @@ async function ensureSchema() {
 async function migrate() {
   await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS plan_id TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS audit_target TEXT");
+  await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS main_branch TEXT");
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -659,16 +660,16 @@ export async function listTaskSessions(taskId) {
 // --- Projets (entité de première classe — enregistrement explicite) --------
 function rowToProject(r) {
   if (!r) return null;
-  return { id: r.id, name: r.name, workspace: r.workspace, gitPath: r.git_path, createdAt: r.created_at, createdBy: r.created_by };
+  return { id: r.id, name: r.name, workspace: r.workspace, gitPath: r.git_path, mainBranch: r.main_branch ?? null, createdAt: r.created_at, createdBy: r.created_by };
 }
 
-export async function registerProject({ id, name, workspace, gitPath, createdBy }) {
+export async function registerProject({ id, name, workspace, gitPath, mainBranch, createdBy }) {
   await ensureSchema();
   await pool().query(
-    `INSERT INTO projects (id, name, workspace, git_path, created_at, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, workspace = EXCLUDED.workspace, git_path = EXCLUDED.git_path`,
-    [id, name, workspace ?? null, gitPath ?? null, nowIso(), createdBy ?? null],
+    `INSERT INTO projects (id, name, workspace, git_path, main_branch, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
+     ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, workspace = EXCLUDED.workspace, git_path = EXCLUDED.git_path, main_branch = EXCLUDED.main_branch`,
+    [id, name, workspace ?? null, gitPath ?? null, mainBranch ?? null, nowIso(), createdBy ?? null],
   );
   return getProject(id);
 }

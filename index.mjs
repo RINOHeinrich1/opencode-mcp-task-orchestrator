@@ -105,7 +105,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.2.1" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.3.0" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -144,17 +144,18 @@ server.registerTool("task_register", {
 
 // === project_register ===
 server.registerTool("project_register", {
-  description: "Enregistre (ou met à jour) un projet dans le registre. Toute tâche doit référencer un projet existant.",
+  description: "Enregistre (ou met à jour) un projet dans le registre. Toute tâche doit référencer un projet existant. La branche principale (mainBranch) est OBLIGATOIRE pour autoriser le déploiement d'une tâche.",
   inputSchema: {
     id: z.string().describe("Identifiant du projet (ex: oniria)."),
     name: z.string().describe("Nom lisible du projet."),
     workspace: z.string().optional().describe("Workspace Coder associé."),
     gitPath: z.string().optional().describe("Chemin du dépôt git (hôte ou /home/coder)."),
+    mainBranch: z.string().optional().describe("Branche principale du projet (ex: main, oniria-preprod) — requise pour déployer."),
     createdBy: z.string().optional(),
   },
-}, async ({ id, name, workspace, gitPath, createdBy }) => {
+}, async ({ id, name, workspace, gitPath, mainBranch, createdBy }) => {
   try {
-    const project = await registerProject({ id, name, workspace, gitPath, createdBy });
+    const project = await registerProject({ id, name, workspace, gitPath, mainBranch, createdBy });
     return text(JSON.stringify({ ok: true, project }, null, 2));
   } catch (e) {
     return err(e.message);
