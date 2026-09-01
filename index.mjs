@@ -123,7 +123,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.6.3" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.6.4" });
 
 // === task_register ===
 server.registerTool("task_register", {

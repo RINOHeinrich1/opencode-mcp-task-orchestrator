@@ -99,7 +99,7 @@ export async function createTask(task) {
     [
       task.id,
       task.request,
-      task.title || substr(task.request, 1, 60),
+      task.title || String(task.request || "").slice(0, 60),
       task.project,
       task.workspace ?? null,
       task.type || "feature",
