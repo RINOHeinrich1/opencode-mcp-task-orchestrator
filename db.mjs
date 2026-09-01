@@ -50,6 +50,7 @@ async function migrate() {
   await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS description TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recette_id TEXT");
+  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS direct_execution INTEGER NOT NULL DEFAULT 0");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_tasks (
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
     task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -94,8 +95,8 @@ export async function createTask(task) {
     `INSERT INTO tasks
        (id, request, title, project, workspace, type, audit_target, priority, deadline,
         budget_maxsteps, budget_maxcost, scope, acceptance_criteria,
-        constraints, dependencies, created_at, created_by, session_id, recette_class, recette_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+        constraints, dependencies, created_at, created_by, session_id, recette_class, recette_id, direct_execution)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`,
     [
       task.id,
       task.request,
@@ -117,6 +118,7 @@ export async function createTask(task) {
       task.sessionId ?? null,
       task.recetteClass ?? null,
       task.recetteId ?? null,
+      task.directExecution ? 1 : 0,
     ],
   );
   // Exécution initiale (statut queued).
@@ -207,6 +209,7 @@ function rowToTask(row) {
     recetteClass: row.recette_class ?? null,
     recetteId: row.recette_id ?? null,
     title: row.title ?? null,
+    directExecution: !!row.direct_execution,
     version: row.version,
   };
 }

@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   recette_class  TEXT,                             -- si tâche issue d'une recette : rework | bug | improvement | feature
   recette_id     TEXT,                             -- recette SOURCE si la tâche a été générée par une recette
   title          TEXT,                             -- titre court de la tâche (obligatoire)
+  direct_execution INTEGER NOT NULL DEFAULT 0,     -- 1 = exécution directe via build-notify (pas d'atomic-plan)
   version        INTEGER NOT NULL DEFAULT 0        -- optimistic lock
 );
 

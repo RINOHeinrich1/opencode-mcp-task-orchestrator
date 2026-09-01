@@ -123,7 +123,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.6.4" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.6.5" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -149,6 +149,7 @@ server.registerTool("task_register", {
     recetteClass: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Si la tâche est issue d'une recette : sa classification."),
     recetteId: z.string().optional().describe("Recette SOURCE si la tâche a été générée par une recette."),
     title: z.string().optional().describe("Titre court de la tâche (dérivé de la demande si absent)."),
+    directExecution: z.boolean().optional().describe("Exécution directe via build-notify (pas d'atomic-plan) pour les tâches simples."),
     taskId: z.string().optional(),
     sessionId: z.string().optional().describe("Session opencode qui crée la tâche (liée par le plugin permission-hook)."),
   },
