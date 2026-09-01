@@ -513,7 +513,7 @@ export async function findScopeConflicts(project, scope, excludeTaskId) {
 }
 
 // --- Mise à jour d'une tâche (uniquement en statut queued) -----------------
-export async function updateTask({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution }) {
+export async function updateTask({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution, linkedTasks }) {
   await ensureSchema();
   const task = await getTask(taskId);
   if (!task) throw new Error(`tâche inconnue : ${taskId}`);
@@ -529,6 +529,13 @@ export async function updateTask({ taskId, request, title, acceptanceCriteria, s
   if (scope !== undefined) { params.push(JSON.stringify(scope)); sets.push(`scope = $${params.length}`); }
   if (priority !== undefined) { params.push(priority); sets.push(`priority = $${params.length}`); }
   if (directExecution !== undefined) { params.push(directExecution ? 1 : 0); sets.push(`direct_execution = $${params.length}`); }
+  // Remplacement des tâches liées si fournies (AVANT le early-return des champs).
+  if (linkedTasks !== undefined) {
+    await pool().query("DELETE FROM task_links WHERE task_id = $1", [taskId]);
+    for (const l of linkedTasks || []) {
+      if (l && l.taskId) await addTaskLink({ taskId, linkedTaskId: l.taskId, description: l.description ?? null });
+    }
+  }
   if (!sets.length) return getTask(taskId);
   params.push(taskId);
   await pool().query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
