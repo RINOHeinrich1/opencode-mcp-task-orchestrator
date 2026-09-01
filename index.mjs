@@ -123,7 +123,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.6.5" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.6.6" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -502,10 +502,11 @@ server.registerTool("task_update", {
     acceptanceCriteria: z.array(z.string()).optional(),
     scope: z.array(z.string()).optional(),
     priority: z.enum(["low", "normal", "high", "critical"]).optional(),
+    directExecution: z.boolean().optional().describe("Exécution directe via build-notify (sans atomic-plan)."),
   },
-}, async ({ taskId, request, title, acceptanceCriteria, scope, priority }) => {
+}, async ({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution }) => {
   try {
-    const task = await updateTask({ taskId, request, title, acceptanceCriteria, scope, priority });
+    const task = await updateTask({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution });
     return text(JSON.stringify({ ok: true, task }, null, 2));
   } catch (e) {
     return err(e.message);
