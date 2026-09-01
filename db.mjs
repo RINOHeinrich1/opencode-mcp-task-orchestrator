@@ -45,6 +45,18 @@ async function migrate() {
   await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS plan_id TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS audit_target TEXT");
   await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS main_branch TEXT");
+  await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS project TEXT");
+  await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS title TEXT");
+  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title TEXT");
+  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recette_id TEXT");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_tasks (
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (recette_id, task_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id)");
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS title TEXT");
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS acceptance TEXT");
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -72,13 +84,14 @@ export async function createTask(task) {
   await ensureSchema();
   await pool().query(
     `INSERT INTO tasks
-       (id, request, project, workspace, type, audit_target, priority, deadline,
+       (id, request, title, project, workspace, type, audit_target, priority, deadline,
         budget_maxsteps, budget_maxcost, scope, acceptance_criteria,
-        constraints, dependencies, created_at, created_by, session_id, recette_class)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+        constraints, dependencies, created_at, created_by, session_id, recette_class, recette_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
     [
       task.id,
       task.request,
+      task.title || substr(task.request, 1, 60),
       task.project,
       task.workspace ?? null,
       task.type || "feature",
@@ -95,6 +108,7 @@ export async function createTask(task) {
       task.createdBy ?? null,
       task.sessionId ?? null,
       task.recetteClass ?? null,
+      task.recetteId ?? null,
     ],
   );
   // Exécution initiale (statut queued).
@@ -183,6 +197,8 @@ function rowToTask(row) {
     sessionId: row.session_id,
     recetteStatus: row.recette_status ?? "pending",
     recetteClass: row.recette_class ?? null,
+    recetteId: row.recette_id ?? null,
+    title: row.title ?? null,
     version: row.version,
   };
 }
@@ -397,16 +413,8 @@ export async function applyTransition({ taskId, to, by, note }) {
       "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'TRANSITION',$4,$5)",
       [`${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, taskId, nowIso(), by, JSON.stringify({ from, to, note: note ?? null })],
     );
-    // Entrée en recette AUTOMATIQUE (v0.7.0) : dès que la tâche passe `done`,
-    // une opération de recette est créée (statut 'pending' = pas faite).
-    if (to === "done") {
-      await client.query(
-        `INSERT INTO recettes (recette_id, task_id, status, created_at)
-         SELECT $1, $2, 'pending', $3
-         WHERE NOT EXISTS (SELECT 1 FROM recettes WHERE task_id = $2)`,
-        [`RECT-${taskId}-${Date.now().toString(36)}`, taskId, nowIso()],
-      );
-    }
+    // v0.8.0 : PLUS de recette automatique par tâche — la recette est une
+    // opération de PROJET (0..N tâches), créée par l'utilisateur (onglet Recettes).
     return { from, to };
   });
   return {
@@ -1035,81 +1043,133 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
 }
 
 // ===========================================================================
-// Recette (opération de vérification) — v0.7.0
+// Recette (opération de vérification) — v0.8.0 (objet de premier niveau, projet)
 // ===========================================================================
 
-// Crée la recette d'une tâche (idempotent) et la passe en cours si demandé.
-export async function startRecette({ taskId, status = "pending", sessionId = null }) {
+// Crée une recette de PROJET (titre + 0..N tâches couvertes) et la passe en cours.
+export async function startRecette({ project, title, taskIds, status = "pending", sessionId = null }) {
   await ensureSchema();
-  const existing = (await pool().query("SELECT recette_id FROM recettes WHERE task_id = $1 ORDER BY created_at DESC LIMIT 1", [taskId])).rows[0];
-  let recetteId;
-  if (existing) {
-    recetteId = existing.recette_id;
-    if (status && status !== "pending") {
-      await pool().query("UPDATE recettes SET status = $1, session_id = COALESCE($2, session_id) WHERE recette_id = $3", [status, sessionId, recetteId]);
-    }
-  } else {
-    recetteId = `RECT-${taskId}-${Date.now().toString(36)}`;
-    await pool().query(
-      "INSERT INTO recettes (recette_id, task_id, session_id, status, created_at) VALUES ($1,$2,$3,$4,$5)",
-      [recetteId, taskId, sessionId, status, nowIso()],
-    );
+  if (!project) throw new Error("projet requis pour une recette");
+  const recetteId = `RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    "INSERT INTO recettes (recette_id, project, title, session_id, status, created_at) VALUES ($1,$2,$3,$4,$5,$6)",
+    [recetteId, project, title || `Recette ${project}`, sessionId, status, nowIso()],
+  );
+  for (const t of taskIds || []) {
+    if (t) await linkRecetteTask(recetteId, t);
   }
-  await pool().query("UPDATE tasks SET recette_status = $1 WHERE id = $2", [status, taskId]);
-  return getRecette(taskId);
+  return getRecetteById(recetteId);
 }
 
+// Rattache une tâche à une recette (couverture).
+export async function linkRecetteTask(recetteId, taskId) {
+  await ensureSchema();
+  await pool().query(
+    "INSERT INTO recette_tasks (recette_id, task_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [recetteId, taskId],
+  );
+  return recetteId;
+}
+
+// Liste les recettes d'un projet (ou toutes).
+export async function listProjectRecettes(project) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT r.*,
+            (SELECT COUNT(*) FROM recette_tasks rt WHERE rt.recette_id = r.recette_id) AS tasks_count,
+            (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = r.recette_id) AS items_count
+     FROM recettes r ${project ? "WHERE r.project = $1" : ""} ORDER BY r.created_at DESC`,
+    project ? [project] : [],
+  )).rows;
+  return rows.map((r) => ({
+    recetteId: r.recette_id,
+    project: r.project,
+    title: r.title,
+    sessionId: r.session_id,
+    status: r.status,
+    createdAt: r.created_at,
+    confirmedAt: r.confirmed_at,
+    confirmedBy: r.confirmed_by,
+    tasksCount: Number(r.tasks_count),
+    itemsCount: Number(r.items_count),
+  }));
+}
+
+// Recette couvrant une tâche (via recette_tasks) — pour l'affichage côté tâche.
 export async function getRecette(taskId) {
   await ensureSchema();
   const r = (await pool().query(
-    `SELECT r.*, (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = r.recette_id) AS items_count
-     FROM recettes r WHERE r.task_id = $1 ORDER BY r.created_at DESC LIMIT 1`,
+    `SELECT r.* FROM recettes r
+     JOIN recette_tasks rt ON rt.recette_id = r.recette_id
+     WHERE rt.task_id = $1 ORDER BY r.created_at DESC LIMIT 1`,
     [taskId],
   )).rows[0];
   if (!r) return null;
+  return getRecetteById(r.recette_id);
+}
+
+export async function getRecetteById(recetteId) {
+  await ensureSchema();
+  const r = (await pool().query(
+    `SELECT r.*, (SELECT COUNT(*) FROM recette_tasks rt WHERE rt.recette_id = r.recette_id) AS tasks_count,
+            (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = r.recette_id) AS items_count
+     FROM recettes r WHERE r.recette_id = $1`,
+    [recetteId],
+  )).rows[0];
+  if (!r) return null;
+  const tasks = (await pool().query(
+    "SELECT task_id FROM recette_tasks WHERE recette_id = $1 ORDER BY task_id",
+    [recetteId],
+  )).rows.map((x) => x.task_id);
   const items = (await pool().query(
-    "SELECT id, content, classification, discussion, scope, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
-    [r.recette_id],
+    "SELECT id, content, classification, discussion, scope, title, acceptance, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
+    [recetteId],
   )).rows.map((i) => ({
     itemId: Number(i.id),
     content: i.content,
     classification: i.classification,
     discussion: i.discussion,
     scope: i.scope ? JSON.parse(i.scope) : [],
+    title: i.title ?? null,
+    acceptance: i.acceptance ?? null,
     status: i.status,
     createdTaskId: i.created_task_id ?? null,
     createdAt: i.created_at,
   }));
   return {
     recetteId: r.recette_id,
-    taskId: r.task_id,
+    project: r.project,
+    title: r.title,
     sessionId: r.session_id,
     status: r.status,
     createdAt: r.created_at,
     confirmedAt: r.confirmed_at,
     confirmedBy: r.confirmed_by,
+    tasks,
     items,
   };
 }
 
-export async function addRecetteItem({ recetteId, content, classification, discussion, scope }) {
+export async function addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance }) {
   await ensureSchema();
   if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
   const r = (await pool().query(
-    `INSERT INTO recette_items (recette_id, content, classification, discussion, scope, status, created_at)
-     VALUES ($1,$2,$3,$4,$5,'open',$6) RETURNING id`,
-    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, nowIso()],
+    `INSERT INTO recette_items (recette_id, content, classification, discussion, scope, title, acceptance, status, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8) RETURNING id`,
+    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, title ?? null, acceptance ?? null, nowIso()],
   )).rows[0];
   return getRecetteItem(Number(r.id));
 }
 
-export async function updateRecetteItem({ itemId, classification, discussion, scope, status, createdTaskId }) {
+export async function updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, status, createdTaskId }) {
   await ensureSchema();
   const sets = [];
   const params = [];
   if (classification) { params.push(classification); sets.push(`classification = $${params.length}`); }
   if (discussion !== undefined) { params.push(discussion); sets.push(`discussion = $${params.length}`); }
   if (scope !== undefined) { params.push(scope && scope.length ? JSON.stringify(scope) : null); sets.push(`scope = $${params.length}`); }
+  if (title !== undefined) { params.push(title); sets.push(`title = $${params.length}`); }
+  if (acceptance !== undefined) { params.push(acceptance); sets.push(`acceptance = $${params.length}`); }
   if (status) { params.push(status); sets.push(`status = $${params.length}`); }
   if (createdTaskId !== undefined) { params.push(createdTaskId); sets.push(`created_task_id = $${params.length}`); }
   if (!sets.length) return getRecetteItem(itemId);
@@ -1120,7 +1180,7 @@ export async function updateRecetteItem({ itemId, classification, discussion, sc
 
 async function getRecetteItem(itemId) {
   const r = (await pool().query(
-    "SELECT id, recette_id, content, classification, discussion, status, created_task_id, created_at FROM recette_items WHERE id = $1",
+    "SELECT id, recette_id, content, classification, discussion, scope, title, acceptance, status, created_task_id, created_at FROM recette_items WHERE id = $1",
     [itemId],
   )).rows[0];
   return r ? {
@@ -1130,27 +1190,41 @@ async function getRecetteItem(itemId) {
     classification: r.classification,
     discussion: r.discussion,
     scope: r.scope ? JSON.parse(r.scope) : [],
+    title: r.title ?? null,
+    acceptance: r.acceptance ?? null,
     status: r.status,
     createdTaskId: r.created_task_id ?? null,
     createdAt: r.created_at,
   } : null;
 }
 
-// Marque la recette comme TERMINÉE (faite) — la tâche initiale est close.
+// Associe une session lancée à une recette + passe en cours.
+export async function setRecetteSession({ recetteId, sessionId }) {
+  await ensureSchema();
+  await pool().query(
+    "UPDATE recettes SET status = 'in_progress', session_id = COALESCE($1, session_id) WHERE recette_id = $2",
+    [sessionId ?? null, recetteId],
+  );
+  return getRecetteById(recetteId);
+}
+
+// Marque la recette TERMINÉE (faite) + toutes les tâches couvertes recette_status='done'.
 export async function confirmRecette({ recetteId, confirmedBy }) {
   await ensureSchema();
   const r = (await pool().query(
-    "UPDATE recettes SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE recette_id = $3 RETURNING task_id",
+    "UPDATE recettes SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE recette_id = $3 RETURNING recette_id",
     [nowIso(), confirmedBy ?? "human", recetteId],
   )).rows[0];
   if (!r) throw new Error(`recette inconnue : ${recetteId}`);
-  await pool().query("UPDATE tasks SET recette_status = 'done' WHERE id = $1", [r.task_id]);
-  // Résout les décisions recette legacy encore 'awaiting' (créées par l'ancien
-  // flux decision_request kind=recette) — elles sont close par la clôture recette.
-  await pool().query(
-    `UPDATE decisions SET status = 'approved', resolved_at = $1, resolution = 'Recette close via le framework recette (v0.7)'
-     WHERE task_id = $2 AND kind = 'recette' AND status = 'awaiting'`,
-    [nowIso(), r.task_id],
-  );
-  return getRecette(r.task_id);
+  const tasks = (await pool().query("SELECT task_id FROM recette_tasks WHERE recette_id = $1", [recetteId])).rows.map((x) => x.task_id);
+  for (const t of tasks) {
+    await pool().query("UPDATE tasks SET recette_status = 'done' WHERE id = $1", [t]);
+    // Résout les décisions recette legacy encore 'awaiting' de la tâche couverte.
+    await pool().query(
+      `UPDATE decisions SET status = 'approved', resolved_at = $1, resolution = 'Recette close via le framework recette (v0.8)'
+       WHERE task_id = $2 AND kind = 'recette' AND status = 'awaiting'`,
+      [nowIso(), t],
+    );
+  }
+  return getRecetteById(recetteId);
 }

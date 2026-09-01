@@ -45,6 +45,10 @@ import {
   listTaskLinks,
   startRecette,
   getRecette,
+  getRecetteById,
+  listProjectRecettes,
+  linkRecetteTask,
+  setRecetteSession,
   addRecetteItem,
   updateRecetteItem,
   confirmRecette,
@@ -115,7 +119,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.5.3" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.6.0" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -139,6 +143,8 @@ server.registerTool("task_register", {
       description: z.string().optional().describe("Nature de la liaison (ex: 'c'est là que le package a été créé')."),
     })).optional().describe("Tâches liées : tâches associées à exploiter (commits, plans, docs) pour traiter la nouvelle tâche."),
     recetteClass: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Si la tâche est issue d'une recette : sa classification."),
+    recetteId: z.string().optional().describe("Recette SOURCE si la tâche a été générée par une recette."),
+    title: z.string().optional().describe("Titre court de la tâche (dérivé de la demande si absent)."),
     taskId: z.string().optional(),
     sessionId: z.string().optional().describe("Session opencode qui crée la tâche (liée par le plugin permission-hook)."),
   },
@@ -258,17 +264,72 @@ server.registerTool("task_link_remove", {
 
 // === recette_start ===
 server.registerTool("recette_start", {
-  description: "Démarre (ou récupère) l'opération de recette d'une tâche terminée : crée la recette (statut 'pending' = pas faite, ou 'in_progress' en cours) et lie la session dédiée si fournie.",
+  description: "Crée une opération de recette de PROJET (v0.8.0) : titre + 0..N tâches couvertes + session dédiée. La recette est un objet de premier niveau rattaché au projet.",
   inputSchema: {
-    taskId: z.string(),
-    status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut, pas faite) ou in_progress (session recette lancée)."),
+    project: z.string().describe("Projet rattaché (contexte obligatoire)."),
+    title: z.string().optional().describe("Titre compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
+    taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N)."),
+    status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
     sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
   },
-}, async ({ taskId, status, sessionId }) => {
+}, async ({ project, title, taskIds, status, sessionId }) => {
+  try {
+    const recette = await startRecette({ project, title, taskIds, status: status || "pending", sessionId: sessionId || null });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_list ===
+server.registerTool("recette_list", {
+  description: "Liste les recettes (toutes ou filtrées par projet) avec nb de tâches couvertes et nb d'éléments.",
+  inputSchema: { project: z.string().optional() },
+}, async ({ project }) => {
+  try {
+    const recettes = await listProjectRecettes(project);
+    return text(JSON.stringify({ count: recettes.length, recettes }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_get ===
+server.registerTool("recette_get", {
+  description: "Détail d'une recette (titre, projet, statut, tâches couvertes, éléments).",
+  inputSchema: { recetteId: z.string() },
+}, async ({ recetteId }) => {
+  try {
+    const recette = await getRecetteById(recetteId);
+    if (!recette) return err(`recette inconnue : ${recetteId}`);
+    return text(JSON.stringify({ recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_session_set ===
+server.registerTool("recette_session_set", {
+  description: "Associe la session dédiée lancée à une recette et la passe en cours (in_progress).",
+  inputSchema: { recetteId: z.string(), sessionId: z.string() },
+}, async ({ recetteId, sessionId }) => {
+  try {
+    const recette = await setRecetteSession({ recetteId, sessionId });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_link_task ===
+server.registerTool("recette_link_task", {
+  description: "Rattache une tâche à une recette (tâche couverte par la recette).",
+  inputSchema: { recetteId: z.string(), taskId: z.string() },
+}, async ({ recetteId, taskId }) => {
   try {
     if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
-    const recette = await startRecette({ taskId, status: status || "pending", sessionId: sessionId || null });
-    return text(JSON.stringify({ ok: true, recette }, null, 2));
+    await linkRecetteTask(recetteId, taskId);
+    return text(JSON.stringify({ ok: true, recette: await getRecetteById(recetteId) }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -283,10 +344,12 @@ server.registerTool("recette_item_add", {
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Nature de l'élément (défaut rework)."),
     discussion: z.string().optional().describe("Échanges associés."),
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins) — transmis à la tâche créée à la confirmation."),
+    title: z.string().optional().describe("Titre court de la tâche qui sera créée à la confirmation."),
+    acceptance: z.string().optional().describe("Critère d'acceptation / livrable attendu de la tâche qui sera créée."),
   },
-}, async ({ recetteId, content, classification, discussion, scope }) => {
+}, async ({ recetteId, content, classification, discussion, scope, title, acceptance }) => {
   try {
-    const item = await addRecetteItem({ recetteId, content, classification, discussion, scope });
+    const item = await addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -301,12 +364,14 @@ server.registerTool("recette_item_update", {
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional(),
     discussion: z.string().optional(),
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins)."),
+    title: z.string().optional(),
+    acceptance: z.string().optional(),
     status: z.enum(["open", "task_created"]).optional(),
     createdTaskId: z.string().optional(),
   },
-}, async ({ itemId, classification, discussion, scope, status, createdTaskId }) => {
+}, async ({ itemId, classification, discussion, scope, title, acceptance, status, createdTaskId }) => {
   try {
-    const item = await updateRecetteItem({ itemId, classification, discussion, scope, status, createdTaskId });
+    const item = await updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, status, createdTaskId });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);

@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   session_id     TEXT,                             -- session opencode qui a créé la tâche
   recette_status TEXT NOT NULL DEFAULT 'pending',  -- recette : pending (pas faite) | in_progress (en cours) | done (faite)
   recette_class  TEXT,                             -- si tâche issue d'une recette : rework | bug | improvement | feature
+  recette_id     TEXT,                             -- recette SOURCE si la tâche a été générée par une recette
+  title          TEXT,                             -- titre court de la tâche (obligatoire)
   version        INTEGER NOT NULL DEFAULT 0        -- optimistic lock
 );
 
@@ -159,21 +161,31 @@ CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_task_links_uniq ON task_links(task_id, linked_task_id);
 
 -- ===========================================================================
--- Recette (opération de vérification d'une tâche terminée) — v0.7.0
--- Une recette = un contexte de travail indépendant (session dédiée, agent
--- dédié, éléments consolidés). La tâche initiale reste `done` et intacte ;
--- les travaux découverts en recette deviennent de NOUVELLES tâches.
+-- Recette (opération de vérification) — v0.8.0
+-- Objet de premier niveau rattaché à un PROJET, avec titre, session propre,
+-- couvrant 0..N tâches (recette_tasks). Les éléments identifiés pendant la
+-- recette deviennent de NOUVELLES tâches.
 -- ===========================================================================
 CREATE TABLE IF NOT EXISTS recettes (
-  recette_id   TEXT PRIMARY KEY,            -- RECT-<taskId>-<ts>
-  task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  recette_id   TEXT PRIMARY KEY,            -- RECT-<ts>-<rand>
+  project      TEXT NOT NULL,               -- projet rattaché (contexte obligatoire)
+  title        TEXT NOT NULL,               -- titre compréhensible (ex: "Recette du module chatbot")
+  task_id      TEXT,                        -- legacy (une seule tâche) — associations via recette_tasks
   session_id   TEXT,                        -- session dédiée agent-recette
   status       TEXT NOT NULL DEFAULT 'pending',  -- pending (pas faite) | in_progress (en cours) | done (faite)
   created_at   TEXT NOT NULL,
   confirmed_at TEXT,
   confirmed_by TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_recettes_task ON recettes(task_id);
+CREATE INDEX IF NOT EXISTS idx_recettes_project ON recettes(project);
+
+-- Tâches couvertes par une recette (0..N).
+CREATE TABLE IF NOT EXISTS recette_tasks (
+  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  PRIMARY KEY (recette_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id);
 
 -- Éléments détectés pendant la recette (remarques, demandes, constats…).
 CREATE TABLE IF NOT EXISTS recette_items (
