@@ -74,8 +74,8 @@ export async function createTask(task) {
     `INSERT INTO tasks
        (id, request, project, workspace, type, audit_target, priority, deadline,
         budget_maxsteps, budget_maxcost, scope, acceptance_criteria,
-        constraints, dependencies, created_at, created_by, session_id)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+        constraints, dependencies, created_at, created_by, session_id, recette_class)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
     [
       task.id,
       task.request,
@@ -94,6 +94,7 @@ export async function createTask(task) {
       nowIso(),
       task.createdBy ?? null,
       task.sessionId ?? null,
+      task.recetteClass ?? null,
     ],
   );
   // Exécution initiale (statut queued).
@@ -181,6 +182,7 @@ function rowToTask(row) {
     createdBy: row.created_by,
     sessionId: row.session_id,
     recetteStatus: row.recette_status ?? "pending",
+    recetteClass: row.recette_class ?? null,
     version: row.version,
   };
 }
@@ -395,6 +397,16 @@ export async function applyTransition({ taskId, to, by, note }) {
       "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'TRANSITION',$4,$5)",
       [`${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, taskId, nowIso(), by, JSON.stringify({ from, to, note: note ?? null })],
     );
+    // Entrée en recette AUTOMATIQUE (v0.7.0) : dès que la tâche passe `done`,
+    // une opération de recette est créée (statut 'pending' = pas faite).
+    if (to === "done") {
+      await client.query(
+        `INSERT INTO recettes (recette_id, task_id, status, created_at)
+         SELECT $1, $2, 'pending', $3
+         WHERE NOT EXISTS (SELECT 1 FROM recettes WHERE task_id = $2)`,
+        [`RECT-${taskId}-${Date.now().toString(36)}`, taskId, nowIso()],
+      );
+    }
     return { from, to };
   });
   return {
@@ -1020,4 +1032,115 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
   }
 
   return { decision: await getDecision(decisionId), transitioned: false };
+}
+
+// ===========================================================================
+// Recette (opération de vérification) — v0.7.0
+// ===========================================================================
+
+// Crée la recette d'une tâche (idempotent) et la passe en cours si demandé.
+export async function startRecette({ taskId, status = "pending", sessionId = null }) {
+  await ensureSchema();
+  const existing = (await pool().query("SELECT recette_id FROM recettes WHERE task_id = $1 ORDER BY created_at DESC LIMIT 1", [taskId])).rows[0];
+  let recetteId;
+  if (existing) {
+    recetteId = existing.recette_id;
+    if (status && status !== "pending") {
+      await pool().query("UPDATE recettes SET status = $1, session_id = COALESCE($2, session_id) WHERE recette_id = $3", [status, sessionId, recetteId]);
+    }
+  } else {
+    recetteId = `RECT-${taskId}-${Date.now().toString(36)}`;
+    await pool().query(
+      "INSERT INTO recettes (recette_id, task_id, session_id, status, created_at) VALUES ($1,$2,$3,$4,$5)",
+      [recetteId, taskId, sessionId, status, nowIso()],
+    );
+  }
+  await pool().query("UPDATE tasks SET recette_status = $1 WHERE id = $2", [status, taskId]);
+  return getRecette(taskId);
+}
+
+export async function getRecette(taskId) {
+  await ensureSchema();
+  const r = (await pool().query(
+    `SELECT r.*, (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = r.recette_id) AS items_count
+     FROM recettes r WHERE r.task_id = $1 ORDER BY r.created_at DESC LIMIT 1`,
+    [taskId],
+  )).rows[0];
+  if (!r) return null;
+  const items = (await pool().query(
+    "SELECT id, content, classification, discussion, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
+    [r.recette_id],
+  )).rows.map((i) => ({
+    itemId: Number(i.id),
+    content: i.content,
+    classification: i.classification,
+    discussion: i.discussion,
+    status: i.status,
+    createdTaskId: i.created_task_id ?? null,
+    createdAt: i.created_at,
+  }));
+  return {
+    recetteId: r.recette_id,
+    taskId: r.task_id,
+    sessionId: r.session_id,
+    status: r.status,
+    createdAt: r.created_at,
+    confirmedAt: r.confirmed_at,
+    confirmedBy: r.confirmed_by,
+    items,
+  };
+}
+
+export async function addRecetteItem({ recetteId, content, classification, discussion }) {
+  await ensureSchema();
+  if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
+  const r = (await pool().query(
+    `INSERT INTO recette_items (recette_id, content, classification, discussion, status, created_at)
+     VALUES ($1,$2,$3,$4,'open',$5) RETURNING id`,
+    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, nowIso()],
+  )).rows[0];
+  return getRecetteItem(Number(r.id));
+}
+
+export async function updateRecetteItem({ itemId, classification, discussion, status, createdTaskId }) {
+  await ensureSchema();
+  const sets = [];
+  const params = [];
+  if (classification) { params.push(classification); sets.push(`classification = $${params.length}`); }
+  if (discussion !== undefined) { params.push(discussion); sets.push(`discussion = $${params.length}`); }
+  if (status) { params.push(status); sets.push(`status = $${params.length}`); }
+  if (createdTaskId !== undefined) { params.push(createdTaskId); sets.push(`created_task_id = $${params.length}`); }
+  if (!sets.length) return getRecetteItem(itemId);
+  params.push(itemId);
+  await pool().query(`UPDATE recette_items SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  return getRecetteItem(itemId);
+}
+
+async function getRecetteItem(itemId) {
+  const r = (await pool().query(
+    "SELECT id, recette_id, content, classification, discussion, status, created_task_id, created_at FROM recette_items WHERE id = $1",
+    [itemId],
+  )).rows[0];
+  return r ? {
+    itemId: Number(r.id),
+    recetteId: r.recette_id,
+    content: r.content,
+    classification: r.classification,
+    discussion: r.discussion,
+    status: r.status,
+    createdTaskId: r.created_task_id ?? null,
+    createdAt: r.created_at,
+  } : null;
+}
+
+// Marque la recette comme TERMINÉE (faite) — la tâche initiale est close.
+export async function confirmRecette({ recetteId, confirmedBy }) {
+  await ensureSchema();
+  const r = (await pool().query(
+    "UPDATE recettes SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE recette_id = $3 RETURNING task_id",
+    [nowIso(), confirmedBy ?? "human", recetteId],
+  )).rows[0];
+  if (!r) throw new Error(`recette inconnue : ${recetteId}`);
+  await pool().query("UPDATE tasks SET recette_status = 'done' WHERE id = $1", [r.task_id]);
+  return getRecette(r.task_id);
 }

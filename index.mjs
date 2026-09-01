@@ -43,6 +43,11 @@ import {
   addTaskLink,
   removeTaskLink,
   listTaskLinks,
+  startRecette,
+  getRecette,
+  addRecetteItem,
+  updateRecetteItem,
+  confirmRecette,
   registerParticipant,
   listParticipants,
   updateTaskSession,
@@ -101,14 +106,16 @@ function stamp() {
 }
 
 function newTaskId() {
-  return `T-${stamp()}`;
+  // Unicité garantie : timestamp + suffixe aléatoire (deux enregistrements
+  // dans la même seconde ne peuvent pas entrer en collision).
+  return `T-${stamp()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
 function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.4.0" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.5.0" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -131,6 +138,7 @@ server.registerTool("task_register", {
       taskId: z.string().describe("taskId de la tâche associée (source)."),
       description: z.string().optional().describe("Nature de la liaison (ex: 'c'est là que le package a été créé')."),
     })).optional().describe("Tâches liées : tâches associées à exploiter (commits, plans, docs) pour traiter la nouvelle tâche."),
+    recetteClass: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Si la tâche est issue d'une recette : sa classification."),
     taskId: z.string().optional(),
     sessionId: z.string().optional().describe("Session opencode qui crée la tâche (liée par le plugin permission-hook)."),
   },
@@ -210,7 +218,8 @@ server.registerTool("task_get", {
     const planCommits = await listTaskPlanCommits(taskId);
     const sessions = await listTaskSessions(taskId);
     const linkedTasks = await listTaskLinks(taskId);
-    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks }, null, 2));
+    const recette = await getRecette(taskId).catch(() => null);
+    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks, recette }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -242,6 +251,77 @@ server.registerTool("task_link_remove", {
   try {
     const links = await removeTaskLink({ taskId, linkedTaskId });
     return text(JSON.stringify({ ok: true, taskId, links }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_start ===
+server.registerTool("recette_start", {
+  description: "Démarre (ou récupère) l'opération de recette d'une tâche terminée : crée la recette (statut 'pending' = pas faite, ou 'in_progress' en cours) et lie la session dédiée si fournie.",
+  inputSchema: {
+    taskId: z.string(),
+    status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut, pas faite) ou in_progress (session recette lancée)."),
+    sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
+  },
+}, async ({ taskId, status, sessionId }) => {
+  try {
+    if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
+    const recette = await startRecette({ taskId, status: status || "pending", sessionId: sessionId || null });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_item_add ===
+server.registerTool("recette_item_add", {
+  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature).",
+  inputSchema: {
+    recetteId: z.string(),
+    content: z.string().describe("La remarque / demande / constat."),
+    classification: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Nature de l'élément (défaut rework)."),
+    discussion: z.string().optional().describe("Échanges associés."),
+  },
+}, async ({ recetteId, content, classification, discussion }) => {
+  try {
+    const item = await addRecetteItem({ recetteId, content, classification, discussion });
+    return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_item_update ===
+server.registerTool("recette_item_update", {
+  description: "Met à jour un élément de recette (classification, discussion, statut, tâche créée).",
+  inputSchema: {
+    itemId: z.number().int(),
+    classification: z.enum(["rework", "bug", "improvement", "feature"]).optional(),
+    discussion: z.string().optional(),
+    status: z.enum(["open", "task_created"]).optional(),
+    createdTaskId: z.string().optional(),
+  },
+}, async ({ itemId, classification, discussion, status, createdTaskId }) => {
+  try {
+    const item = await updateRecetteItem({ itemId, classification, discussion, status, createdTaskId });
+    return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_confirm ===
+server.registerTool("recette_confirm", {
+  description: "Clôt la recette (statut 'done' = faite) après confirmation de la liste consolidée. La tâche initiale reste done et close ; les travaux issus sont de nouvelles tâches.",
+  inputSchema: {
+    recetteId: z.string(),
+    confirmedBy: z.string().optional(),
+  },
+}, async ({ recetteId, confirmedBy }) => {
+  try {
+    const recette = await confirmRecette({ recetteId, confirmedBy });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -313,10 +393,10 @@ server.registerTool("task_transition", {
     const exec = await getCurrentExecution(taskId);
     if (!exec) return err(`tâche inconnue : ${taskId}`);
     if (!isValidState(to)) return err(`statut invalide : ${to}`);
-    // Garde (v0.5.2) : une recette déjà validée clôture la tâche — aucune transition.
+    // Garde (v0.5.2) : une recette en cours ou terminée clôture la tâche (aucune transition) — aucune transition.
     const task = await getTask(taskId);
-    if (task && task.recetteStatus === "approved") {
-      return err(`recette déjà validée : la tâche ${taskId} est clôturée, aucune transition (${to}) n'est autorisée`);
+    if (task && ["in_progress","approved","done"].includes(task.recetteStatus)) {
+      return err(`recette en cours ou terminée : la tâche ${taskId} est clôturée, aucune transition (${to}) n'est autorisée`);
     }
     if (!canTaskTransition(exec.status, to)) {
       await logTransitionError({ taskId, from: exec.status, to, by: by || "orchestrator", reason: `non autorisé depuis ${exec.status}` });
@@ -553,9 +633,9 @@ server.registerTool("decision_request", {
   try {
     const task = await getTask(taskId);
     if (!task) return err(`tâche inconnue : ${taskId}`);
-    // Garde (v0.5.2) : recette déjà validée → aucune nouvelle décision.
-    if (task.recetteStatus === "approved") {
-      return err(`recette déjà validée : la tâche ${taskId} est clôturée, aucune nouvelle décision (${kind}) n'est autorisée`);
+    // Garde (v0.5.2) : recette en cours ou terminée → aucune nouvelle décision.
+    if (["in_progress","approved","done"].includes(task.recetteStatus)) {
+      return err(`recette en cours ou terminée : la tâche ${taskId} est clôturée, aucune nouvelle décision (${kind}) n'est autorisée`);
     }
     const d = await requestDecision({ taskId, kind, expiresAt, ttlMinutes: ttlMinutes ?? 2880, detail, requestedBy: by, sessionId, planId });
     return text(JSON.stringify({ ok: true, decision: d }, null, 2));
@@ -631,9 +711,9 @@ server.registerTool("plan_transition", {
     const planTaskId = await findPlanTask(planId).catch(() => null);
     if (planTaskId) {
       const task = await getTask(planTaskId);
-      if (task && task.recetteStatus === "approved") {
-        await logTransitionError({ taskId: planTaskId, to, by: by || "orchestrator", reason: "recette déjà validée — tâche clôturée" });
-        return err(`recette déjà validée : la tâche ${planTaskId} (plan ${planId}) est clôturée, aucune transition de plan (${to}) n'est autorisée`);
+      if (task && ["in_progress","approved","done"].includes(task.recetteStatus)) {
+        await logTransitionError({ taskId: planTaskId, to, by: by || "orchestrator", reason: "recette en cours ou terminée — tâche clôturée" });
+        return err(`recette en cours ou terminée : la tâche ${planTaskId} (plan ${planId}) est clôturée, aucune transition de plan (${to}) n'est autorisée`);
       }
     }
     const r = await applyPlanTransition({ planId, to, by: by || "orchestrator", note });

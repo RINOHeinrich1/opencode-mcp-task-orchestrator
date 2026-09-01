@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at     TEXT NOT NULL,
   created_by     TEXT,
   session_id     TEXT,                             -- session opencode qui a créé la tâche
-  recette_status TEXT NOT NULL DEFAULT 'pending',  -- recette humaine : pending | approved | rejected
+  recette_status TEXT NOT NULL DEFAULT 'pending',  -- recette : pending (pas faite) | in_progress (en cours) | done (faite)
+  recette_class  TEXT,                             -- si tâche issue d'une recette : rework | bug | improvement | feature
   version        INTEGER NOT NULL DEFAULT 0        -- optimistic lock
 );
 
@@ -156,6 +157,36 @@ CREATE TABLE IF NOT EXISTS task_links (
 );
 CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_task_links_uniq ON task_links(task_id, linked_task_id);
+
+-- ===========================================================================
+-- Recette (opération de vérification d'une tâche terminée) — v0.7.0
+-- Une recette = un contexte de travail indépendant (session dédiée, agent
+-- dédié, éléments consolidés). La tâche initiale reste `done` et intacte ;
+-- les travaux découverts en recette deviennent de NOUVELLES tâches.
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS recettes (
+  recette_id   TEXT PRIMARY KEY,            -- RECT-<taskId>-<ts>
+  task_id      TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  session_id   TEXT,                        -- session dédiée agent-recette
+  status       TEXT NOT NULL DEFAULT 'pending',  -- pending (pas faite) | in_progress (en cours) | done (faite)
+  created_at   TEXT NOT NULL,
+  confirmed_at TEXT,
+  confirmed_by TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recettes_task ON recettes(task_id);
+
+-- Éléments détectés pendant la recette (remarques, demandes, constats…).
+CREATE TABLE IF NOT EXISTS recette_items (
+  id               INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  recette_id       TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  content          TEXT NOT NULL,           -- la remarque / demande / constat
+  classification   TEXT NOT NULL DEFAULT 'rework',  -- rework | bug | improvement | feature
+  discussion       TEXT,                    -- échanges liés
+  status           TEXT NOT NULL DEFAULT 'open',    -- open | task_created
+  created_task_id  TEXT,                    -- tâche créée après confirmation
+  created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id);
 
 -- ===========================================================================
 -- Plans d'action (granularité atomique) — persistance des plans gérés par
