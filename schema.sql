@@ -169,7 +169,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_task_links_uniq ON task_links(task_id, lin
 CREATE TABLE IF NOT EXISTS recettes (
   recette_id   TEXT PRIMARY KEY,            -- RECT-<ts>-<rand>
   project      TEXT NOT NULL,               -- projet rattaché (contexte obligatoire)
-  title        TEXT NOT NULL,               -- titre compréhensible (ex: "Recette du module chatbot")
+  title        TEXT NOT NULL,               -- titre court compréhensible (ex: "Recette du module chatbot")
+  description  TEXT,                        -- description longue (détail du périmètre vérifié)
   task_id      TEXT,                        -- legacy (une seule tâche) — associations via recette_tasks
   session_id   TEXT,                        -- session dédiée agent-recette
   status       TEXT NOT NULL DEFAULT 'pending',  -- pending (pas faite) | in_progress (en cours) | done (faite)

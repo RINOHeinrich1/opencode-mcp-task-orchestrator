@@ -123,7 +123,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.6.2" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.6.3" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -271,14 +271,15 @@ server.registerTool("recette_start", {
   description: "Crée une opération de recette de PROJET (v0.8.0) : titre + 0..N tâches couvertes + session dédiée. La recette est un objet de premier niveau rattaché au projet.",
   inputSchema: {
     project: z.string().describe("Projet rattaché (contexte obligatoire)."),
-    title: z.string().optional().describe("Titre compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
+    title: z.string().optional().describe("Titre court compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
+    description: z.string().optional().describe("Description longue (détail du périmètre vérifié)."),
     taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N)."),
     status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
     sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
   },
-}, async ({ project, title, taskIds, status, sessionId }) => {
+}, async ({ project, title, description, taskIds, status, sessionId }) => {
   try {
-    const recette = await startRecette({ project, title, taskIds, status: status || "pending", sessionId: sessionId || null });
+    const recette = await startRecette({ project, title, description, taskIds, status: status || "pending", sessionId: sessionId || null });
     return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) {
     return err(e.message);

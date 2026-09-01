@@ -47,6 +47,7 @@ async function migrate() {
   await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS main_branch TEXT");
   await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS project TEXT");
   await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS title TEXT");
+  await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS description TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recette_id TEXT");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_tasks (
@@ -1076,13 +1077,13 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
 // ===========================================================================
 
 // Crée une recette de PROJET (titre + 0..N tâches couvertes) et la passe en cours.
-export async function startRecette({ project, title, taskIds, status = "pending", sessionId = null }) {
+export async function startRecette({ project, title, description, taskIds, status = "pending", sessionId = null }) {
   await ensureSchema();
   if (!project) throw new Error("projet requis pour une recette");
   const recetteId = `RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
-    "INSERT INTO recettes (recette_id, project, title, session_id, status, created_at) VALUES ($1,$2,$3,$4,$5,$6)",
-    [recetteId, project, title || `Recette ${project}`, sessionId, status, nowIso()],
+    "INSERT INTO recettes (recette_id, project, title, description, session_id, status, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+    [recetteId, project, title || `Recette ${project}`, description ?? null, sessionId, status, nowIso()],
   );
   for (const t of taskIds || []) {
     if (t) await linkRecetteTask(recetteId, t);
@@ -1114,6 +1115,7 @@ export async function listProjectRecettes(project) {
     recetteId: r.recette_id,
     project: r.project,
     title: r.title,
+    description: r.description ?? null,
     sessionId: r.session_id,
     status: r.status,
     createdAt: r.created_at,
@@ -1170,6 +1172,7 @@ export async function getRecetteById(recetteId) {
     recetteId: r.recette_id,
     project: r.project,
     title: r.title,
+    description: r.description ?? null,
     sessionId: r.session_id,
     status: r.status,
     createdAt: r.created_at,
