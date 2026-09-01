@@ -115,7 +115,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.5.0" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.5.1" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -334,7 +334,7 @@ server.registerTool("task_link_session", {
   inputSchema: {
     taskId: z.string(),
     sessionId: z.string().describe("Identifiant de session opencode à lier."),
-    kind: z.enum(["launch", "rework", "relaunch"]).optional().describe("Type de lien : launch | rework | relaunch (défaut launch)."),
+    kind: z.enum(["launch", "rework", "relaunch", "recette"]).optional().describe("Type de lien : launch | rework | relaunch | recette (défaut launch)."),
   },
 }, async ({ taskId, sessionId, kind }) => {
   try {
