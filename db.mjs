@@ -57,6 +57,13 @@ async function migrate() {
   await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id)");
   await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS title TEXT");
   await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS acceptance TEXT");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
+    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    title TEXT, nature TEXT, source TEXT NOT NULL DEFAULT 'import',
+    path TEXT, artifact_id TEXT, created_at TEXT NOT NULL
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_documents_recette ON recette_documents(recette_id)");
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -1158,6 +1165,7 @@ export async function getRecetteById(recetteId) {
     createdTaskId: i.created_task_id ?? null,
     createdAt: i.created_at,
   }));
+  const documents = await listRecetteDocuments(recetteId);
   return {
     recetteId: r.recette_id,
     project: r.project,
@@ -1169,7 +1177,51 @@ export async function getRecetteById(recetteId) {
     confirmedBy: r.confirmed_by,
     tasks,
     items,
+    documents,
   };
+}
+
+// --- Documents de recette --------------------------------------------------
+export async function addRecetteDocument({ recetteId, title, nature, source, path, artifactId }) {
+  await ensureSchema();
+  const r = (await pool().query(
+    `INSERT INTO recette_documents (recette_id, title, nature, source, path, artifact_id, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+    [recetteId, title ?? null, nature ?? null, source || "import", path ?? null, artifactId ?? null, nowIso()],
+  )).rows[0];
+  return listRecetteDocuments(recetteId);
+}
+
+export async function listRecetteDocuments(recetteId) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT d.id, d.recette_id, d.title, d.nature, d.source, d.path, d.artifact_id, d.created_at,
+            a.title AS artifact_title, a.task_id AS artifact_task
+     FROM recette_documents d
+     LEFT JOIN artifacts a ON a.artifact_id = d.artifact_id
+     WHERE d.recette_id = $1 ORDER BY d.id ASC`,
+    [recetteId],
+  )).rows;
+  return rows.map((r) => ({
+    documentId: Number(r.id),
+    recetteId: r.recette_id,
+    title: r.title || r.artifact_title || (r.path ? r.path.split("/").pop() : null) || null,
+    nature: r.nature,
+    source: r.source,
+    path: r.path,
+    artifactId: r.artifact_id ?? null,
+    artifactTask: r.artifact_task ?? null,
+    createdAt: r.created_at,
+  }));
+}
+
+export async function removeRecetteDocument(documentId) {
+  await ensureSchema();
+  const r = (await pool().query(
+    "DELETE FROM recette_documents WHERE id = $1 RETURNING recette_id",
+    [documentId],
+  )).rows[0];
+  return r ? r.recette_id : null;
 }
 
 export async function addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance }) {

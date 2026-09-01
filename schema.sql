@@ -201,6 +201,20 @@ CREATE TABLE IF NOT EXISTS recette_items (
 );
 CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id);
 
+-- Documents rattachés à une recette (importés ou liés à un artefact existant),
+-- avec la NATURE de la liaison (à quoi sert le document / comment l'exploiter).
+CREATE TABLE IF NOT EXISTS recette_documents (
+  id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  recette_id  TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  title       TEXT,                          -- titre affiché (défaut : nom du fichier)
+  nature      TEXT,                          -- à quoi sert le doc / comment l'exploiter
+  source      TEXT NOT NULL DEFAULT 'import',-- import | artifact
+  path        TEXT,                          -- chemin du fichier
+  artifact_id TEXT,                          -- si lié à un artefact existant
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recette_documents_recette ON recette_documents(recette_id);
+
 -- ===========================================================================
 -- Plans d'action (granularité atomique) — persistance des plans gérés par
 -- l'agent `atomic-plan` et le MCP `plan-manager`.

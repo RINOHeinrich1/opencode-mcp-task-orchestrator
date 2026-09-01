@@ -49,6 +49,9 @@ import {
   listProjectRecettes,
   linkRecetteTask,
   setRecetteSession,
+  addRecetteDocument,
+  listRecetteDocuments,
+  removeRecetteDocument,
   addRecetteItem,
   updateRecetteItem,
   confirmRecette,
@@ -120,7 +123,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.6.1" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.6.2" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -317,6 +320,47 @@ server.registerTool("recette_session_set", {
   try {
     const recette = await setRecetteSession({ recetteId, sessionId });
     return text(JSON.stringify({ ok: true, recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_doc_add ===
+server.registerTool("recette_doc_add", {
+  description: "Rattache un document à une recette (importé ou artefact existant) avec la nature de la liaison (à quoi sert / comment l'exploiter).",
+  inputSchema: {
+    recetteId: z.string(),
+    title: z.string().optional(),
+    nature: z.string().optional().describe("Nature de la liaison : à quoi sert le document et comment l'exploiter."),
+    source: z.enum(["import", "artifact"]).default("import"),
+    path: z.string().optional().describe("Chemin du fichier (mode import)."),
+    artifactId: z.string().optional().describe("Artefact existant à lier (mode artifact)."),
+  },
+}, async ({ recetteId, title, nature, source, path, artifactId }) => {
+  try {
+    let finalPath = path;
+    if (source === "artifact") {
+      if (!artifactId) return err("artifactId requis en mode artifact");
+      const a = await getArtifact(artifactId);
+      if (!a) return err(`artefact inconnu : ${artifactId}`);
+      finalPath = a.path;
+    }
+    const docs = await addRecetteDocument({ recetteId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null });
+    return text(JSON.stringify({ ok: true, documents: docs }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_doc_remove ===
+server.registerTool("recette_doc_remove", {
+  description: "Retire un document d'une recette.",
+  inputSchema: { documentId: z.number().int() },
+}, async ({ documentId }) => {
+  try {
+    const recetteId = await removeRecetteDocument(documentId);
+    if (!recetteId) return err(`document inconnu : ${documentId}`);
+    return text(JSON.stringify({ ok: true, recetteId, documents: await listRecetteDocuments(recetteId) }, null, 2));
   } catch (e) {
     return err(e.message);
   }
