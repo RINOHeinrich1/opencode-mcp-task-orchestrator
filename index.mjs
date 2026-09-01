@@ -55,6 +55,7 @@ import {
   registerParticipant,
   listParticipants,
   updateTaskSession,
+  updateTask,
   linkTaskSession,
   listTaskSessions,
   registerProject,
@@ -119,7 +120,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.6.0" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.6.1" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -440,6 +441,26 @@ server.registerTool("task_list", {
       tasks.push({ taskId: t.id, project: t.project, type: t.type, priority: t.priority, status: exec?.status || "queued", request: t.request });
     }
     return text(JSON.stringify({ count: tasks.length, tasks }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === task_update ===
+server.registerTool("task_update", {
+  description: "Modifie une tâche en statut 'queued' (non lancée) : request, titre court, critères d'acceptation, scope, priorité. Refusée si la tâche n'est plus queued.",
+  inputSchema: {
+    taskId: z.string(),
+    request: z.string().optional(),
+    title: z.string().optional().describe("Titre court."),
+    acceptanceCriteria: z.array(z.string()).optional(),
+    scope: z.array(z.string()).optional(),
+    priority: z.enum(["low", "normal", "high", "critical"]).optional(),
+  },
+}, async ({ taskId, request, title, acceptanceCriteria, scope, priority }) => {
+  try {
+    const task = await updateTask({ taskId, request, title, acceptanceCriteria, scope, priority });
+    return text(JSON.stringify({ ok: true, task }, null, 2));
   } catch (e) {
     return err(e.message);
   }

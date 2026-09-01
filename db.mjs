@@ -501,6 +501,28 @@ export async function findScopeConflicts(project, scope, excludeTaskId) {
   return { conflicts, reservedWorktrees };
 }
 
+// --- Mise à jour d'une tâche (uniquement en statut queued) -----------------
+export async function updateTask({ taskId, request, title, acceptanceCriteria, scope, priority }) {
+  await ensureSchema();
+  const task = await getTask(taskId);
+  if (!task) throw new Error(`tâche inconnue : ${taskId}`);
+  const exec = await getCurrentExecution(taskId);
+  if (!exec || exec.status !== "queued") {
+    throw new Error(`seule une tâche 'queued' est modifiable (actuel : ${exec?.status || "inconnu"})`);
+  }
+  const sets = [];
+  const params = [];
+  if (request !== undefined) { params.push(request); sets.push(`request = $${params.length}`); }
+  if (title !== undefined) { params.push(title); sets.push(`title = $${params.length}`); }
+  if (acceptanceCriteria !== undefined) { params.push(JSON.stringify(acceptanceCriteria)); sets.push(`acceptance_criteria = $${params.length}`); }
+  if (scope !== undefined) { params.push(JSON.stringify(scope)); sets.push(`scope = $${params.length}`); }
+  if (priority !== undefined) { params.push(priority); sets.push(`priority = $${params.length}`); }
+  if (!sets.length) return getTask(taskId);
+  params.push(taskId);
+  await pool().query(`UPDATE tasks SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  return getTask(taskId);
+}
+
 // --- Conflits de scope : persistance (KPI d'orchestration) -----------------
 export async function recordScopeConflicts({ project, scope, conflicts, reservedWorktrees }) {
   await ensureSchema();
