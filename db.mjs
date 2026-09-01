@@ -1145,5 +1145,12 @@ export async function confirmRecette({ recetteId, confirmedBy }) {
   )).rows[0];
   if (!r) throw new Error(`recette inconnue : ${recetteId}`);
   await pool().query("UPDATE tasks SET recette_status = 'done' WHERE id = $1", [r.task_id]);
+  // Résout les décisions recette legacy encore 'awaiting' (créées par l'ancien
+  // flux decision_request kind=recette) — elles sont close par la clôture recette.
+  await pool().query(
+    `UPDATE decisions SET status = 'approved', resolved_at = $1, resolution = 'Recette close via le framework recette (v0.7)'
+     WHERE task_id = $2 AND kind = 'recette' AND status = 'awaiting'`,
+    [nowIso(), r.task_id],
+  );
   return getRecette(r.task_id);
 }
