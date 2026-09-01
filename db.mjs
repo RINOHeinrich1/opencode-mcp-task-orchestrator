@@ -1068,13 +1068,14 @@ export async function getRecette(taskId) {
   )).rows[0];
   if (!r) return null;
   const items = (await pool().query(
-    "SELECT id, content, classification, discussion, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
+    "SELECT id, content, classification, discussion, scope, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
     [r.recette_id],
   )).rows.map((i) => ({
     itemId: Number(i.id),
     content: i.content,
     classification: i.classification,
     discussion: i.discussion,
+    scope: i.scope ? JSON.parse(i.scope) : [],
     status: i.status,
     createdTaskId: i.created_task_id ?? null,
     createdAt: i.created_at,
@@ -1091,23 +1092,24 @@ export async function getRecette(taskId) {
   };
 }
 
-export async function addRecetteItem({ recetteId, content, classification, discussion }) {
+export async function addRecetteItem({ recetteId, content, classification, discussion, scope }) {
   await ensureSchema();
   if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
   const r = (await pool().query(
-    `INSERT INTO recette_items (recette_id, content, classification, discussion, status, created_at)
-     VALUES ($1,$2,$3,$4,'open',$5) RETURNING id`,
-    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, nowIso()],
+    `INSERT INTO recette_items (recette_id, content, classification, discussion, scope, status, created_at)
+     VALUES ($1,$2,$3,$4,$5,'open',$6) RETURNING id`,
+    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, nowIso()],
   )).rows[0];
   return getRecetteItem(Number(r.id));
 }
 
-export async function updateRecetteItem({ itemId, classification, discussion, status, createdTaskId }) {
+export async function updateRecetteItem({ itemId, classification, discussion, scope, status, createdTaskId }) {
   await ensureSchema();
   const sets = [];
   const params = [];
   if (classification) { params.push(classification); sets.push(`classification = $${params.length}`); }
   if (discussion !== undefined) { params.push(discussion); sets.push(`discussion = $${params.length}`); }
+  if (scope !== undefined) { params.push(scope && scope.length ? JSON.stringify(scope) : null); sets.push(`scope = $${params.length}`); }
   if (status) { params.push(status); sets.push(`status = $${params.length}`); }
   if (createdTaskId !== undefined) { params.push(createdTaskId); sets.push(`created_task_id = $${params.length}`); }
   if (!sets.length) return getRecetteItem(itemId);
@@ -1127,6 +1129,7 @@ async function getRecetteItem(itemId) {
     content: r.content,
     classification: r.classification,
     discussion: r.discussion,
+    scope: r.scope ? JSON.parse(r.scope) : [],
     status: r.status,
     createdTaskId: r.created_task_id ?? null,
     createdAt: r.created_at,

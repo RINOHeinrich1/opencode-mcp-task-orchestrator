@@ -182,6 +182,7 @@ CREATE TABLE IF NOT EXISTS recette_items (
   content          TEXT NOT NULL,           -- la remarque / demande / constat
   classification   TEXT NOT NULL DEFAULT 'rework',  -- rework | bug | improvement | feature
   discussion       TEXT,                    -- échanges liés
+  scope            TEXT,                    -- JSON array de chemins (périmètre suggéré, rempli par l'agent-recette)
   status           TEXT NOT NULL DEFAULT 'open',    -- open | task_created
   created_task_id  TEXT,                    -- tâche créée après confirmation
   created_at       TEXT NOT NULL

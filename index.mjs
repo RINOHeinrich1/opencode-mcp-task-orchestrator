@@ -115,7 +115,7 @@ function newExecutionId(taskId) {
   return `E-${taskId}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const server = new McpServer({ name: "task-orchestrator", version: "0.5.1" });
+const server = new McpServer({ name: "task-orchestrator", version: "0.5.2" });
 
 // === task_register ===
 server.registerTool("task_register", {
@@ -276,16 +276,17 @@ server.registerTool("recette_start", {
 
 // === recette_item_add ===
 server.registerTool("recette_item_add", {
-  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature).",
+  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature) et le périmètre (scope) suggéré.",
   inputSchema: {
     recetteId: z.string(),
     content: z.string().describe("La remarque / demande / constat."),
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Nature de l'élément (défaut rework)."),
     discussion: z.string().optional().describe("Échanges associés."),
+    scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins) — transmis à la tâche créée à la confirmation."),
   },
-}, async ({ recetteId, content, classification, discussion }) => {
+}, async ({ recetteId, content, classification, discussion, scope }) => {
   try {
-    const item = await addRecetteItem({ recetteId, content, classification, discussion });
+    const item = await addRecetteItem({ recetteId, content, classification, discussion, scope });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -294,17 +295,18 @@ server.registerTool("recette_item_add", {
 
 // === recette_item_update ===
 server.registerTool("recette_item_update", {
-  description: "Met à jour un élément de recette (classification, discussion, statut, tâche créée).",
+  description: "Met à jour un élément de recette (classification, discussion, scope, statut, tâche créée).",
   inputSchema: {
     itemId: z.number().int(),
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional(),
     discussion: z.string().optional(),
+    scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins)."),
     status: z.enum(["open", "task_created"]).optional(),
     createdTaskId: z.string().optional(),
   },
-}, async ({ itemId, classification, discussion, status, createdTaskId }) => {
+}, async ({ itemId, classification, discussion, scope, status, createdTaskId }) => {
   try {
-    const item = await updateRecetteItem({ itemId, classification, discussion, status, createdTaskId });
+    const item = await updateRecetteItem({ itemId, classification, discussion, scope, status, createdTaskId });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
