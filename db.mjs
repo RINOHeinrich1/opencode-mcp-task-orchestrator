@@ -59,6 +59,8 @@ async function migrate() {
   await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id)");
   await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS title TEXT");
   await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS acceptance TEXT");
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS exec_order INTEGER");
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS vigilance TEXT");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
@@ -1164,7 +1166,7 @@ export async function getRecetteById(recetteId) {
     [recetteId],
   )).rows.map((x) => x.task_id);
   const items = (await pool().query(
-    "SELECT id, content, classification, discussion, scope, title, acceptance, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
+    "SELECT id, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
     [recetteId],
   )).rows.map((i) => ({
     itemId: Number(i.id),
@@ -1174,6 +1176,8 @@ export async function getRecetteById(recetteId) {
     scope: i.scope ? JSON.parse(i.scope) : [],
     title: i.title ?? null,
     acceptance: i.acceptance ?? null,
+    execOrder: i.exec_order ?? null,
+    vigilance: i.vigilance ?? null,
     status: i.status,
     createdTaskId: i.created_task_id ?? null,
     createdAt: i.created_at,
@@ -1238,18 +1242,18 @@ export async function removeRecetteDocument(documentId) {
   return r ? r.recette_id : null;
 }
 
-export async function addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance }) {
+export async function addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance, execOrder, vigilance }) {
   await ensureSchema();
   if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
   const r = (await pool().query(
-    `INSERT INTO recette_items (recette_id, content, classification, discussion, scope, title, acceptance, status, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8) RETURNING id`,
-    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, title ?? null, acceptance ?? null, nowIso()],
+    `INSERT INTO recette_items (recette_id, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'open',$10) RETURNING id`,
+    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, title ?? null, acceptance ?? null, execOrder ?? null, vigilance ?? null, nowIso()],
   )).rows[0];
   return getRecetteItem(Number(r.id));
 }
 
-export async function updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, status, createdTaskId }) {
+export async function updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, execOrder, vigilance, status, createdTaskId }) {
   await ensureSchema();
   const sets = [];
   const params = [];
@@ -1258,6 +1262,8 @@ export async function updateRecetteItem({ itemId, classification, discussion, sc
   if (scope !== undefined) { params.push(scope && scope.length ? JSON.stringify(scope) : null); sets.push(`scope = $${params.length}`); }
   if (title !== undefined) { params.push(title); sets.push(`title = $${params.length}`); }
   if (acceptance !== undefined) { params.push(acceptance); sets.push(`acceptance = $${params.length}`); }
+  if (execOrder !== undefined) { params.push(execOrder ?? null); sets.push(`exec_order = $${params.length}`); }
+  if (vigilance !== undefined) { params.push(vigilance); sets.push(`vigilance = $${params.length}`); }
   if (status) { params.push(status); sets.push(`status = $${params.length}`); }
   if (createdTaskId !== undefined) { params.push(createdTaskId); sets.push(`created_task_id = $${params.length}`); }
   if (!sets.length) return getRecetteItem(itemId);
@@ -1268,7 +1274,7 @@ export async function updateRecetteItem({ itemId, classification, discussion, sc
 
 async function getRecetteItem(itemId) {
   const r = (await pool().query(
-    "SELECT id, recette_id, content, classification, discussion, scope, title, acceptance, status, created_task_id, created_at FROM recette_items WHERE id = $1",
+    "SELECT id, recette_id, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_task_id, created_at FROM recette_items WHERE id = $1",
     [itemId],
   )).rows[0];
   return r ? {
@@ -1280,6 +1286,8 @@ async function getRecetteItem(itemId) {
     scope: r.scope ? JSON.parse(r.scope) : [],
     title: r.title ?? null,
     acceptance: r.acceptance ?? null,
+    execOrder: r.exec_order ?? null,
+    vigilance: r.vigilance ?? null,
     status: r.status,
     createdTaskId: r.created_task_id ?? null,
     createdAt: r.created_at,

@@ -393,10 +393,12 @@ server.registerTool("recette_item_add", {
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins) — transmis à la tâche créée à la confirmation."),
     title: z.string().optional().describe("Titre court de la tâche qui sera créée à la confirmation."),
     acceptance: z.string().optional().describe("Critère d'acceptation / livrable attendu de la tâche qui sera créée."),
+    execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = exécutable en parallèle)."),
+    vigilance: z.string().optional().describe("Point de vigilance / écart sémantique détecté pour cet élément."),
   },
-}, async ({ recetteId, content, classification, discussion, scope, title, acceptance }) => {
+}, async ({ recetteId, content, classification, discussion, scope, title, acceptance, execOrder, vigilance }) => {
   try {
-    const item = await addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance });
+    const item = await addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance, execOrder, vigilance });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -413,12 +415,14 @@ server.registerTool("recette_item_update", {
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins)."),
     title: z.string().optional(),
     acceptance: z.string().optional(),
+    execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = parallèle)."),
+    vigilance: z.string().optional().describe("Point de vigilance / écart sémantique."),
     status: z.enum(["open", "task_created"]).optional(),
     createdTaskId: z.string().optional(),
   },
-}, async ({ itemId, classification, discussion, scope, title, acceptance, status, createdTaskId }) => {
+}, async ({ itemId, classification, discussion, scope, title, acceptance, execOrder, vigilance, status, createdTaskId }) => {
   try {
-    const item = await updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, status, createdTaskId });
+    const item = await updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, execOrder, vigilance, status, createdTaskId });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);

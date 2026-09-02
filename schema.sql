@@ -199,6 +199,8 @@ CREATE TABLE IF NOT EXISTS recette_items (
   scope            TEXT,                    -- JSON array de chemins (périmètre suggéré, rempli par l'agent-recette)
   status           TEXT NOT NULL DEFAULT 'open',    -- open | task_created
   created_task_id  TEXT,                    -- tâche créée après confirmation
+  exec_order       INTEGER,                 -- ordre d'exécution recommandé (même n = parallèle)
+  vigilance        TEXT,                    -- point de vigilance / écart sémantique
   created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id);
