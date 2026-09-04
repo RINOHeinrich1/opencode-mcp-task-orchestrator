@@ -61,6 +61,28 @@ async function migrate() {
   await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS acceptance TEXT");
   await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS exec_order INTEGER");
   await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS vigilance TEXT");
+  // Recette multi-projets : 1 recette = 1..N projets + 1 item = 1 projet cible.
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS project TEXT");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_projects (
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    project    TEXT NOT NULL,
+    PRIMARY KEY (recette_id, project)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_projects_project ON recette_projects(project)");
+  // Rétro-remplissage idempotent : chaque recette existante a ≥1 projet (son projet legacy).
+  await pool().query(
+    `INSERT INTO recette_projects (recette_id, project)
+     SELECT r.recette_id, r.project FROM recettes r
+     WHERE r.project IS NOT NULL
+     ON CONFLICT DO NOTHING`,
+  );
+  // Items legacy sans projet cible → premier projet de leur recette.
+  await pool().query(
+    `UPDATE recette_items i SET project = COALESCE(i.project, (
+       SELECT rp.project FROM recette_projects rp WHERE rp.recette_id = i.recette_id ORDER BY rp.project LIMIT 1
+     ))
+     WHERE i.project IS NULL`,
+  );
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
@@ -1090,14 +1112,23 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
 // ===========================================================================
 
 // Crée une recette de PROJET (titre + 0..N tâches couvertes) et la passe en cours.
-export async function startRecette({ project, title, description, taskIds, status = "pending", sessionId = null }) {
+export async function startRecette({ project, projects, title, description, taskIds, status = "pending", sessionId = null }) {
   await ensureSchema();
-  if (!project) throw new Error("projet requis pour une recette");
+  // 1 recette = 1..N projets (jamais nulle). `projects` prioritaire, sinon `project`.
+  const projs = [...new Set(((projects && projects.length ? projects : (project ? [project] : [])).map((p) => p && String(p).trim()).filter(Boolean)))];
+  if (projs.length === 0) throw new Error("au moins un projet requis pour une recette");
+  const first = projs[0];
   const recetteId = `RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
     "INSERT INTO recettes (recette_id, project, title, description, session_id, status, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-    [recetteId, project, title || `Recette ${project}`, description ?? null, sessionId, status, nowIso()],
+    [recetteId, first, title || `Recette ${projs.join(", ")}`, description ?? null, sessionId, status, nowIso()],
   );
+  for (const p of projs) {
+    await pool().query(
+      "INSERT INTO recette_projects (recette_id, project) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+      [recetteId, p],
+    );
+  }
   for (const t of taskIds || []) {
     if (t) await linkRecetteTask(recetteId, t);
   }
@@ -1114,19 +1145,31 @@ export async function linkRecetteTask(recetteId, taskId) {
   return recetteId;
 }
 
-// Liste les recettes d'un projet (ou toutes).
+// Liste les recettes d'un projet (ou toutes) — un projet = présent dans recette_projects.
 export async function listProjectRecettes(project) {
   await ensureSchema();
   const rows = (await pool().query(
     `SELECT r.*,
             (SELECT COUNT(*) FROM recette_tasks rt WHERE rt.recette_id = r.recette_id) AS tasks_count,
             (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = r.recette_id) AS items_count
-     FROM recettes r ${project ? "WHERE r.project = $1" : ""} ORDER BY r.created_at DESC`,
+     FROM recettes r
+     ${project ? "WHERE EXISTS (SELECT 1 FROM recette_projects rp WHERE rp.recette_id = r.recette_id AND rp.project = $1)" : ""}
+     ORDER BY r.created_at DESC`,
     project ? [project] : [],
   )).rows;
+  const ids = rows.map((r) => r.recette_id);
+  const projectsByRec = {};
+  if (ids.length) {
+    const rp = await pool().query(
+      "SELECT recette_id, project FROM recette_projects WHERE recette_id = ANY($1) ORDER BY project",
+      [ids],
+    );
+    for (const x of rp.rows) (projectsByRec[x.recette_id] = projectsByRec[x.recette_id] || []).push(x.project);
+  }
   return rows.map((r) => ({
     recetteId: r.recette_id,
     project: r.project,
+    projects: projectsByRec[r.recette_id] || (r.project ? [r.project] : []),
     title: r.title,
     description: r.description ?? null,
     sessionId: r.session_id,
@@ -1165,8 +1208,13 @@ export async function getRecetteById(recetteId) {
     "SELECT task_id FROM recette_tasks WHERE recette_id = $1 ORDER BY task_id",
     [recetteId],
   )).rows.map((x) => x.task_id);
+  const projs = (await pool().query(
+    "SELECT project FROM recette_projects WHERE recette_id = $1 ORDER BY project",
+    [recetteId],
+  )).rows.map((x) => x.project);
+  const projects = projs.length ? projs : (r.project ? [r.project] : []);
   const items = (await pool().query(
-    "SELECT id, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
+    "SELECT id, content, classification, discussion, scope, project, title, acceptance, exec_order, vigilance, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
     [recetteId],
   )).rows.map((i) => ({
     itemId: Number(i.id),
@@ -1174,6 +1222,7 @@ export async function getRecetteById(recetteId) {
     classification: i.classification,
     discussion: i.discussion,
     scope: i.scope ? JSON.parse(i.scope) : [],
+    project: i.project ?? null,
     title: i.title ?? null,
     acceptance: i.acceptance ?? null,
     execOrder: i.exec_order ?? null,
@@ -1186,6 +1235,7 @@ export async function getRecetteById(recetteId) {
   return {
     recetteId: r.recette_id,
     project: r.project,
+    projects,
     title: r.title,
     description: r.description ?? null,
     sessionId: r.session_id,
@@ -1242,24 +1292,32 @@ export async function removeRecetteDocument(documentId) {
   return r ? r.recette_id : null;
 }
 
-export async function addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance, execOrder, vigilance }) {
+export async function addRecetteItem({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance }) {
   await ensureSchema();
   if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
+  // 1 item = 1 projet cible. Défaut si absent : premier projet de la recette.
+  const target = project && String(project).trim()
+    ? String(project).trim()
+    : (await pool().query(
+        "SELECT project FROM recette_projects WHERE recette_id = $1 ORDER BY project LIMIT 1",
+        [recetteId],
+      )).rows[0]?.project ?? null;
   const r = (await pool().query(
-    `INSERT INTO recette_items (recette_id, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'open',$10) RETURNING id`,
-    [recetteId, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, title ?? null, acceptance ?? null, execOrder ?? null, vigilance ?? null, nowIso()],
+    `INSERT INTO recette_items (recette_id, project, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',$11) RETURNING id`,
+    [recetteId, target, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, title ?? null, acceptance ?? null, execOrder ?? null, vigilance ?? null, nowIso()],
   )).rows[0];
   return getRecetteItem(Number(r.id));
 }
 
-export async function updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, execOrder, vigilance, status, createdTaskId }) {
+export async function updateRecetteItem({ itemId, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId }) {
   await ensureSchema();
   const sets = [];
   const params = [];
   if (classification) { params.push(classification); sets.push(`classification = $${params.length}`); }
   if (discussion !== undefined) { params.push(discussion); sets.push(`discussion = $${params.length}`); }
   if (scope !== undefined) { params.push(scope && scope.length ? JSON.stringify(scope) : null); sets.push(`scope = $${params.length}`); }
+  if (project !== undefined) { params.push(project ? String(project).trim() : null); sets.push(`project = $${params.length}`); }
   if (title !== undefined) { params.push(title); sets.push(`title = $${params.length}`); }
   if (acceptance !== undefined) { params.push(acceptance); sets.push(`acceptance = $${params.length}`); }
   if (execOrder !== undefined) { params.push(execOrder ?? null); sets.push(`exec_order = $${params.length}`); }
@@ -1274,12 +1332,13 @@ export async function updateRecetteItem({ itemId, classification, discussion, sc
 
 async function getRecetteItem(itemId) {
   const r = (await pool().query(
-    "SELECT id, recette_id, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_task_id, created_at FROM recette_items WHERE id = $1",
+    "SELECT id, recette_id, project, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, status, created_task_id, created_at FROM recette_items WHERE id = $1",
     [itemId],
   )).rows[0];
   return r ? {
     itemId: Number(r.id),
     recetteId: r.recette_id,
+    project: r.project ?? null,
     content: r.content,
     classification: r.classification,
     discussion: r.discussion,

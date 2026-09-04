@@ -189,10 +189,21 @@ CREATE TABLE IF NOT EXISTS recette_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id);
 
+-- Projets rattachés à une recette (1..N — une recette peut couvrir plusieurs projets).
+-- `recettes.project` (colonne legacy) reste le PREMIER projet (jamais NULL) ; la
+-- source de vérité multi-projets est cette table.
+CREATE TABLE IF NOT EXISTS recette_projects (
+  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  project    TEXT NOT NULL,
+  PRIMARY KEY (recette_id, project)
+);
+CREATE INDEX IF NOT EXISTS idx_recette_projects_project ON recette_projects(project);
+
 -- Éléments détectés pendant la recette (remarques, demandes, constats…).
 CREATE TABLE IF NOT EXISTS recette_items (
   id               INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   recette_id       TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  project          TEXT,                    -- projet cible de l'élément (1 item = 1 projet) ; NULL legacy
   content          TEXT NOT NULL,           -- la remarque / demande / constat
   classification   TEXT NOT NULL DEFAULT 'rework',  -- rework | bug | improvement | feature
   discussion       TEXT,                    -- échanges liés

@@ -268,19 +268,20 @@ server.registerTool("task_link_remove", {
 });
 
 // === recette_start ===
-server.registerTool("recette_start", {
-  description: "Crée une opération de recette de PROJET (v0.8.0) : titre + 0..N tâches couvertes + session dédiée. La recette est un objet de premier niveau rattaché au projet.",
+ server.registerTool("recette_start", {
+  description: "Crée une opération de recette de PROJET (v0.9.0) : 1..N projets rattachés + titre + 0..N tâches couvertes + session dédiée. La recette est un objet de premier niveau rattaché à UN OU PLUSIEURS projets.",
   inputSchema: {
-    project: z.string().describe("Projet rattaché (contexte obligatoire)."),
+    project: z.string().optional().describe("Projet principal/historique (1er projet). Rétrocompat : requis si `projects` absent."),
+    projects: z.array(z.string()).optional().describe("Projets rattachés (1..N — recommandé). Au moins un projet est requis au total."),
     title: z.string().optional().describe("Titre court compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
     description: z.string().optional().describe("Description longue (détail du périmètre vérifié)."),
     taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N)."),
     status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
     sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
   },
-}, async ({ project, title, description, taskIds, status, sessionId }) => {
+}, async ({ project, projects, title, description, taskIds, status, sessionId }) => {
   try {
-    const recette = await startRecette({ project, title, description, taskIds, status: status || "pending", sessionId: sessionId || null });
+    const recette = await startRecette({ project, projects, title, description, taskIds, status: status || "pending", sessionId: sessionId || null });
     return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -384,11 +385,12 @@ server.registerTool("recette_link_task", {
 
 // === recette_item_add ===
 server.registerTool("recette_item_add", {
-  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature) et le périmètre (scope) suggéré.",
+  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature), son PROJET CIBLE (1 item = 1 projet) et le périmètre (scope) suggéré.",
   inputSchema: {
     recetteId: z.string(),
     content: z.string().describe("La remarque / demande / constat."),
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Nature de l'élément (défaut rework)."),
+    project: z.string().optional().describe("Projet CIBLE de l'élément (doit être l'un des projets de la recette). Défaut : premier projet de la recette."),
     discussion: z.string().optional().describe("Échanges associés."),
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins) — transmis à la tâche créée à la confirmation."),
     title: z.string().optional().describe("Titre court de la tâche qui sera créée à la confirmation."),
@@ -396,9 +398,9 @@ server.registerTool("recette_item_add", {
     execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = exécutable en parallèle)."),
     vigilance: z.string().optional().describe("Point de vigilance / écart sémantique détecté pour cet élément."),
   },
-}, async ({ recetteId, content, classification, discussion, scope, title, acceptance, execOrder, vigilance }) => {
+}, async ({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance }) => {
   try {
-    const item = await addRecetteItem({ recetteId, content, classification, discussion, scope, title, acceptance, execOrder, vigilance });
+    const item = await addRecetteItem({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -407,12 +409,13 @@ server.registerTool("recette_item_add", {
 
 // === recette_item_update ===
 server.registerTool("recette_item_update", {
-  description: "Met à jour un élément de recette (classification, discussion, scope, statut, tâche créée).",
+  description: "Met à jour un élément de recette (classification, discussion, scope, projet cible, statut, tâche créée).",
   inputSchema: {
     itemId: z.number().int(),
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional(),
     discussion: z.string().optional(),
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins)."),
+    project: z.string().optional().describe("Projet cible de l'élément."),
     title: z.string().optional(),
     acceptance: z.string().optional(),
     execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = parallèle)."),
@@ -420,9 +423,9 @@ server.registerTool("recette_item_update", {
     status: z.enum(["open", "task_created"]).optional(),
     createdTaskId: z.string().optional(),
   },
-}, async ({ itemId, classification, discussion, scope, title, acceptance, execOrder, vigilance, status, createdTaskId }) => {
+}, async ({ itemId, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId }) => {
   try {
-    const item = await updateRecetteItem({ itemId, classification, discussion, scope, title, acceptance, execOrder, vigilance, status, createdTaskId });
+    const item = await updateRecetteItem({ itemId, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
