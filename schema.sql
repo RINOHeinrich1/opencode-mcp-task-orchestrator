@@ -337,3 +337,58 @@ CREATE TABLE IF NOT EXISTS scope_conflicts (
 );
 CREATE INDEX IF NOT EXISTS idx_scope_conflicts_project ON scope_conflicts(project);
 CREATE INDEX IF NOT EXISTS idx_scope_conflicts_id ON scope_conflicts(id);
+
+-- ===========================================================================
+-- Tests E2E Playwright (cadrage 07-tests-e2e.md) : registre, liens tâche↔test,
+-- exécutions avec preuves (rapport texte partagé IA+humain ; vidéo = humain).
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS e2e_tests (
+  id             TEXT PRIMARY KEY,             -- E2E-<PROJ>-<hash>
+  project        TEXT NOT NULL,                -- projet/dépôt applicatif
+  spec_file      TEXT NOT NULL,                -- chemin du spec Playwright
+  scenario       TEXT NOT NULL,                -- titre du test()
+  title          TEXT,
+  status         TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | OBSOLETE | QUARANTINE | DRAFT
+  version        INTEGER NOT NULL DEFAULT 1,
+  meta           JSONB,
+  first_seen_at  TEXT NOT NULL,
+  updated_at     TEXT NOT NULL,
+  CONSTRAINT uq_e2e_tests_scenario UNIQUE (project, spec_file, scenario)
+);
+CREATE INDEX IF NOT EXISTS idx_e2e_tests_project ON e2e_tests(project);
+
+-- Relation N:N tâche ↔ test (typée : pourquoi le test est associé).
+CREATE TABLE IF NOT EXISTS task_e2e (
+  task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  e2e_test_id   TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+  relation_type TEXT NOT NULL DEFAULT 'REGRESSION',  -- CREATED|UPDATED|REGRESSION|EXISTING
+  reason        TEXT,
+  PRIMARY KEY (task_id, e2e_test_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_e2e_test ON task_e2e(e2e_test_id);
+
+-- Une exécution = une preuve (rapport texte partagé ; vidéo = humain).
+CREATE TABLE IF NOT EXISTS e2e_executions (
+  id                 TEXT PRIMARY KEY,          -- EXE-<ts>-<rand>
+  e2e_test_id        TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+  task_id            TEXT,
+  deployment_id      TEXT,
+  plan_id            TEXT,
+  env                TEXT,
+  commit_sha         TEXT,
+  branch             TEXT,
+  pipeline_ref       TEXT,
+  status             TEXT NOT NULL DEFAULT 'PENDING',  -- PENDING|RUNNING|PASSED|FAILED|ERROR|SKIPPED|FLAKY
+  duration_ms        INTEGER,
+  attempts           INTEGER NOT NULL DEFAULT 1,       -- itération de correction (1..3)
+  executed_at        TEXT,
+  report_artifact_id TEXT,       -- artefact TEXTE (IA + humain)
+  logs_url           TEXT,
+  video_url          TEXT,       -- preuve HUMAINE
+  summary            TEXT,       -- verdict/synthèse textuelle
+  verdict_by         TEXT,       -- build-notify | human
+  created_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_e2e_executions_task ON e2e_executions(task_id);
+CREATE INDEX IF NOT EXISTS idx_e2e_executions_test ON e2e_executions(e2e_test_id);
+CREATE INDEX IF NOT EXISTS idx_e2e_executions_created ON e2e_executions(created_at);

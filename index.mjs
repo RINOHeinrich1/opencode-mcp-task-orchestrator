@@ -47,6 +47,13 @@ import {
   addRecetteProject,
   removeRecetteProject,
   unlinkRecetteTask,
+  upsertE2ETest,
+  linkTaskE2E,
+  unlinkTaskE2E,
+  listTaskE2E,
+  recordE2EExecution,
+  updateE2EExecution,
+  listE2EExecutions,
   getRecette,
   getRecetteById,
   listProjectRecettes,
@@ -1065,6 +1072,114 @@ server.registerTool("task_delete", {
   } catch (e) {
     return err(e.message);
   }
+});
+
+
+// ===========================================================================
+// Tests E2E Playwright (cadrage 07) — registre, liens, exécutions
+// ===========================================================================
+
+// === e2e_test_register ===
+server.registerTool("e2e_test_register", {
+  description: "Enregistre (ou réactive) un test E2E dans le référentiel central — 1 enregistrement par test() Playwright (project + spec_file + scenario).",
+  inputSchema: {
+    project: z.string(),
+    specFile: z.string().describe("Chemin du spec file (ex: tests/e2e/auth/login.spec.ts)."),
+    scenario: z.string().describe("Titre du test() Playwright."),
+    title: z.string().optional(),
+  },
+}, async ({ project, specFile, scenario, title }) => {
+  try {
+    const t = await upsertE2ETest({ project, specFile, scenario, title });
+    return text(JSON.stringify({ ok: true, test: t }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === e2e_test_link / unlink ===
+server.registerTool("e2e_test_link", {
+  description: "Associe un test E2E à une tâche (N:N). relation_type : CREATED|UPDATED|REGRESSION|EXISTING (+ reason obligatoire).",
+  inputSchema: {
+    taskId: z.string(),
+    e2eTestId: z.string(),
+    relationType: z.enum(["CREATED", "UPDATED", "REGRESSION", "EXISTING"]).optional(),
+    reason: z.string().optional().describe("Justification (tracée)."),
+  },
+}, async ({ taskId, e2eTestId, relationType, reason }) => {
+  try {
+    const r = await linkTaskE2E({ taskId, e2eTestId, relationType, reason });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_test_unlink", {
+  description: "Détache un test E2E d'une tâche.",
+  inputSchema: { taskId: z.string(), e2eTestId: z.string() },
+}, async ({ taskId, e2eTestId }) => {
+  try {
+    return text(JSON.stringify({ ok: true, ...(await unlinkTaskE2E({ taskId, e2eTestId })) }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === e2e_list ===
+server.registerTool("e2e_list", {
+  description: "Liste les tests E2E associés à une tâche (avec relation et dernière exécution).",
+  inputSchema: { taskId: z.string() },
+}, async ({ taskId }) => {
+  try {
+    const tests = await listTaskE2E(taskId);
+    return text(JSON.stringify({ taskId, count: tests.length, tests }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === e2e_execution_record / update ===
+server.registerTool("e2e_execution_record", {
+  description: "Enregistre le début d'une exécution E2E (PENDING/RUNNING) rattachée à un test et une tâche.",
+  inputSchema: {
+    e2eTestId: z.string(),
+    taskId: z.string().optional(),
+    deploymentId: z.string().optional(),
+    planId: z.string().optional(),
+    env: z.string().optional(),
+    commitSha: z.string().optional(),
+    branch: z.string().optional(),
+    pipelineRef: z.string().optional(),
+    attempts: z.number().int().optional().describe("Itération de correction (1..3)."),
+  },
+}, async (args) => {
+  try {
+    const r = await recordE2EExecution(args);
+    return text(JSON.stringify({ ok: true, execution: r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_execution_update", {
+  description: "Met à jour une exécution E2E (verdict, durée, preuves : rapport texte partagé, vidéo humaine, logs, synthèse).",
+  inputSchema: {
+    executionId: z.string(),
+    status: z.enum(["PENDING", "RUNNING", "PASSED", "FAILED", "ERROR", "SKIPPED", "FLAKY"]).optional(),
+    durationMs: z.number().int().optional(),
+    reportArtifactId: z.string().optional().describe("Artefact rapport TEXTE (IA + humain)."),
+    logsUrl: z.string().optional(),
+    videoUrl: z.string().optional().describe("Preuve HUMAINE (vidéo) — jamais analysée par l'IA."),
+    summary: z.string().optional().describe("Verdict / synthèse textuelle."),
+    verdictBy: z.string().optional().describe("build-notify | human."),
+    executedAt: z.string().optional(),
+  },
+}, async ({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt }) => {
+  try {
+    const ex = await updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt });
+    return text(JSON.stringify({ ok: true, execution: ex }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_execution_list", {
+  description: "Liste les exécutions E2E (filtrées par tâche et/ou test).",
+  inputSchema: { taskId: z.string().optional(), e2eTestId: z.string().optional(), limit: z.number().int().optional() },
+}, async ({ taskId, e2eTestId, limit }) => {
+  try {
+    const executions = await listE2EExecutions({ taskId, e2eTestId, limit });
+    return text(JSON.stringify({ count: executions.length, executions }, null, 2));
+  } catch (e) { return err(e.message); }
 });
 
 // === main ===

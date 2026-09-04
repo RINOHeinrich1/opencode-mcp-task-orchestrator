@@ -83,6 +83,32 @@ async function migrate() {
      ))
      WHERE i.project IS NULL`,
   );
+  // Tests E2E (cadrage 07) : registre, liens tâche<->test, exécutions/preuves.
+  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_tests (
+    id TEXT PRIMARY KEY, project TEXT NOT NULL, spec_file TEXT NOT NULL,
+    scenario TEXT NOT NULL, title TEXT,
+    status TEXT NOT NULL DEFAULT 'ACTIVE', version INTEGER NOT NULL DEFAULT 1,
+    meta JSONB, first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    CONSTRAINT uq_e2e_tests_scenario UNIQUE (project, spec_file, scenario)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_tests_project ON e2e_tests(project)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS task_e2e (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    e2e_test_id TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL DEFAULT 'REGRESSION', reason TEXT,
+    PRIMARY KEY (task_id, e2e_test_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_task_e2e_test ON task_e2e(e2e_test_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_executions (
+    id TEXT PRIMARY KEY, e2e_test_id TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+    task_id TEXT, deployment_id TEXT, plan_id TEXT, env TEXT, commit_sha TEXT, branch TEXT,
+    pipeline_ref TEXT, status TEXT NOT NULL DEFAULT 'PENDING', duration_ms INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 1, executed_at TEXT, report_artifact_id TEXT,
+    logs_url TEXT, video_url TEXT, summary TEXT, verdict_by TEXT, created_at TEXT NOT NULL
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_task ON e2e_executions(task_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_test ON e2e_executions(e2e_test_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_created ON e2e_executions(created_at)");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
@@ -1451,4 +1477,176 @@ export async function confirmRecette({ recetteId, confirmedBy }) {
     );
   }
   return getRecetteById(recetteId);
+}
+
+// ===========================================================================
+// Tests E2E Playwright — registre + exécutions (cadrage 07-tests-e2e.md)
+// ===========================================================================
+
+// ID stable d'un test : déterministe pour (project, spec_file, scenario).
+function e2eStableId(project, specFile, scenario) {
+  let h = 0x811c9dc5;
+  for (const part of [project, specFile, scenario]) {
+    for (let i = 0; i < part.length; i++) { h ^= part.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  }
+  const hash = (h >>> 0).toString(36).slice(0, 8);
+  const proj = String(project).toUpperCase().replace(/[^A-Z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "APP";
+  return `E2E-${proj}-${hash}`;
+}
+
+// Enregistre (ou réactive) un test dans le référentiel central. 1 test() = 1 entité.
+export async function upsertE2ETest({ project, specFile, scenario, title }) {
+  await ensureSchema();
+  if (!project || !specFile || !scenario) throw new Error("project, specFile et scenario requis");
+  const p = String(project).trim();
+  const now = nowIso();
+  const r = (await pool().query(
+    `INSERT INTO e2e_tests (id, project, spec_file, scenario, title, status, version, first_seen_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,'ACTIVE',1,$6,$6)
+     ON CONFLICT (project, spec_file, scenario)
+     DO UPDATE SET title = EXCLUDED.title, status = 'ACTIVE', updated_at = $6
+     RETURNING id`,
+    [e2eStableId(p, specFile, scenario), p, String(specFile).trim(), String(scenario).trim(), title ?? null, now],
+  )).rows[0];
+  return { id: r.id, project: p, specFile: String(specFile).trim(), scenario: String(scenario).trim() };
+}
+
+// Associe un test à une tâche (N:N typé : CREATED|UPDATED|REGRESSION|EXISTING + raison).
+export async function linkTaskE2E({ taskId, e2eTestId, relationType, reason }) {
+  await ensureSchema();
+  await pool().query(
+    `INSERT INTO task_e2e (task_id, e2e_test_id, relation_type, reason)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (task_id, e2e_test_id) DO UPDATE SET relation_type = EXCLUDED.relation_type, reason = EXCLUDED.reason`,
+    [taskId, e2eTestId, relationType || "REGRESSION", reason ?? null],
+  );
+  return { ok: true, taskId, e2eTestId };
+}
+
+export async function unlinkTaskE2E({ taskId, e2eTestId }) {
+  await ensureSchema();
+  await pool().query("DELETE FROM task_e2e WHERE task_id = $1 AND e2e_test_id = $2", [taskId, e2eTestId]);
+  return { ok: true };
+}
+
+// Liste les tests associés à une tâche (avec leur dernière exécution).
+export async function listTaskE2E(taskId) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT t.id, t.project, t.spec_file, t.scenario, t.title, t.status, t.version,
+            te.relation_type, te.reason,
+            (SELECT x.status FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_status,
+            (SELECT x.duration_ms FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_duration_ms,
+            (SELECT x.id FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_execution_id
+     FROM task_e2e te JOIN e2e_tests t ON t.id = te.e2e_test_id
+     WHERE te.task_id = $1 ORDER BY t.scenario`,
+    [taskId],
+  )).rows;
+  return rows.map((r) => ({
+    e2eTestId: r.id,
+    project: r.project,
+    specFile: r.spec_file,
+    scenario: r.scenario,
+    title: r.title,
+    status: r.status,
+    version: r.version,
+    relationType: r.relation_type,
+    reason: r.reason,
+    lastExecutionId: r.last_execution_id,
+    lastStatus: r.last_status,
+    lastDurationMs: r.last_duration_ms,
+  }));
+}
+
+// Enregistre une exécution E2E (statut PENDING/RUNNING puis mis à jour via update).
+export async function recordE2EExecution({ taskId, e2eTestId, deploymentId, planId, env, commitSha, branch, pipelineRef, status = "RUNNING", attempts = 1 }) {
+  await ensureSchema();
+  if (!e2eTestId) throw new Error("e2eTestId requis");
+  const id = `EXE-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO e2e_executions (id, e2e_test_id, task_id, deployment_id, plan_id, env, commit_sha, branch, pipeline_ref, status, attempts, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [id, e2eTestId, taskId ?? null, deploymentId ?? null, planId ?? null, env ?? null, commitSha ?? null, branch ?? null, pipelineRef ?? null, status, attempts || 1, nowIso()],
+  );
+  return { id, e2eTestId, taskId: taskId ?? null, status };
+}
+
+// Met à jour une exécution (verdict, preuves, durée).
+export async function updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt }) {
+  await ensureSchema();
+  const sets = [];
+  const params = [];
+  if (status) { params.push(status); sets.push(`status = $${params.length}`); }
+  if (durationMs !== undefined) { params.push(durationMs); sets.push(`duration_ms = $${params.length}`); }
+  if (reportArtifactId !== undefined) { params.push(reportArtifactId); sets.push(`report_artifact_id = $${params.length}`); }
+  if (logsUrl !== undefined) { params.push(logsUrl); sets.push(`logs_url = $${params.length}`); }
+  if (videoUrl !== undefined) { params.push(videoUrl); sets.push(`video_url = $${params.length}`); }
+  if (summary !== undefined) { params.push(summary); sets.push(`summary = $${params.length}`); }
+  if (verdictBy !== undefined) { params.push(verdictBy); sets.push(`verdict_by = $${params.length}`); }
+  if (executedAt !== undefined) { params.push(executedAt); sets.push(`executed_at = $${params.length}`); }
+  if (!sets.length) throw new Error("aucun champ à mettre à jour");
+  params.push(executionId);
+  await pool().query(`UPDATE e2e_executions SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  return getE2EExecution(executionId);
+}
+
+export async function getE2EExecution(executionId) {
+  await ensureSchema();
+  const r = (await pool().query("SELECT * FROM e2e_executions WHERE id = $1", [executionId])).rows[0];
+  if (!r) return null;
+  return {
+    id: r.id,
+    e2eTestId: r.e2e_test_id,
+    taskId: r.task_id,
+    deploymentId: r.deployment_id,
+    planId: r.plan_id,
+    env: r.env,
+    commitSha: r.commit_sha,
+    branch: r.branch,
+    pipelineRef: r.pipeline_ref,
+    status: r.status,
+    durationMs: r.duration_ms,
+    attempts: r.attempts,
+    executedAt: r.executed_at,
+    reportArtifactId: r.report_artifact_id,
+    logsUrl: r.logs_url,
+    videoUrl: r.video_url,
+    summary: r.summary,
+    verdictBy: r.verdict_by,
+    createdAt: r.created_at,
+  };
+}
+
+export async function listE2EExecutions({ taskId, e2eTestId, limit = 50 }) {
+  await ensureSchema();
+  const conds = [];
+  const params = [];
+  if (taskId) { params.push(taskId); conds.push(`task_id = $${params.length}`); }
+  if (e2eTestId) { params.push(e2eTestId); conds.push(`e2e_test_id = $${params.length}`); }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  params.push(Number(limit) || 50);
+  const rows = (await pool().query(
+    `SELECT * FROM e2e_executions ${where} ORDER BY created_at DESC LIMIT $${params.length}`, params,
+  )).rows;
+  return rows.map((r) => ({
+    id: r.id,
+    e2eTestId: r.e2e_test_id,
+    taskId: r.task_id,
+    deploymentId: r.deployment_id,
+    planId: r.plan_id,
+    env: r.env,
+    commitSha: r.commit_sha,
+    branch: r.branch,
+    pipelineRef: r.pipeline_ref,
+    status: r.status,
+    durationMs: r.duration_ms,
+    attempts: r.attempts,
+    executedAt: r.executed_at,
+    reportArtifactId: r.report_artifact_id,
+    logsUrl: r.logs_url,
+    videoUrl: r.video_url,
+    summary: r.summary,
+    verdictBy: r.verdict_by,
+    createdAt: r.created_at,
+  }));
 }
