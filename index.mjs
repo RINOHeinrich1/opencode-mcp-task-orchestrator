@@ -14,6 +14,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, rmSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, extname } from "node:path";
 import { canTaskTransition, isValidState, allowedFrom, VALID_STATES } from "./statemachine.mjs";
 import {
@@ -1223,6 +1224,71 @@ server.registerTool("e2e_collect", {
     writeFileSync(join(outDir, "imported.json"), JSON.stringify({ runId, importedAt: new Date().toISOString(), count: imported.length }, null, 2));
     try { rmSync(runDir, { recursive: true, force: true }); } catch {}
     return text(JSON.stringify({ ok: true, runId, imported, count: imported.length, failures: imported.filter((i) => i.status === "FAILED").length }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+
+// === e2e_run ===
+const E2E_ENV_FILE = "/root/.config/opencode/e2e.env";   // creds compte de test (root-only)
+const E2E_RUNNER = "/root/.config/opencode/scripts/e2e-runner.mjs";
+function loadE2EEnv() {
+  const out = {};
+  try {
+    const raw = readFileSync(E2E_ENV_FILE, "utf8");
+    for (const line of raw.split("\n")) {
+      const m = /^([A-Z0-9_]+)=(.*)$/.exec(line.trim());
+      if (m) out[m[1]] = m[2];
+    }
+  } catch {}
+  return out;
+}
+server.registerTool("e2e_run", {
+  description: "Déclenche un run E2E Playwright sur un repo applicatif (cible externe déployée, ex. préprod) puis IMPORTE le résultat dans le registre. À utiliser pour confronter le code réel au scénario (vérification/recette). Le verdict lu par l'IA est le RAPPORT TEXTE ; la vidéo est une preuve humaine.",
+  inputSchema: {
+    project: z.string(),
+    repoDir: z.string().describe("Répertoire (hôte) du dépôt applicatif avec Playwright (ex: /root/mada-talk-preprod)."),
+    baseUrl: z.string().optional().describe("URL de la cible déployée (défaut : e2e.env E2E_BASE_URL)."),
+    taskId: z.string().optional().describe("Tâche orchestrateur à associer au run."),
+    specPattern: z.string().optional().describe("Filtre de spec à exécuter (transmis à Playwright, optionnel)."),
+  },
+}, async ({ project, repoDir, baseUrl, taskId, specPattern }) => {
+  try {
+    if (!repoDir || !existsSync(join(repoDir, "package.json"))) return err(`repoDir invalide ou sans package.json : ${repoDir}`);
+    const env = loadE2EEnv();
+    if (!env.E2E_USER_EMAIL || !env.E2E_USER_PASSWORD) return err("identifiants E2E absents : renseigner " + E2E_ENV_FILE);
+    const target = baseUrl || env.E2E_BASE_URL || "";
+    if (!target) return err("baseUrl requis (cible déployée)");
+    const runId = `run-${Date.now()}`;
+    const args = [E2E_RUNNER, "--runId", runId, "--project", project, "--out", "/root/orchestrator-panel/storage/e2e/inbox"];
+    if (taskId) args.push("--taskId", taskId);
+    const runEnv = { ...process.env, E2E_EXTERNAL: "1", E2E_BASE_URL: target, E2E_USER_EMAIL: env.E2E_USER_EMAIL, E2E_USER_PASSWORD: env.E2E_USER_PASSWORD };
+    execFileSync("node", args, { cwd: repoDir, env: runEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 });
+    // Import automatique du run dans le registre.
+    const runDir = join("/root/orchestrator-panel/storage/e2e/inbox", runId);
+    const manifestPath = join(runDir, "manifest.json");
+    if (!existsSync(manifestPath)) return err(`run exécuté mais manifest absent : ${manifestPath}`);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const imported = [];
+    for (const res of manifest.results || []) {
+      if (!res.specFile || !res.scenario) continue;
+      const reg = await upsertE2ETest({ project, specFile: res.specFile, scenario: res.scenario, title: res.title });
+      if (taskId) await linkTaskE2E({ taskId, e2eTestId: reg.id, relationType: res.relation || "REGRESSION", reason: res.reason || "Run déclenché par la recette/vérification" });
+      const rec = await recordE2EExecution({ e2eTestId: reg.id, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1 });
+      const outDir = join("/root/orchestrator-panel/storage/e2e/runs", runId);
+      mkdirSync(outDir, { recursive: true });
+      const reportPath = join(outDir, `report-${rec.id}.json`);
+      writeFileSync(reportPath, JSON.stringify({ runId, executionId: rec.id, e2eTestId: reg.id, specFile: res.specFile, scenario: res.scenario, status: res.status, durationMs: res.durationMs, error: res.error || null, attempts: manifest.attempts || 1 }, null, 2));
+      let videoUrl = null;
+      if (res.videoFile && existsSync(join(runDir, res.videoFile))) {
+        const dest = join(outDir, `video-${rec.id}${extname(res.videoFile) || ".webm"}`);
+        copyFileSync(join(runDir, res.videoFile), dest);
+        videoUrl = dest;
+      }
+      await updateE2EExecution({ executionId: rec.id, status: res.status || "ERROR", durationMs: res.durationMs || null, logsUrl: reportPath, videoUrl, summary: (res.summary || `Résultat ${res.status}`).slice(0, 2000), verdictBy: "build-notify", executedAt: manifest.executedAt || new Date().toISOString() });
+      imported.push({ e2eTestId: reg.id, executionId: rec.id, status: res.status || "ERROR", scenario: res.scenario, summary: (res.summary || "").slice(0, 300) });
+    }
+    try { rmSync(runDir, { recursive: true, force: true }); } catch {}
+    return text(JSON.stringify({ ok: true, runId, count: imported.length, results: imported }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
