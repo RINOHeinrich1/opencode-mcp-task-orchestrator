@@ -44,6 +44,8 @@ import {
   removeTaskLink,
   listTaskLinks,
   startRecette,
+  addRecetteProject,
+  removeRecetteProject,
   getRecette,
   getRecetteById,
   listProjectRecettes,
@@ -378,6 +380,32 @@ server.registerTool("recette_link_task", {
     if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
     await linkRecetteTask(recetteId, taskId);
     return text(JSON.stringify({ ok: true, recette: await getRecetteById(recetteId) }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_project_add ===
+server.registerTool("recette_project_add", {
+  description: "Ajoute un projet à une recette existante (recette multi-projets : 1 recette = 1..N projets, pas de projet principal).",
+  inputSchema: { recetteId: z.string(), project: z.string().describe("Projet à rattacher à la recette.") },
+}, async ({ recetteId, project }) => {
+  try {
+    const recette = await addRecetteProject({ recetteId, project });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_project_remove ===
+server.registerTool("recette_project_remove", {
+  description: "Retire un projet d'une recette existante. Refus si c'est le dernier projet, ou si la recette couvre encore des tâches de ce projet.",
+  inputSchema: { recetteId: z.string(), project: z.string().describe("Projet à retirer de la recette.") },
+}, async ({ recetteId, project }) => {
+  try {
+    const recette = await removeRecetteProject({ recetteId, project });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) {
     return err(e.message);
   }

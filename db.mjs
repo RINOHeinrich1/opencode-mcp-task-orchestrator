@@ -1145,6 +1145,53 @@ export async function linkRecetteTask(recetteId, taskId) {
   return recetteId;
 }
 
+// Ajoute un projet à une recette existante (recette_projects). Ne modifie pas
+// `recettes.project` (legacy = 1er projet). 1 recette = 1..N projets.
+export async function addRecetteProject({ recetteId, project }) {
+  await ensureSchema();
+  if (!project || !String(project).trim()) throw new Error("projet requis");
+  const p = String(project).trim();
+  const r = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!r) throw new Error(`recette inconnue : ${recetteId}`);
+  await pool().query(
+    "INSERT INTO recette_projects (recette_id, project) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [recetteId, p],
+  );
+  return getRecetteById(recetteId);
+}
+
+// Retire un projet d'une recette existante. Refus si : c'est le dernier projet,
+// ou si la recette couvre encore des tâches appartenant à ce projet.
+export async function removeRecetteProject({ recetteId, project }) {
+  await ensureSchema();
+  if (!project) throw new Error("projet requis");
+  const r = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!r) throw new Error(`recette inconnue : ${recetteId}`);
+  const projs = (await pool().query(
+    "SELECT project FROM recette_projects WHERE recette_id = $1",
+    [recetteId],
+  )).rows.map((x) => x.project);
+  if (projs.length <= 1) throw new Error("impossible de retirer le dernier projet d'une recette");
+  if (!projs.includes(project)) return getRecetteById(recetteId);
+  const covered = (await pool().query(
+    `SELECT 1 FROM recette_tasks rt JOIN tasks t ON t.id = rt.task_id
+     WHERE rt.recette_id = $1 AND t.project = $2 LIMIT 1`,
+    [recetteId, project],
+  )).rows.length;
+  if (covered) throw new Error(`impossible : la recette couvre encore des tâches du projet ${project} (détachez-les d'abord)`);
+  await pool().query(
+    "DELETE FROM recette_projects WHERE recette_id = $1 AND project = $2",
+    [recetteId, project],
+  );
+  // Maintient le legacy `recettes.project` sur le 1er projet restant.
+  const rest = (await pool().query(
+    "SELECT project FROM recette_projects WHERE recette_id = $1 ORDER BY project LIMIT 1",
+    [recetteId],
+  )).rows[0];
+  if (rest) await pool().query("UPDATE recettes SET project = $1 WHERE recette_id = $2", [rest.project, recetteId]);
+  return getRecetteById(recetteId);
+}
+
 // Liste les recettes d'un projet (ou toutes) — un projet = présent dans recette_projects.
 export async function listProjectRecettes(project) {
   await ensureSchema();
