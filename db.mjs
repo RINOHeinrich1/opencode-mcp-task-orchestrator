@@ -1448,6 +1448,23 @@ async function getRecetteItem(itemId) {
   } : null;
 }
 
+
+// Supprime un élément de recette. Garde : refus si une tâche a déjà été créée
+// depuis cet élément (statut task_created) — on ne supprime pas une preuve.
+export async function deleteRecetteItem({ itemId }) {
+  await ensureSchema();
+  const r = (await pool().query(
+    "SELECT id, status, created_task_id FROM recette_items WHERE id = $1",
+    [Number(itemId)],
+  )).rows[0];
+  if (!r) throw new Error(`élément de recette introuvable : ${itemId}`);
+  if (r.status === "task_created" || r.created_task_id) {
+    throw new Error(`impossible de supprimer : une tâche (${r.created_task_id || "?"}) a déjà été créée depuis cet élément`);
+  }
+  await pool().query("DELETE FROM recette_items WHERE id = $1", [Number(itemId)]);
+  return { ok: true, itemId: Number(itemId) };
+}
+
 // Associe une session lancée à une recette + passe en cours.
 export async function setRecetteSession({ recetteId, sessionId }) {
   await ensureSchema();

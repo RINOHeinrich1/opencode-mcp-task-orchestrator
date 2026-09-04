@@ -56,6 +56,7 @@ import {
   listTaskE2E,
   recordE2EExecution,
   updateE2EExecution,
+  deleteRecetteItem,
   listE2EExecutions,
   getRecette,
   getRecetteById,
@@ -483,6 +484,18 @@ server.registerTool("recette_item_update", {
   } catch (e) {
     return err(e.message);
   }
+});
+
+
+// === recette_item_delete ===
+server.registerTool("recette_item_delete", {
+  description: "Supprime un élément de recette (remarque/demande/constat). Refus si une tâche a déjà été créée depuis cet élément (task_created).",
+  inputSchema: { itemId: z.number().int() },
+}, async ({ itemId }) => {
+  try {
+    const r = await deleteRecetteItem({ itemId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
 });
 
 // === recette_confirm ===
