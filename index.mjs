@@ -46,6 +46,7 @@ import {
   startRecette,
   addRecetteProject,
   removeRecetteProject,
+  unlinkRecetteTask,
   getRecette,
   getRecetteById,
   listProjectRecettes,
@@ -373,13 +374,27 @@ server.registerTool("recette_doc_remove", {
 
 // === recette_link_task ===
 server.registerTool("recette_link_task", {
-  description: "Rattache une tâche à une recette (tâche couverte par la recette).",
+  description: "Rattache une tâche à une recette (tâche couverte). Garde : la tâche doit appartenir à l'un des projets rattachés à la recette.",
   inputSchema: { recetteId: z.string(), taskId: z.string() },
 }, async ({ recetteId, taskId }) => {
   try {
     if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
     await linkRecetteTask(recetteId, taskId);
     return text(JSON.stringify({ ok: true, recette: await getRecetteById(recetteId) }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_unlink_task ===
+server.registerTool("recette_unlink_task", {
+  description: "Détache une tâche d'une recette (la tâche reste historiquement intacte, juste plus couverte).",
+  inputSchema: { recetteId: z.string(), taskId: z.string() },
+}, async ({ recetteId, taskId }) => {
+  try {
+    const recette = await unlinkRecetteTask(recetteId, taskId);
+    if (!recette) return err(`recette inconnue : ${recetteId}`);
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) {
     return err(e.message);
   }

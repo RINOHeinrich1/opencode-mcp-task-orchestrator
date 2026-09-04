@@ -1,6 +1,6 @@
 {
   "name": "task-orchestrator-mcp",
-  "version": "0.6.10",
+  "version": "0.6.11",
   "description": "MCP server — moteur d'orchestration de tâches : registre SQLite, machine à états, cycle de vie des worktrees et leases.",
   "type": "module",
   "main": "index.mjs",

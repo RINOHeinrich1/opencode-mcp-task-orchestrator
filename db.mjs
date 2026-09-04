@@ -1135,14 +1135,36 @@ export async function startRecette({ project, projects, title, description, task
   return getRecetteById(recetteId);
 }
 
-// Rattache une tâche à une recette (couverture).
+// Rattache une tâche à une recette (couverture). Garde : la tâche doit appartenir
+// à l'un des projets rattachés à la recette (1 recette = projets couverts).
 export async function linkRecetteTask(recetteId, taskId) {
   await ensureSchema();
+  const rec = (await pool().query("SELECT 1 FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const t = (await pool().query("SELECT project FROM tasks WHERE id = $1", [taskId])).rows[0];
+  if (!t) throw new Error(`tâche inconnue : ${taskId}`);
+  const projs = (await pool().query(
+    "SELECT project FROM recette_projects WHERE recette_id = $1",
+    [recetteId],
+  )).rows.map((x) => x.project);
+  if (projs.length && t.project && !projs.includes(t.project)) {
+    throw new Error(`la tâche ${taskId} appartient au projet ${t.project}, non rattaché à la recette (projets : ${projs.join(", ")})`);
+  }
   await pool().query(
     "INSERT INTO recette_tasks (recette_id, task_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
     [recetteId, taskId],
   );
   return recetteId;
+}
+
+// Détache une tâche d'une recette (la tâche reste historiquement intacte).
+export async function unlinkRecetteTask(recetteId, taskId) {
+  await ensureSchema();
+  await pool().query(
+    "DELETE FROM recette_tasks WHERE recette_id = $1 AND task_id = $2",
+    [recetteId, taskId],
+  );
+  return getRecetteById(recetteId);
 }
 
 // Ajoute un projet à une recette existante (recette_projects). Ne modifie pas
