@@ -13,6 +13,8 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, rmSync, unlinkSync } from "node:fs";
+import { join, extname } from "node:path";
 import { canTaskTransition, isValidState, allowedFrom, VALID_STATES } from "./statemachine.mjs";
 import {
   createTask,
@@ -1179,6 +1181,48 @@ server.registerTool("e2e_execution_list", {
   try {
     const executions = await listE2EExecutions({ taskId, e2eTestId, limit });
     return text(JSON.stringify({ count: executions.length, executions }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+
+// === e2e_collect ===
+const E2E_INBOX = "/root/orchestrator-panel/storage/e2e/inbox";
+const E2E_RUNS = "/root/orchestrator-panel/storage/e2e/runs";
+server.registerTool("e2e_collect", {
+  description: "Importe un run E2E CI (manifest + résultats Playwright) depuis storage/e2e/inbox/<runId> dans le registre (e2e_tests/task_e2e/e2e_executions) et conserve rapports texte + vidéos. Verdict posé sur le RAPPORT TEXTE uniquement (la vidéo est une preuve humaine).",
+  inputSchema: { runId: z.string() },
+}, async ({ runId }) => {
+  try {
+    const runDir = join(E2E_INBOX, runId);
+    const manifestPath = join(runDir, "manifest.json");
+    if (!existsSync(manifestPath)) return err(`manifest introuvable : ${manifestPath}`);
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    const { taskId, project, env, commitSha, branch, pipelineRef, attempts = 1 } = manifest;
+    const results = Array.isArray(manifest.results) ? manifest.results : [];
+    if (!results.length) return err("aucun résultat dans le manifest");
+    const outDir = join(E2E_RUNS, runId);
+    mkdirSync(outDir, { recursive: true });
+    const imported = [];
+    for (const res of results) {
+      if (!res.specFile || !res.scenario) continue;
+      const reg = await upsertE2ETest({ project, specFile: res.specFile, scenario: res.scenario, title: res.title });
+      const e2eTestId = reg.id;
+      if (taskId) await linkTaskE2E({ taskId, e2eTestId, relationType: res.relation || "REGRESSION", reason: res.reason || "Associé à l'exécution CI" });
+      const rec = await recordE2EExecution({ e2eTestId, taskId, env, commitSha, branch, pipelineRef, attempts });
+      const reportPath = join(outDir, `report-${rec.id}.json`);
+      writeFileSync(reportPath, JSON.stringify({ runId, executionId: rec.id, e2eTestId, specFile: res.specFile, scenario: res.scenario, status: res.status, durationMs: res.durationMs, error: res.error || null, attempts }, null, 2));
+      let videoUrl = null;
+      if (res.videoFile && existsSync(join(runDir, res.videoFile))) {
+        const dest = join(outDir, `video-${rec.id}${extname(res.videoFile) || ".webm"}`);
+        copyFileSync(join(runDir, res.videoFile), dest);
+        videoUrl = dest;
+      }
+      await updateE2EExecution({ executionId: rec.id, status: res.status || "ERROR", durationMs: res.durationMs || null, logsUrl: reportPath, videoUrl, summary: (res.summary || (res.error ? `Échec : ${String(res.error).slice(0, 400)}` : `PASS ${res.scenario}`)).slice(0, 2000), verdictBy: "build-notify", executedAt: manifest.executedAt || new Date().toISOString() });
+      imported.push({ e2eTestId, executionId: rec.id, status: res.status || "ERROR" });
+    }
+    writeFileSync(join(outDir, "imported.json"), JSON.stringify({ runId, importedAt: new Date().toISOString(), count: imported.length }, null, 2));
+    try { rmSync(runDir, { recursive: true, force: true }); } catch {}
+    return text(JSON.stringify({ ok: true, runId, imported, count: imported.length, failures: imported.filter((i) => i.status === "FAILED").length }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
