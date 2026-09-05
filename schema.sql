@@ -339,15 +339,16 @@ CREATE INDEX IF NOT EXISTS idx_scope_conflicts_project ON scope_conflicts(projec
 CREATE INDEX IF NOT EXISTS idx_scope_conflicts_id ON scope_conflicts(id);
 
 -- ===========================================================================
--- Tests E2E Playwright (cadrage 07-tests-e2e.md) : registre, liens tâche↔test,
--- exécutions avec preuves (rapport texte partagé IA+humain ; vidéo = humain).
+-- Tests E2E Playwright (cadrage 08) : entités de 1er niveau (indépendantes des
+-- tâches), projets couverts (N:N), paramètres, exécutions propriété du test.
 -- ===========================================================================
 CREATE TABLE IF NOT EXISTS e2e_tests (
   id             TEXT PRIMARY KEY,             -- E2E-<PROJ>-<hash>
-  project        TEXT NOT NULL,                -- projet/dépôt applicatif
+  project        TEXT NOT NULL,                -- REPO SOURCE (où vit le spec)
   spec_file      TEXT NOT NULL,                -- chemin du spec Playwright
   scenario       TEXT NOT NULL,                -- titre du test()
   title          TEXT,
+  description    TEXT,
   status         TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | OBSOLETE | QUARANTINE | DRAFT
   version        INTEGER NOT NULL DEFAULT 1,
   meta           JSONB,
@@ -357,7 +358,26 @@ CREATE TABLE IF NOT EXISTS e2e_tests (
 );
 CREATE INDEX IF NOT EXISTS idx_e2e_tests_project ON e2e_tests(project);
 
--- Relation N:N tâche ↔ test (typée : pourquoi le test est associé).
+-- Projets couverts par le comportement (N:N) — inclut le repo source.
+CREATE TABLE IF NOT EXISTS e2e_test_projects (
+  e2e_test_id   TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+  project       TEXT NOT NULL,
+  PRIMARY KEY (e2e_test_id, project)
+);
+CREATE INDEX IF NOT EXISTS idx_e2e_test_projects_project ON e2e_test_projects(project);
+
+-- Paramètres variables d'un test (défaut non sensible ; refs secrets hors registre).
+CREATE TABLE IF NOT EXISTS e2e_test_params (
+  e2e_test_id   TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL,
+  kind          TEXT NOT NULL DEFAULT 'string',   -- url | string | secret | int | bool
+  default_value TEXT,
+  secret_ref    TEXT,
+  required      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (e2e_test_id, name)
+);
+
+-- Relation N:N tâche ↔ test (pure association : le test existe sans tâche).
 CREATE TABLE IF NOT EXISTS task_e2e (
   task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   e2e_test_id   TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
@@ -367,10 +387,11 @@ CREATE TABLE IF NOT EXISTS task_e2e (
 );
 CREATE INDEX IF NOT EXISTS idx_task_e2e_test ON task_e2e(e2e_test_id);
 
--- Une exécution = une preuve (rapport texte partagé ; vidéo = humain).
+-- Une exécution = une preuve ; appartient au TEST (origin : task|recette|ci|manual|session).
 CREATE TABLE IF NOT EXISTS e2e_executions (
   id                 TEXT PRIMARY KEY,          -- EXE-<ts>-<rand>
   e2e_test_id        TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+  origin             TEXT,
   task_id            TEXT,
   deployment_id      TEXT,
   plan_id            TEXT,
@@ -386,9 +407,12 @@ CREATE TABLE IF NOT EXISTS e2e_executions (
   logs_url           TEXT,
   video_url          TEXT,       -- preuve HUMAINE
   summary            TEXT,       -- verdict/synthèse textuelle
-  verdict_by         TEXT,       -- build-notify | human
-  created_at         TEXT NOT NULL
+  verdict_by         TEXT,       -- build-notify | human | agent-recette
+  created_at         TEXT NOT NULL,
+  param_values       JSONB       -- valeurs effectives utilisées au run
 );
 CREATE INDEX IF NOT EXISTS idx_e2e_executions_task ON e2e_executions(task_id);
 CREATE INDEX IF NOT EXISTS idx_e2e_executions_test ON e2e_executions(e2e_test_id);
 CREATE INDEX IF NOT EXISTS idx_e2e_executions_created ON e2e_executions(created_at);
+-- NOTE : idx_e2e_executions_origin est créé par migrate() APRÈS l'ALTER ADD COLUMN
+-- origin (rétrocompat base existante) — ne pas le déclarer ici avant l'ALTER.

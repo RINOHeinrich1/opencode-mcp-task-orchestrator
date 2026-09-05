@@ -51,6 +51,12 @@ import {
   removeRecetteProject,
   unlinkRecetteTask,
   upsertE2ETest,
+  reactivateE2ETest,
+  markE2ETestObsolete,
+  updateE2ETestMeta,
+  setE2ETestParams,
+  getE2ETest,
+  listE2ETests,
   linkTaskE2E,
   unlinkTaskE2E,
   listTaskE2E,
@@ -1096,24 +1102,104 @@ server.registerTool("task_delete", {
 // ===========================================================================
 
 // === e2e_test_register ===
+// === e2e_test_register (entité 1er niveau) ===
 server.registerTool("e2e_test_register", {
-  description: "Enregistre (ou réactive) un test E2E dans le référentiel central — 1 enregistrement par test() Playwright (project + spec_file + scenario).",
+  description: "Enregistre (ou réactive) un test E2E comme entité de 1er niveau — 1 enregistrement par test() Playwright. project = REPO SOURCE (où vit le spec) ; coveredProjects = projets dont le comportement est vérifié (le repo source est toujours inclus). Indépendant de toute tâche (l'association tâche se fait via e2e_test_link).",
   inputSchema: {
-    project: z.string(),
+    project: z.string().describe("Repo source (projet du dépôt où vit le spec)."),
     specFile: z.string().describe("Chemin du spec file (ex: tests/e2e/auth/login.spec.ts)."),
     scenario: z.string().describe("Titre du test() Playwright."),
-    title: z.string().optional(),
+    title: z.string().optional().describe("Titre court / comportement couvert."),
+    description: z.string().optional().describe("Description du comportement vérifié (multi-projets éventuel)."),
+    coveredProjects: z.array(z.string()).optional().describe("Projets couverts par le comportement (ex. ['mada-talk','oniria'])."),
   },
-}, async ({ project, specFile, scenario, title }) => {
+}, async ({ project, specFile, scenario, title, description, coveredProjects }) => {
   try {
-    const t = await upsertE2ETest({ project, specFile, scenario, title });
+    const t = await upsertE2ETest({ project, specFile, scenario, title, description, coveredProjects });
+    return text(JSON.stringify({ ok: true, test: await getE2ETest(t.id) }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === e2e_test_update / get / obsolete ===
+server.registerTool("e2e_test_update", {
+  description: "Met à jour le titre/description/projets couverts d'un test E2E (entité 1er niveau).",
+  inputSchema: {
+    e2eTestId: z.string(),
+    title: z.string().optional(),
+    description: z.string().optional(),
+    coveredProjects: z.array(z.string()).optional().describe("Remplace les projets couverts."),
+  },
+}, async ({ e2eTestId, title, description, coveredProjects }) => {
+  try {
+    const t = await updateE2ETestMeta({ e2eTestId, title, description, coveredProjects });
     return text(JSON.stringify({ ok: true, test: t }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-// === e2e_test_link / unlink ===
+server.registerTool("e2e_test_get", {
+  description: "Détail d'un test E2E (1er niveau) : infos, projets couverts, paramètres, tâches liées, dernière exécution.",
+  inputSchema: { e2eTestId: z.string() },
+}, async ({ e2eTestId }) => {
+  try {
+    const t = await getE2ETest(e2eTestId);
+    if (!t) return err(`test inconnu : ${e2eTestId}`);
+    return text(JSON.stringify({ ok: true, test: t }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_test_obsolete", {
+  description: "Marque un test E2E OBSOLETE (spec disparu du repo — sync auto T10). Jamais de suppression d'historique.",
+  inputSchema: { e2eTestId: z.string() },
+}, async ({ e2eTestId }) => {
+  try {
+    const t = await markE2ETestObsolete(e2eTestId);
+    return text(JSON.stringify({ ok: true, test: t }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_test_param_set", {
+  description: "Déclare/remplace les paramètres variables d'un test (URL, compte, token…). Valeur par défaut NON sensible ; secret : fournir secretRef (référence e2e.env/secrets), JAMAIS la valeur.",
+  inputSchema: {
+    e2eTestId: z.string(),
+    params: z.array(z.object({
+      name: z.string(),
+      kind: z.enum(["url", "string", "secret", "int", "bool"]).optional().describe("Type du paramètre (défaut string)."),
+      defaultValue: z.string().optional().describe("Valeur par défaut non sensible."),
+      secretRef: z.string().optional().describe("Si secret : référence (ex. ONIRIA_E2E_USER_EMAIL) — la valeur ne doit jamais être persistée."),
+      required: z.boolean().optional(),
+    })).describe("Paramètres du test (remplace l'existant)."),
+  },
+}, async ({ e2eTestId, params }) => {
+  try {
+    await setE2ETestParams(e2eTestId, params);
+    return text(JSON.stringify({ ok: true, e2eTestId, params: params || [] }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === e2e_list (global, entités 1er niveau) ===
+server.registerTool("e2e_list", {
+  description: "Liste les tests E2E (entités 1er niveau). Filtres : projet couvert, tâche associée (taskId → tests liés à la tâche), statut, recherche texte.",
+  inputSchema: {
+    taskId: z.string().optional().describe("Si fourni : tests associés à cette tâche (relation + dernière exécution sur la tâche)."),
+    project: z.string().optional().describe("Filtre : projet couvert par le comportement."),
+    status: z.string().optional().describe("Filtre statut : ACTIVE | OBSOLETE | QUARANTINE | DRAFT."),
+    search: z.string().optional().describe("Recherche texte (titre / scénario / spec file)."),
+    limit: z.number().int().optional(),
+  },
+}, async ({ taskId, project, status, search, limit }) => {
+  try {
+    if (taskId) {
+      const tests = await listTaskE2E(taskId);
+      return text(JSON.stringify({ taskId, count: tests.length, tests }, null, 2));
+    }
+    const tests = await listE2ETests({ project, status, search, limit });
+    return text(JSON.stringify({ count: tests.length, tests }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === e2e_test_link / unlink (association tâche ↔ test) ===
 server.registerTool("e2e_test_link", {
-  description: "Associe un test E2E à une tâche (N:N). relation_type : CREATED|UPDATED|REGRESSION|EXISTING (+ reason obligatoire).",
+  description: "Associe un test E2E à une tâche (N:N pure association). relation_type : CREATED|UPDATED|REGRESSION|EXISTING (+ reason obligatoire). Le test reste indépendant.",
   inputSchema: {
     taskId: z.string(),
     e2eTestId: z.string(),
@@ -1128,7 +1214,7 @@ server.registerTool("e2e_test_link", {
 });
 
 server.registerTool("e2e_test_unlink", {
-  description: "Détache un test E2E d'une tâche.",
+  description: "Détache un test E2E d'une tâche (le test reste enregistré).",
   inputSchema: { taskId: z.string(), e2eTestId: z.string() },
 }, async ({ taskId, e2eTestId }) => {
   try {
@@ -1136,30 +1222,21 @@ server.registerTool("e2e_test_unlink", {
   } catch (e) { return err(e.message); }
 });
 
-// === e2e_list ===
-server.registerTool("e2e_list", {
-  description: "Liste les tests E2E associés à une tâche (avec relation et dernière exécution).",
-  inputSchema: { taskId: z.string() },
-}, async ({ taskId }) => {
-  try {
-    const tests = await listTaskE2E(taskId);
-    return text(JSON.stringify({ taskId, count: tests.length, tests }, null, 2));
-  } catch (e) { return err(e.message); }
-});
-
-// === e2e_execution_record / update ===
+// === e2e_execution_record / update / list ===
 server.registerTool("e2e_execution_record", {
-  description: "Enregistre le début d'une exécution E2E (PENDING/RUNNING) rattachée à un test et une tâche.",
+  description: "Enregistre le début d'une exécution E2E (PENDING/RUNNING). L'exécution appartient au TEST ; origin = task|recette|ci|manual|session (défaut manual). taskId optionnel = origine tracée.",
   inputSchema: {
     e2eTestId: z.string(),
-    taskId: z.string().optional(),
+    origin: z.enum(["task", "recette", "ci", "manual", "session"]).optional().describe("Origine du déclenchement (défaut manual)."),
+    taskId: z.string().optional().describe("Tâche origine (optionnelle)."),
     deploymentId: z.string().optional(),
     planId: z.string().optional(),
-    env: z.string().optional(),
+    env: z.string().optional().describe("Description de la cible exécutée."),
     commitSha: z.string().optional(),
     branch: z.string().optional(),
     pipelineRef: z.string().optional(),
     attempts: z.number().int().optional().describe("Itération de correction (1..3)."),
+    paramValues: z.record(z.string(), z.any()).optional().describe("Valeurs effectives utilisées au run (noms ; secrets référencés, jamais en clair)."),
   },
 }, async (args) => {
   try {
@@ -1178,22 +1255,28 @@ server.registerTool("e2e_execution_update", {
     logsUrl: z.string().optional(),
     videoUrl: z.string().optional().describe("Preuve HUMAINE (vidéo) — jamais analysée par l'IA."),
     summary: z.string().optional().describe("Verdict / synthèse textuelle."),
-    verdictBy: z.string().optional().describe("build-notify | human."),
+    verdictBy: z.string().optional().describe("build-notify | human | agent-recette."),
+    origin: z.enum(["task", "recette", "ci", "manual", "session"]).optional(),
     executedAt: z.string().optional(),
   },
-}, async ({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt }) => {
+}, async ({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, origin, executedAt }) => {
   try {
-    const ex = await updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt });
+    const ex = await updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, origin, executedAt });
     return text(JSON.stringify({ ok: true, execution: ex }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("e2e_execution_list", {
-  description: "Liste les exécutions E2E (filtrées par tâche et/ou test).",
-  inputSchema: { taskId: z.string().optional(), e2eTestId: z.string().optional(), limit: z.number().int().optional() },
-}, async ({ taskId, e2eTestId, limit }) => {
+  description: "Liste les exécutions E2E (historique d'un test et/ou d'une tâche, filtrable par origine).",
+  inputSchema: {
+    e2eTestId: z.string().optional().describe("Historique du test."),
+    taskId: z.string().optional().describe("Exécutions dont l'origine est cette tâche."),
+    origin: z.enum(["task", "recette", "ci", "manual", "session"]).optional(),
+    limit: z.number().int().optional(),
+  },
+}, async ({ e2eTestId, taskId, origin, limit }) => {
   try {
-    const executions = await listE2EExecutions({ taskId, e2eTestId, limit });
+    const executions = await listE2EExecutions({ e2eTestId, taskId, origin, limit });
     return text(JSON.stringify({ count: executions.length, executions }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1222,7 +1305,7 @@ server.registerTool("e2e_collect", {
       const reg = await upsertE2ETest({ project, specFile: res.specFile, scenario: res.scenario, title: res.title });
       const e2eTestId = reg.id;
       if (taskId) await linkTaskE2E({ taskId, e2eTestId, relationType: res.relation || "REGRESSION", reason: res.reason || "Associé à l'exécution CI" });
-      const rec = await recordE2EExecution({ e2eTestId, taskId, env, commitSha, branch, pipelineRef, attempts });
+      const rec = await recordE2EExecution({ e2eTestId, origin: "ci", taskId, env, commitSha, branch, pipelineRef, attempts });
       const reportPath = join(outDir, `report-${rec.id}.json`);
       writeFileSync(reportPath, JSON.stringify({ runId, executionId: rec.id, e2eTestId, specFile: res.specFile, scenario: res.scenario, status: res.status, durationMs: res.durationMs, error: res.error || null, attempts }, null, 2));
       let videoUrl = null;
@@ -1256,25 +1339,42 @@ function loadE2EEnv() {
   return out;
 }
 server.registerTool("e2e_run", {
-  description: "Déclenche un run E2E Playwright sur un repo applicatif (cible externe déployée, ex. préprod) puis IMPORTE le résultat dans le registre. À utiliser pour confronter le code réel au scénario (vérification/recette). Le verdict lu par l'IA est le RAPPORT TEXTE ; la vidéo est une preuve humaine.",
+  description: "Déclenche un run E2E Playwright sur un repo applicatif (cible externe déployée, ex. préprod) puis IMPORTE le résultat dans le registre. Le test est une entité de 1er niveau : passer e2eTestId (ou laisser specPattern pour un run libre). origin : task|recette|manual (défaut manual, task si taskId fourni). Le verdict lu par l'IA est le RAPPORT TEXTE ; la vidéo est une preuve humaine.",
   inputSchema: {
     project: z.string(),
     repoDir: z.string().describe("Répertoire (hôte) du dépôt applicatif avec Playwright (ex: /root/mada-talk-preprod)."),
     baseUrl: z.string().optional().describe("URL de la cible déployée (défaut : e2e.env E2E_BASE_URL)."),
-    taskId: z.string().optional().describe("Tâche orchestrateur à associer au run."),
+    e2eTestId: z.string().optional().describe("Test (entité 1er niveau) à exécuter — résout specPattern + projets couverts depuis le registre."),
+    origin: z.enum(["task", "recette", "manual", "ci", "session"]).optional().describe("Origine du déclenchement."),
+    taskId: z.string().optional().describe("Tâche origine à associer (et lier si non déjà liée)."),
     specPattern: z.string().optional().describe("Regex Playwright de filtre de spec à exécuter (positionnelle, transmise après '--' ; défaut : run complet de la config). Ex: madatalk-requests-(chatbot-cycle|support-interactions-kpi|pause-resiliation)\\\\.spec\\\\.ts"),
     playwrightConfig: z.string().optional().describe("Config Playwright dédiée (ex: playwright.madatalk-requests.recette.config.ts) — passée à Playwright via --config (placée AVANT les filtres de spec)."),
     pwArgs: z.array(z.string()).optional().describe("Arguments Playwright supplémentaires transmis après '--' (ex: ['--project=authenticated']). Sans collision avec 'project' (projet du REGISTRE oniria/mada-talk), ni avec 'playwrightConfig'."),
+    paramValues: z.record(z.string(), z.string()).optional().describe("Surcharge des paramètres du test au run (ex. {'baseUrl':'…'} ; les défauts du test sont appliqués sinon)."),
   },
-}, async ({ project, repoDir, baseUrl, taskId, specPattern, playwrightConfig, pwArgs }) => {
+}, async ({ project, repoDir, baseUrl, taskId, origin, e2eTestId, specPattern, playwrightConfig, pwArgs, paramValues }) => {
   try {
     if (!repoDir || !existsSync(join(repoDir, "package.json"))) return err(`repoDir invalide ou sans package.json : ${repoDir}`);
     const env = loadE2EEnv();
     if (!env.E2E_USER_EMAIL || !env.E2E_USER_PASSWORD) return err("identifiants E2E absents : renseigner " + E2E_ENV_FILE);
+    // Si un test 1er niveau est donné, on résout specPattern + défauts de params.
+    let resolvedProject = project;
+    let pattern = specPattern;
+    let paramOverrides = paramValues || {};
+    if (e2eTestId) {
+      const t = await getE2ETest(e2eTestId);
+      if (!t) return err(`test inconnu : ${e2eTestId}`);
+      resolvedProject = t.project;
+      pattern = pattern || t.specFile;
+      for (const p of t.params || []) {
+        if (p.defaultValue && paramOverrides[p.name] === undefined) paramOverrides[p.name] = p.defaultValue;
+      }
+    }
+    const runOrigin = origin || (taskId ? "task" : "manual");
     const target = baseUrl || env.E2E_BASE_URL || "";
     if (!target) return err("baseUrl requis (cible déployée)");
     const runId = `run-${Date.now()}`;
-    const args = [E2E_RUNNER, "--runId", runId, "--project", project, "--out", "/root/orchestrator-panel/storage/e2e/inbox"];
+    const args = [E2E_RUNNER, "--runId", runId, "--project", resolvedProject, "--out", "/root/orchestrator-panel/storage/e2e/inbox"];
     if (taskId) args.push("--taskId", taskId);
     // Arguments Playwright après le séparateur "--" (le runner les transmet à
     // `npx playwright test`). Ordre : --config AVANT les filtres de spec, puis
@@ -1283,7 +1383,7 @@ server.registerTool("e2e_run", {
     const pw = [];
     if (playwrightConfig) pw.push(`--config=${playwrightConfig}`);
     if (Array.isArray(pwArgs) && pwArgs.length) pw.push(...pwArgs);
-    if (specPattern) pw.push(specPattern);
+    if (pattern) pw.push(pattern);
     if (pw.length) args.push("--", ...pw);
     // Environnement du run :
     //  - E2E_BASE_URL reste posé (rétrocompat mada-talk : le SPA lit cette var) ;
@@ -1296,6 +1396,11 @@ server.registerTool("e2e_run", {
     for (const [k, v] of Object.entries(env)) {
       if (/^ONIRIA_E2E_/.test(k) && !(k in process.env)) runEnv[k] = v;
     }
+    // Surcharges paramValues exposées comme variables d'environnement (les
+    // specs lisent process.env). baseUrl prioritaire sur paramValues.
+    for (const [k, v] of Object.entries(paramOverrides)) {
+      if (runEnv[k] === undefined && k !== "baseUrl") runEnv[k] = String(v);
+    }
     execFileSync("node", args, { cwd: repoDir, env: runEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 });
     // Import automatique du run dans le registre.
     const runDir = join("/root/orchestrator-panel/storage/e2e/inbox", runId);
@@ -1305,9 +1410,9 @@ server.registerTool("e2e_run", {
     const imported = [];
     for (const res of manifest.results || []) {
       if (!res.specFile || !res.scenario) continue;
-      const reg = await upsertE2ETest({ project, specFile: res.specFile, scenario: res.scenario, title: res.title });
+      const reg = await upsertE2ETest({ project: resolvedProject, specFile: res.specFile, scenario: res.scenario, title: res.title, coveredProjects: (e2eTestId ? null : [resolvedProject]) });
       if (taskId) await linkTaskE2E({ taskId, e2eTestId: reg.id, relationType: res.relation || "REGRESSION", reason: res.reason || "Run déclenché par la recette/vérification" });
-      const rec = await recordE2EExecution({ e2eTestId: reg.id, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1 });
+      const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? paramOverrides : null });
       const outDir = join("/root/orchestrator-panel/storage/e2e/runs", runId);
       mkdirSync(outDir, { recursive: true });
       const reportPath = join(outDir, `report-${rec.id}.json`);
@@ -1322,7 +1427,7 @@ server.registerTool("e2e_run", {
       imported.push({ e2eTestId: reg.id, executionId: rec.id, status: res.status || "ERROR", scenario: res.scenario, summary: (res.summary || "").slice(0, 300) });
     }
     try { rmSync(runDir, { recursive: true, force: true }); } catch {}
-    return text(JSON.stringify({ ok: true, runId, count: imported.length, results: imported }, null, 2));
+    return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, results: imported }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

@@ -83,15 +83,36 @@ async function migrate() {
      ))
      WHERE i.project IS NULL`,
   );
-  // Tests E2E (cadrage 07) : registre, liens tâche<->test, exécutions/preuves.
+  // Tests E2E (cadrage 08) : entités de 1er niveau (indépendantes des tâches).
+  // `project` = REPO SOURCE (où vit le spec) ; projets couverts en N:N via
+  // e2e_test_projects (le comportement peut traverser plusieurs projets).
   await pool().query(`CREATE TABLE IF NOT EXISTS e2e_tests (
     id TEXT PRIMARY KEY, project TEXT NOT NULL, spec_file TEXT NOT NULL,
     scenario TEXT NOT NULL, title TEXT,
+    description TEXT,
     status TEXT NOT NULL DEFAULT 'ACTIVE', version INTEGER NOT NULL DEFAULT 1,
     meta JSONB, first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     CONSTRAINT uq_e2e_tests_scenario UNIQUE (project, spec_file, scenario)
   )`);
+  await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS description TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_tests_project ON e2e_tests(project)");
+  // Projets couverts par le comportement (N:N) — inclut le repo source.
+  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_test_projects (
+    e2e_test_id TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+    project     TEXT NOT NULL,
+    PRIMARY KEY (e2e_test_id, project)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_test_projects_project ON e2e_test_projects(project)");
+  // Paramètres variables d'un test (valeur par défaut non sensible ; refs secrets).
+  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_test_params (
+    e2e_test_id   TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+    name          TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'string',
+    default_value TEXT,
+    secret_ref    TEXT,
+    required      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (e2e_test_id, name)
+  )`);
   await pool().query(`CREATE TABLE IF NOT EXISTS task_e2e (
     task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     e2e_test_id TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
@@ -99,15 +120,20 @@ async function migrate() {
     PRIMARY KEY (task_id, e2e_test_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_task_e2e_test ON task_e2e(e2e_test_id)");
+  // Exécutions = propriété du TEST ; tâche/recette/CI/manuel = origine tracée.
   await pool().query(`CREATE TABLE IF NOT EXISTS e2e_executions (
     id TEXT PRIMARY KEY, e2e_test_id TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
-    task_id TEXT, deployment_id TEXT, plan_id TEXT, env TEXT, commit_sha TEXT, branch TEXT,
+    origin TEXT, task_id TEXT, deployment_id TEXT, plan_id TEXT, env TEXT, commit_sha TEXT, branch TEXT,
     pipeline_ref TEXT, status TEXT NOT NULL DEFAULT 'PENDING', duration_ms INTEGER,
     attempts INTEGER NOT NULL DEFAULT 1, executed_at TEXT, report_artifact_id TEXT,
-    logs_url TEXT, video_url TEXT, summary TEXT, verdict_by TEXT, created_at TEXT NOT NULL
+    logs_url TEXT, video_url TEXT, summary TEXT, verdict_by TEXT, created_at TEXT NOT NULL,
+    param_values JSONB
   )`);
+  await pool().query("ALTER TABLE e2e_executions ADD COLUMN IF NOT EXISTS origin TEXT");
+  await pool().query("ALTER TABLE e2e_executions ADD COLUMN IF NOT EXISTS param_values JSONB");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_task ON e2e_executions(task_id)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_test ON e2e_executions(e2e_test_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_origin ON e2e_executions(origin)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_created ON e2e_executions(created_at)");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -1497,10 +1523,12 @@ export async function confirmRecette({ recetteId, confirmedBy }) {
 }
 
 // ===========================================================================
-// Tests E2E Playwright — registre + exécutions (cadrage 07-tests-e2e.md)
+// Tests E2E Playwright (cadrage 08) — entités de 1er niveau indépendantes des
+// tâches : repo source + projets couverts (N:N), paramètres, exécutions
+// propriété du test (origin : task|recette|ci|manual|session).
 // ===========================================================================
 
-// ID stable d'un test : déterministe pour (project, spec_file, scenario).
+// ID stable d'un test : déterministe pour (repo source = project, spec_file, scenario).
 function e2eStableId(project, specFile, scenario) {
   let h = 0x811c9dc5;
   for (const part of [project, specFile, scenario]) {
@@ -1511,24 +1539,104 @@ function e2eStableId(project, specFile, scenario) {
   return `E2E-${proj}-${hash}`;
 }
 
+// Lecteur de projets couverts d'un test (N:N e2e_test_projects).
+// Fallback : si aucune ligne, le test couvre au minimum son repo source (project).
+async function getE2EProjects(e2eTestId) {
+  const rows = (await pool().query("SELECT project FROM e2e_test_projects WHERE e2e_test_id = $1 ORDER BY project", [e2eTestId])).rows;
+  if (rows.length) return rows.map((r) => r.project);
+  const t = (await pool().query("SELECT project FROM e2e_tests WHERE id = $1", [e2eTestId])).rows[0];
+  return t ? [t.project] : [];
+}
+
+// Réécrit les projets couverts (N:N) — le repo source est TOUJOURS inclus.
+async function setE2EProjects(e2eTestId, project, coveredProjects) {
+  const set = new Set([project, ...(Array.isArray(coveredProjects) ? coveredProjects.map(String) : [])].map((x) => x.trim()).filter(Boolean));
+  await pool().query("DELETE FROM e2e_test_projects WHERE e2e_test_id = $1", [e2eTestId]);
+  for (const prj of set) {
+    await pool().query("INSERT INTO e2e_test_projects (e2e_test_id, project) VALUES ($1,$2) ON CONFLICT DO NOTHING", [e2eTestId, prj]);
+  }
+}
+
 // Enregistre (ou réactive) un test dans le référentiel central. 1 test() = 1 entité.
-export async function upsertE2ETest({ project, specFile, scenario, title }) {
+// project = REPO SOURCE (où vit le spec) ; coveredProjects[] = projets couverts.
+export async function upsertE2ETest({ project, specFile, scenario, title, description, coveredProjects }) {
   await ensureSchema();
-  if (!project || !specFile || !scenario) throw new Error("project, specFile et scenario requis");
+  if (!project || !specFile || !scenario) throw new Error("project (repo source), specFile et scenario requis");
   const p = String(project).trim();
   const now = nowIso();
   const r = (await pool().query(
-    `INSERT INTO e2e_tests (id, project, spec_file, scenario, title, status, version, first_seen_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,'ACTIVE',1,$6,$6)
+    `INSERT INTO e2e_tests (id, project, spec_file, scenario, title, description, status, version, first_seen_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,'ACTIVE',1,$7,$7)
      ON CONFLICT (project, spec_file, scenario)
-     DO UPDATE SET title = EXCLUDED.title, status = 'ACTIVE', updated_at = $6
+     DO UPDATE SET title = EXCLUDED.title, description = COALESCE(EXCLUDED.description, e2e_tests.description),
+                   status = 'ACTIVE', updated_at = $7
      RETURNING id`,
-    [e2eStableId(p, specFile, scenario), p, String(specFile).trim(), String(scenario).trim(), title ?? null, now],
+    [e2eStableId(p, specFile, scenario), p, String(specFile).trim(), String(scenario).trim(), title ?? null, description ?? null, now],
   )).rows[0];
+  await setE2EProjects(r.id, p, coveredProjects);
   return { id: r.id, project: p, specFile: String(specFile).trim(), scenario: String(scenario).trim() };
 }
 
+// Réactive un test existant (utilisé par la sync auto T10 quand un spec reparait).
+export async function reactivateE2ETest(e2eTestId) {
+  await ensureSchema();
+  await pool().query("UPDATE e2e_tests SET status = 'ACTIVE', updated_at = $1 WHERE id = $2", [nowIso(), e2eTestId]);
+  return getE2ETest(e2eTestId);
+}
+
+// Marque un test OBSOLETE (spec disparu du repo — sync auto T10). Jamais de suppression.
+export async function markE2ETestObsolete(e2eTestId) {
+  await ensureSchema();
+  await pool().query("UPDATE e2e_tests SET status = 'OBSOLETE', updated_at = $1 WHERE id = $2 AND status <> 'OBSOLETE'", [nowIso(), e2eTestId]);
+  return getE2ETest(e2eTestId);
+}
+
+export async function updateE2ETestMeta({ e2eTestId, title, description, coveredProjects }) {
+  await ensureSchema();
+  const sets = [];
+  const params = [];
+  const now = nowIso();
+  if (title !== undefined) { params.push(title); sets.push(`title = $${params.length}`); }
+  if (description !== undefined) { params.push(description); sets.push(`description = $${params.length}`); }
+  if (sets.length) {
+    params.push(now, e2eTestId);
+    await pool().query(`UPDATE e2e_tests SET ${sets.join(", ")}, updated_at = $${params.length - 1} WHERE id = $${params.length}`, params);
+  }
+  if (Array.isArray(coveredProjects) && coveredProjects.length) {
+    const t = await getE2ETestRow(e2eTestId);
+    if (t) await setE2EProjects(e2eTestId, t.project, coveredProjects);
+  }
+  return getE2ETest(e2eTestId);
+}
+
+async function getE2ETestRow(e2eTestId) {
+  const r = (await pool().query("SELECT * FROM e2e_tests WHERE id = $1", [e2eTestId])).rows[0];
+  return r || null;
+}
+
+// Déclare/remplace les paramètres d'un test (valeurs défaut NON sensibles).
+export async function setE2ETestParams(e2eTestId, params) {
+  await ensureSchema();
+  await pool().query("DELETE FROM e2e_test_params WHERE e2e_test_id = $1", [e2eTestId]);
+  for (const prm of params || []) {
+    if (!prm || !prm.name) continue;
+    await pool().query(
+      `INSERT INTO e2e_test_params (e2e_test_id, name, kind, default_value, secret_ref, required)
+       VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (e2e_test_id, name) DO UPDATE
+         SET kind = EXCLUDED.kind, default_value = EXCLUDED.default_value,
+             secret_ref = EXCLUDED.secret_ref, required = EXCLUDED.required`,
+      [e2eTestId, String(prm.name), prm.kind || "string", prm.defaultValue ?? prm.default_value ?? null, prm.secretRef ?? prm.secret_ref ?? null, prm.required ? 1 : 0],
+    );
+  }
+}
+
+async function listE2ETestParamsRow(e2eTestId) {
+  const rows = (await pool().query("SELECT * FROM e2e_test_params WHERE e2e_test_id = $1 ORDER BY name", [e2eTestId])).rows;
+  return rows.map((r) => ({ name: r.name, kind: r.kind, defaultValue: r.default_value, secretRef: r.secret_ref, required: Boolean(r.required) }));
+}
+
 // Associe un test à une tâche (N:N typé : CREATED|UPDATED|REGRESSION|EXISTING + raison).
+// Pure association : le test existe et s'exécute indépendamment de la tâche.
 export async function linkTaskE2E({ taskId, e2eTestId, relationType, reason }) {
   await ensureSchema();
   await pool().query(
@@ -1546,18 +1654,80 @@ export async function unlinkTaskE2E({ taskId, e2eTestId }) {
   return { ok: true };
 }
 
-// Liste les tests associés à une tâche (avec leur dernière exécution).
-export async function listTaskE2E(taskId) {
+// Détail complet d'un test (1er niveau) : projets, params, tâches liées, exécutions.
+export async function getE2ETest(e2eTestId) {
   await ensureSchema();
+  const t = await getE2ETestRow(e2eTestId);
+  if (!t) return null;
+  const [projects, params, tasks, lastExec] = await Promise.all([
+    getE2EProjects(e2eTestId),
+    listE2ETestParamsRow(e2eTestId),
+    (async () => (await pool().query(
+      `SELECT te.task_id, te.relation_type, te.reason FROM task_e2e te WHERE te.e2e_test_id = $1 ORDER BY te.task_id`, [e2eTestId],
+    )).rows.map((r) => ({ taskId: r.task_id, relationType: r.relation_type, reason: r.reason })))(),
+    (async () => (await pool().query(
+      `SELECT x.status, x.origin, x.task_id, x.created_at, x.duration_ms FROM e2e_executions x
+       WHERE x.e2e_test_id = $1 ORDER BY x.created_at DESC LIMIT 1`, [e2eTestId],
+    )).rows[0] || null)(),
+  ]);
+  return {
+    e2eTestId: t.id,
+    project: t.project,
+    specFile: t.spec_file,
+    scenario: t.scenario,
+    title: t.title,
+    description: t.description,
+    status: t.status,
+    version: t.version,
+    firstSeenAt: t.first_seen_at,
+    updatedAt: t.updated_at,
+    projects,
+    params,
+    linkedTasks: tasks,
+    lastExecution: lastExec ? {
+      status: lastExec.status,
+      origin: lastExec.origin,
+      taskId: lastExec.task_id,
+      createdAt: lastExec.created_at,
+      durationMs: lastExec.duration_ms,
+    } : null,
+  };
+}
+
+// Liste globale des tests (filtres : projet couvert, tâche liée, statut, recherche).
+export async function listE2ETests({ project, taskId, status, search, limit = 500 }) {
+  await ensureSchema();
+  const conds = [];
+  const params = [];
+  if (project) {
+    params.push(String(project));
+    conds.push(`t.id IN (SELECT e2e_test_id FROM e2e_test_projects WHERE project = $${params.length})`);
+  }
+  if (taskId) {
+    params.push(String(taskId));
+    conds.push(`t.id IN (SELECT e2e_test_id FROM task_e2e WHERE task_id = $${params.length})`);
+  }
+  if (status) { params.push(String(status)); conds.push(`t.status = $${params.length}`); }
+  if (search) {
+    params.push(`%${String(search)}%`);
+    conds.push(`(t.title ILIKE $${params.length} OR t.scenario ILIKE $${params.length} OR t.spec_file ILIKE $${params.length})`);
+  }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  params.push(Number(limit) || 500);
   const rows = (await pool().query(
-    `SELECT t.id, t.project, t.spec_file, t.scenario, t.title, t.status, t.version,
-            te.relation_type, te.reason,
-            (SELECT x.status FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_status,
-            (SELECT x.duration_ms FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_duration_ms,
-            (SELECT x.id FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_execution_id
-     FROM task_e2e te JOIN e2e_tests t ON t.id = te.e2e_test_id
-     WHERE te.task_id = $1 ORDER BY t.scenario`,
-    [taskId],
+    `SELECT t.*,
+            (SELECT COALESCE(
+               (SELECT jsonb_agg(project ORDER BY project) FILTER (WHERE project IS NOT NULL)
+                FROM e2e_test_projects ep WHERE ep.e2e_test_id = t.id),
+               jsonb_build_array(t.project))) AS projects,
+            tk.task_count,
+            (SELECT x.status FROM e2e_executions x WHERE x.e2e_test_id = t.id ORDER BY x.created_at DESC LIMIT 1) AS last_status,
+            (SELECT x.origin FROM e2e_executions x WHERE x.e2e_test_id = t.id ORDER BY x.created_at DESC LIMIT 1) AS last_origin,
+            (SELECT x.created_at FROM e2e_executions x WHERE x.e2e_test_id = t.id ORDER BY x.created_at DESC LIMIT 1) AS last_run_at
+     FROM e2e_tests t
+     LEFT JOIN LATERAL (SELECT count(*)::int AS task_count FROM task_e2e te WHERE te.e2e_test_id = t.id) tk ON true
+     ${where} ORDER BY t.updated_at DESC LIMIT $${params.length}`,
+    params,
   )).rows;
   return rows.map((r) => ({
     e2eTestId: r.id,
@@ -1565,31 +1735,71 @@ export async function listTaskE2E(taskId) {
     specFile: r.spec_file,
     scenario: r.scenario,
     title: r.title,
+    description: r.description,
     status: r.status,
-    version: r.version,
-    relationType: r.relation_type,
-    reason: r.reason,
-    lastExecutionId: r.last_execution_id,
+    projects: r.projects || [],
+    taskCount: r.task_count || 0,
     lastStatus: r.last_status,
-    lastDurationMs: r.last_duration_ms,
+    lastOrigin: r.last_origin,
+    lastRunAt: r.last_run_at,
   }));
 }
 
+// Liste les tests associés à une tâche (avec leur dernière exécution SUR LA TÂCHE).
+export async function listTaskE2E(taskId) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT t.id, t.project, t.spec_file, t.scenario, t.title, t.description, t.status, t.version,
+            te.relation_type, te.reason,
+            (SELECT x.status FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_status,
+            (SELECT x.origin FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_origin,
+            (SELECT x.duration_ms FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_duration_ms,
+            (SELECT x.id FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_execution_id
+     FROM task_e2e te JOIN e2e_tests t ON t.id = te.e2e_test_id
+     WHERE te.task_id = $1 ORDER BY t.scenario`,
+    [taskId],
+  )).rows;
+  const out = [];
+  for (const r of rows) {
+    const projects = await getE2EProjects(r.id);
+    out.push({
+      e2eTestId: r.id,
+      project: r.project,
+      projects,
+      specFile: r.spec_file,
+      scenario: r.scenario,
+      title: r.title,
+      description: r.description,
+      status: r.status,
+      version: r.version,
+      relationType: r.relation_type,
+      reason: r.reason,
+      lastExecutionId: r.last_execution_id,
+      lastStatus: r.last_status,
+      lastOrigin: r.last_origin,
+      lastDurationMs: r.last_duration_ms,
+    });
+  }
+  return out;
+}
+
 // Enregistre une exécution E2E (statut PENDING/RUNNING puis mis à jour via update).
-export async function recordE2EExecution({ taskId, e2eTestId, deploymentId, planId, env, commitSha, branch, pipelineRef, status = "RUNNING", attempts = 1 }) {
+// L'exécution appartient au TEST ; origin = task|recette|ci|manual|session.
+export async function recordE2EExecution({ e2eTestId, origin = "manual", taskId, deploymentId, planId, env, commitSha, branch, pipelineRef, status = "RUNNING", attempts = 1, paramValues }) {
   await ensureSchema();
   if (!e2eTestId) throw new Error("e2eTestId requis");
   const id = `EXE-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const pv = paramValues ? JSON.stringify(paramValues) : null;
   await pool().query(
-    `INSERT INTO e2e_executions (id, e2e_test_id, task_id, deployment_id, plan_id, env, commit_sha, branch, pipeline_ref, status, attempts, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-    [id, e2eTestId, taskId ?? null, deploymentId ?? null, planId ?? null, env ?? null, commitSha ?? null, branch ?? null, pipelineRef ?? null, status, attempts || 1, nowIso()],
+    `INSERT INTO e2e_executions (id, e2e_test_id, origin, task_id, deployment_id, plan_id, env, commit_sha, branch, pipeline_ref, status, attempts, created_at, param_values)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+    [id, e2eTestId, origin ?? null, taskId ?? null, deploymentId ?? null, planId ?? null, env ?? null, commitSha ?? null, branch ?? null, pipelineRef ?? null, status, attempts || 1, nowIso(), pv],
   );
-  return { id, e2eTestId, taskId: taskId ?? null, status };
+  return { id, e2eTestId, taskId: taskId ?? null, origin: origin ?? null, status };
 }
 
 // Met à jour une exécution (verdict, preuves, durée).
-export async function updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt }) {
+export async function updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt, origin }) {
   await ensureSchema();
   const sets = [];
   const params = [];
@@ -1601,6 +1811,7 @@ export async function updateE2EExecution({ executionId, status, durationMs, repo
   if (summary !== undefined) { params.push(summary); sets.push(`summary = $${params.length}`); }
   if (verdictBy !== undefined) { params.push(verdictBy); sets.push(`verdict_by = $${params.length}`); }
   if (executedAt !== undefined) { params.push(executedAt); sets.push(`executed_at = $${params.length}`); }
+  if (origin !== undefined) { params.push(origin); sets.push(`origin = $${params.length}`); }
   if (!sets.length) throw new Error("aucun champ à mettre à jour");
   params.push(executionId);
   await pool().query(`UPDATE e2e_executions SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
@@ -1614,6 +1825,7 @@ export async function getE2EExecution(executionId) {
   return {
     id: r.id,
     e2eTestId: r.e2e_test_id,
+    origin: r.origin,
     taskId: r.task_id,
     deploymentId: r.deployment_id,
     planId: r.plan_id,
@@ -1631,23 +1843,26 @@ export async function getE2EExecution(executionId) {
     summary: r.summary,
     verdictBy: r.verdict_by,
     createdAt: r.created_at,
+    paramValues: r.param_values,
   };
 }
 
-export async function listE2EExecutions({ taskId, e2eTestId, limit = 50 }) {
+export async function listE2EExecutions({ e2eTestId, taskId, origin, limit = 100 }) {
   await ensureSchema();
   const conds = [];
   const params = [];
-  if (taskId) { params.push(taskId); conds.push(`task_id = $${params.length}`); }
   if (e2eTestId) { params.push(e2eTestId); conds.push(`e2e_test_id = $${params.length}`); }
+  if (taskId) { params.push(taskId); conds.push(`task_id = $${params.length}`); }
+  if (origin) { params.push(origin); conds.push(`origin = $${params.length}`); }
   const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
-  params.push(Number(limit) || 50);
+  params.push(Number(limit) || 100);
   const rows = (await pool().query(
     `SELECT * FROM e2e_executions ${where} ORDER BY created_at DESC LIMIT $${params.length}`, params,
   )).rows;
   return rows.map((r) => ({
     id: r.id,
     e2eTestId: r.e2e_test_id,
+    origin: r.origin,
     taskId: r.task_id,
     deploymentId: r.deployment_id,
     planId: r.plan_id,
@@ -1665,5 +1880,6 @@ export async function listE2EExecutions({ taskId, e2eTestId, limit = 50 }) {
     summary: r.summary,
     verdictBy: r.verdict_by,
     createdAt: r.created_at,
+    paramValues: r.param_values,
   }));
 }
