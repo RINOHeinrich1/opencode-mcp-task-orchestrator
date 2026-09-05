@@ -32,13 +32,15 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 -- Projets : entité de première classe (enregistrement explicite).
 CREATE TABLE IF NOT EXISTS projects (
-  id          TEXT PRIMARY KEY,
-  name        TEXT NOT NULL,
-  workspace   TEXT,
-  git_path    TEXT,
-  main_branch TEXT,                              -- branche principale (garde déploiement)
-  created_at  TEXT NOT NULL,
-  created_by  TEXT
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  workspace     TEXT,
+  git_path      TEXT,
+  main_branch   TEXT,                              -- branche principale (garde déploiement)
+  e2e_repo_dir  TEXT,                              -- checkout hôte où s'exécutent les runs E2E
+  e2e_base_url  TEXT,                              -- URL de test par défaut (E2E)
+  created_at    TEXT NOT NULL,
+  created_by    TEXT
 );
 
 -- État opérationnel d'une exécution (le "comment", mutable par l'orchestrateur seul).

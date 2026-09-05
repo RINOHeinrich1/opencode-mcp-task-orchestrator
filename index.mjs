@@ -191,18 +191,20 @@ server.registerTool("task_register", {
 
 // === project_register ===
 server.registerTool("project_register", {
-  description: "Enregistre (ou met à jour) un projet dans le registre. Toute tâche doit référencer un projet existant. La branche principale (mainBranch) est OBLIGATOIRE pour autoriser le déploiement d'une tâche.",
+  description: "Enregistre (ou met à jour) un projet dans le registre. Toute tâche doit référencer un projet existant. La branche principale (mainBranch) est OBLIGATOIRE pour autoriser le déploiement d'une tâche. e2eRepoDir = checkout hôte où s'exécutent les runs E2E ; e2eBaseUrl = URL de test par défaut.",
   inputSchema: {
     id: z.string().describe("Identifiant du projet (ex: oniria)."),
     name: z.string().describe("Nom lisible du projet."),
     workspace: z.string().optional().describe("Workspace Coder associé."),
     gitPath: z.string().optional().describe("Chemin du dépôt git (hôte ou /home/coder)."),
     mainBranch: z.string().optional().describe("Branche principale du projet (ex: main, oniria-preprod) — requise pour déployer."),
+    e2eRepoDir: z.string().optional().describe("Checkout hôte des runs E2E (ex: /root/oniria-preprod)."),
+    e2eBaseUrl: z.string().optional().describe("URL de test par défaut (ex: https://preprod.madatalk.fr)."),
     createdBy: z.string().optional(),
   },
-}, async ({ id, name, workspace, gitPath, mainBranch, createdBy }) => {
+}, async ({ id, name, workspace, gitPath, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) => {
   try {
-    const project = await registerProject({ id, name, workspace, gitPath, mainBranch, createdBy });
+    const project = await registerProject({ id, name, workspace, gitPath, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
     return text(JSON.stringify({ ok: true, project }, null, 2));
   } catch (e) {
     return err(e.message);

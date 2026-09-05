@@ -45,6 +45,9 @@ async function migrate() {
   await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS plan_id TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS audit_target TEXT");
   await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS main_branch TEXT");
+  // E2E (cadrage 08) : checkout hôte où s'exécutent les runs + URL de test par défaut.
+  await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS e2e_repo_dir TEXT");
+  await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS e2e_base_url TEXT");
   await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS project TEXT");
   await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS title TEXT");
   await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS description TEXT");
@@ -852,16 +855,22 @@ export async function listTaskSessions(taskId) {
 // --- Projets (entité de première classe — enregistrement explicite) --------
 function rowToProject(r) {
   if (!r) return null;
-  return { id: r.id, name: r.name, workspace: r.workspace, gitPath: r.git_path, mainBranch: r.main_branch ?? null, createdAt: r.created_at, createdBy: r.created_by };
+  return {
+    id: r.id, name: r.name, workspace: r.workspace, gitPath: r.git_path, mainBranch: r.main_branch ?? null,
+    e2eRepoDir: r.e2e_repo_dir ?? null, e2eBaseUrl: r.e2e_base_url ?? null,
+    createdAt: r.created_at, createdBy: r.created_by,
+  };
 }
 
-export async function registerProject({ id, name, workspace, gitPath, mainBranch, createdBy }) {
+export async function registerProject({ id, name, workspace, gitPath, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) {
   await ensureSchema();
   await pool().query(
-    `INSERT INTO projects (id, name, workspace, git_path, main_branch, created_at, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
-     ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, workspace = EXCLUDED.workspace, git_path = EXCLUDED.git_path, main_branch = EXCLUDED.main_branch`,
-    [id, name, workspace ?? null, gitPath ?? null, mainBranch ?? null, nowIso(), createdBy ?? null],
+    `INSERT INTO projects (id, name, workspace, git_path, main_branch, e2e_repo_dir, e2e_base_url, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+     ON CONFLICT(id) DO UPDATE SET
+       name = EXCLUDED.name, workspace = EXCLUDED.workspace, git_path = EXCLUDED.git_path,
+       main_branch = EXCLUDED.main_branch, e2e_repo_dir = EXCLUDED.e2e_repo_dir, e2e_base_url = EXCLUDED.e2e_base_url`,
+    [id, name, workspace ?? null, gitPath ?? null, mainBranch ?? null, e2eRepoDir ?? null, e2eBaseUrl ?? null, nowIso(), createdBy ?? null],
   );
   return getProject(id);
 }
