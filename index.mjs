@@ -1262,9 +1262,11 @@ server.registerTool("e2e_run", {
     repoDir: z.string().describe("Répertoire (hôte) du dépôt applicatif avec Playwright (ex: /root/mada-talk-preprod)."),
     baseUrl: z.string().optional().describe("URL de la cible déployée (défaut : e2e.env E2E_BASE_URL)."),
     taskId: z.string().optional().describe("Tâche orchestrateur à associer au run."),
-    specPattern: z.string().optional().describe("Filtre de spec à exécuter (transmis à Playwright, optionnel)."),
+    specPattern: z.string().optional().describe("Regex Playwright de filtre de spec à exécuter (positionnelle, transmise après '--' ; défaut : run complet de la config). Ex: madatalk-requests-(chatbot-cycle|support-interactions-kpi|pause-resiliation)\\\\.spec\\\\.ts"),
+    playwrightConfig: z.string().optional().describe("Config Playwright dédiée (ex: playwright.madatalk-requests.recette.config.ts) — passée à Playwright via --config (placée AVANT les filtres de spec)."),
+    pwArgs: z.array(z.string()).optional().describe("Arguments Playwright supplémentaires transmis après '--' (ex: ['--project=authenticated']). Sans collision avec 'project' (projet du REGISTRE oniria/mada-talk), ni avec 'playwrightConfig'."),
   },
-}, async ({ project, repoDir, baseUrl, taskId, specPattern }) => {
+}, async ({ project, repoDir, baseUrl, taskId, specPattern, playwrightConfig, pwArgs }) => {
   try {
     if (!repoDir || !existsSync(join(repoDir, "package.json"))) return err(`repoDir invalide ou sans package.json : ${repoDir}`);
     const env = loadE2EEnv();
@@ -1274,7 +1276,26 @@ server.registerTool("e2e_run", {
     const runId = `run-${Date.now()}`;
     const args = [E2E_RUNNER, "--runId", runId, "--project", project, "--out", "/root/orchestrator-panel/storage/e2e/inbox"];
     if (taskId) args.push("--taskId", taskId);
-    const runEnv = { ...process.env, E2E_EXTERNAL: "1", E2E_BASE_URL: target, E2E_USER_EMAIL: env.E2E_USER_EMAIL, E2E_USER_PASSWORD: env.E2E_USER_PASSWORD };
+    // Arguments Playwright après le séparateur "--" (le runner les transmet à
+    // `npx playwright test`). Ordre : --config AVANT les filtres de spec, puis
+    // args Playwright supplémentaires (ex. --project=authenticated), puis la
+    // regex de spec (positionnelle, en dernier).
+    const pw = [];
+    if (playwrightConfig) pw.push(`--config=${playwrightConfig}`);
+    if (Array.isArray(pwArgs) && pwArgs.length) pw.push(...pwArgs);
+    if (specPattern) pw.push(specPattern);
+    if (pw.length) args.push("--", ...pw);
+    // Environnement du run :
+    //  - E2E_BASE_URL reste posé (rétrocompat mada-talk : le SPA lit cette var) ;
+    //  - ONIRIA_E2E_BASE_URL posé avec la même cible (les configs Playwright du
+    //    dépôt ONIRIA lisent cette var — défaut localhost:3000 sinon) ;
+    //  - propagation des éventuels secrets ONIRIA_E2E_* présents dans e2e.env,
+    //    sans écraser ceux déjà posés par process.env ;
+    //  - identifiants de compte de test E2E_USER_* (root-only e2e.env).
+    const runEnv = { ...process.env, E2E_EXTERNAL: "1", E2E_BASE_URL: target, ONIRIA_E2E_BASE_URL: target, E2E_USER_EMAIL: env.E2E_USER_EMAIL, E2E_USER_PASSWORD: env.E2E_USER_PASSWORD };
+    for (const [k, v] of Object.entries(env)) {
+      if (/^ONIRIA_E2E_/.test(k) && !(k in process.env)) runEnv[k] = v;
+    }
     execFileSync("node", args, { cwd: repoDir, env: runEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 });
     // Import automatique du run dans le registre.
     const runDir = join("/root/orchestrator-panel/storage/e2e/inbox", runId);
