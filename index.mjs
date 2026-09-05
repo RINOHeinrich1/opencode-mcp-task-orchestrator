@@ -13,9 +13,9 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, rmSync, unlinkSync, readdirSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { join, extname } from "node:path";
+import { join, extname, relative, resolve } from "node:path";
 import { canTaskTransition, isValidState, allowedFrom, VALID_STATES } from "./statemachine.mjs";
 import {
   createTask,
@@ -57,6 +57,7 @@ import {
   setE2ETestParams,
   getE2ETest,
   listE2ETests,
+  e2eStableId,
   linkTaskE2E,
   unlinkTaskE2E,
   listTaskE2E,
@@ -1428,6 +1429,119 @@ server.registerTool("e2e_run", {
     }
     try { rmSync(runDir, { recursive: true, force: true }); } catch {}
     return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, results: imported }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === e2e_sync_repo (T10 : synchronisation automatique registre ↔ repo) ===
+// Reflet du repo dans le registre : scan des spec files Playwright, création/
+// réactivation des tests présents, passage OBSOLETE des tests disparus.
+// Le registre reste la source pour l'historique (jamais de suppression).
+function walkSpecFiles(dir, out, relBase) {
+  let entries = [];
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const e of entries) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) {
+      if (e.name === "node_modules" || e.name === ".git" || e.name === "test-results" || e.name === "playwright-report" || e.name === ".playwright") continue;
+      walkSpecFiles(p, out, relBase);
+    } else if (e.isFile() && /\.spec\.(ts|tsx|js|mjs|cjs)$/.test(e.name)) {
+      out.push(relative(relBase, p).replace(/\\/g, "/"));
+    }
+  }
+}
+
+// Extraction légère des titres de test() Playwright (scenarios) d'un spec file.
+// Gère `test("titre", async ...)`, `test('titre', ...)` avec apostrophes dans le
+// titre, et les variantes ternaires `test(cond ? "a" : "b", ...)`. Le registre
+// est au grain test() (les test.describe ne sont pas des entrées).
+function extractTestTitles(src) {
+  const out = [];
+  const startRe = /\btest\s*\(\s*(?:[\w.\s]+\?\s*)?(['"`])/g;
+  let sm;
+  while ((sm = startRe.exec(src))) {
+    const q = sm[1];
+    const i = startRe.lastIndex;
+    // Lecture du contenu jusqu'à la quote de fermeture non échappée.
+    let j = i; let closed = -1;
+    while (j < src.length) {
+      if (src[j] === "\\") { j += 2; continue; }
+      if (src[j] === q) { closed = j; break; }
+      j++;
+    }
+    if (closed < 0) continue;
+    const title = src.slice(i, closed).trim();
+    // Ignore test.skip/fixme/fail/slow(...).
+    const head = src.slice(0, sm.index);
+    const lastKw = head.slice(head.lastIndexOf("test")).trim();
+    if (/^(skip|fixme|fail|slow)\s*\(/.test(lastKw)) { startRe.lastIndex = closed + 1; continue; }
+    if (title && title.length && title.length <= 200 && !out.includes(title)) out.push(title);
+    startRe.lastIndex = closed + 1;
+  }
+  return out;
+}
+
+server.registerTool("e2e_sync_repo", {
+  description: "Synchronise le registre e2e_tests avec un repo applicatif (T10) : scan récursif des spec files Playwright (repoDir), enregistre/réactive les tests présents (ACTIVE, repo source = project, projets couverts par défaut = project) et marque OBSOLETE ceux du projet qui ont disparu du repo. L'historique d'exécution n'est jamais supprimé. Idempotent.",
+  inputSchema: {
+    project: z.string().describe("Projet du registre (= repo source, ex. oniria / mada-talk)."),
+    repoDir: z.string().describe("Répertoire (hôte) du dépôt applicatif à scanner."),
+    testDir: z.string().optional().describe("Sous-dossier racine des specs (défaut : scan récursif de tout le repo, hors node_modules/.git/test-results/playwright-report/.playwright)."),
+    dryRun: z.boolean().optional().describe("true = rapport seul sans écriture (défaut false)."),
+  },
+}, async ({ project, repoDir, testDir, dryRun }) => {
+  try {
+    if (!project || !repoDir || !existsSync(repoDir)) return err(`project et repoDir valide requis (reçu project=${project}, repoDir=${repoDir})`);
+    const base = resolve(repoDir);
+    const scanRoot = testDir ? resolve(base, testDir) : base;
+    if (!existsSync(scanRoot)) return err(`testDir introuvable : ${scanRoot}`);
+    const specFiles = [];
+    walkSpecFiles(scanRoot, specFiles, base);
+
+    // Cartographie des tests présents dans le repo : (specFile -> scenarios).
+    const present = new Map(); // key `${specFile}::${scenario}` -> specFile
+    for (const specFile of specFiles) {
+      let src = "";
+      try { src = readFileSync(join(base, specFile), "utf8"); } catch { continue; }
+      const titles = extractTestTitles(src);
+      if (!titles.length) continue;
+      for (const scenario of titles) present.set(`${specFile}::${scenario}`, specFile);
+    }
+
+    const dry = dryRun === true;
+    const created = [];
+    const reactivated = [];
+    const obsolete = [];
+    const updatedSpecs = new Set();
+
+    // 1) Upsert de chaque test présent dans le repo.
+    for (const [key, specFile] of present) {
+      const scenario = key.slice(key.indexOf("::") + 2);
+      const id = e2eStableId(project, specFile, scenario);
+      const existing = await getE2ETest(id);
+      if (!dry) await upsertE2ETest({ project, specFile, scenario, coveredProjects: [project] });
+      if (existing && existing.status === "OBSOLETE") reactivated.push(id);
+      else if (!existing) created.push(id);
+      else updatedSpecs.add(specFile);
+    }
+
+    // 2) Marque OBSOLETE les tests ACTIVE du projet dont le spec/scenario a disparu.
+    const known = await listE2ETests({ project, status: "ACTIVE", limit: 10000 });
+    const presentKeys = new Set(present.keys());
+    for (const t of known.tests || []) {
+      const k = `${t.specFile}::${t.scenario}`;
+      if (!presentKeys.has(k)) {
+        if (!dry) await markE2ETestObsolete(t.e2eTestId);
+        obsolete.push(t.e2eTestId);
+      }
+    }
+
+    return text(JSON.stringify({
+      ok: true, project, repoDir: base, testDir: testDir || null,
+      dryRun: dry, specFiles: specFiles.length,
+      present: present.size, created: created.length, reactivated: reactivated.length,
+      obsolete: obsolete.length, unchanged: updatedSpecs.size,
+      detail: dry ? { created, reactivated, obsolete } : undefined,
+    }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

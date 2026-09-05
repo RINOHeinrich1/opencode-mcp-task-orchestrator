@@ -1529,7 +1529,7 @@ export async function confirmRecette({ recetteId, confirmedBy }) {
 // ===========================================================================
 
 // ID stable d'un test : déterministe pour (repo source = project, spec_file, scenario).
-function e2eStableId(project, specFile, scenario) {
+export function e2eStableId(project, specFile, scenario) {
   let h = 0x811c9dc5;
   for (const part of [project, specFile, scenario]) {
     for (let i = 0; i < part.length; i++) { h ^= part.charCodeAt(i); h = Math.imul(h, 0x01000193); }
