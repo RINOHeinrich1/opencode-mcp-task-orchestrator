@@ -157,12 +157,15 @@ async function migrate() {
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_vars_project ON e2e_vars(project)");
   // Migration rétrocompat : la table e2e_secrets (v0.8.6) devient e2e_vars.
-  await pool().query(
-    `INSERT INTO e2e_vars (project, name, kind, value_enc, purpose, created_at, updated_at)
-     SELECT project, name, 'secret', value_enc, purpose, created_at, updated_at FROM e2e_secrets
-     ON CONFLICT (project, name) DO UPDATE SET kind = 'secret', value_enc = EXCLUDED.value_enc, purpose = COALESCE(EXCLUDED.purpose, e2e_vars.purpose)`,
-  );
-  await pool().query("DROP TABLE IF EXISTS e2e_secrets");
+  const hasSecrets = (await pool().query("SELECT to_regclass('public.e2e_secrets') AS t")).rows[0].t !== null;
+  if (hasSecrets) {
+    await pool().query(
+      `INSERT INTO e2e_vars (project, name, kind, value_enc, purpose, created_at, updated_at)
+       SELECT project, name, 'secret', value_enc, purpose, created_at, updated_at FROM e2e_secrets
+       ON CONFLICT (project, name) DO UPDATE SET kind = 'secret', value_enc = EXCLUDED.value_enc, purpose = COALESCE(EXCLUDED.purpose, e2e_vars.purpose)`,
+    );
+    await pool().query("DROP TABLE IF EXISTS e2e_secrets");
+  }
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
