@@ -1529,7 +1529,7 @@ server.registerTool("e2e_sync_repo", {
     // 2) Marque OBSOLETE les tests ACTIVE du projet dont le spec/scenario a disparu.
     const known = await listE2ETests({ project, status: "ACTIVE", limit: 10000 });
     const presentKeys = new Set(present.keys());
-    for (const t of known.tests || []) {
+    for (const t of known) {
       const k = `${t.specFile}::${t.scenario}`;
       if (!presentKeys.has(k)) {
         if (!dry) await markE2ETestObsolete(t.e2eTestId);
