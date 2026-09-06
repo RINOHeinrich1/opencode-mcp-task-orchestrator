@@ -220,6 +220,21 @@ async function migrate() {
        AND p.id NOT IN (SELECT project_id FROM project_repos WHERE project_id = p.id AND repo_id = p.id)
      ON CONFLICT DO NOTHING`,
   );
+  // Tâches ⇄ Repos (ADR 09) : une tâche travaille sur 1..N repos du projet
+  // (défaut = tous les repos du projet au moment de la création).
+  await pool().query(`CREATE TABLE IF NOT EXISTS task_repos (
+    task_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    repo_id  TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, repo_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_task_repos_repo ON task_repos(repo_id)");
+  // Backfill : les tâches existantes reçoivent les repos de leur projet.
+  await pool().query(
+    `INSERT INTO task_repos (task_id, repo_id)
+     SELECT t.id, pr.repo_id FROM tasks t
+     JOIN project_repos pr ON pr.project_id = t.project
+     ON CONFLICT DO NOTHING`,
+  );
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -287,6 +302,8 @@ export async function createTask(task) {
       await addTaskLink({ taskId: task.id, linkedTaskId: l.taskId, description: l.description ?? null });
     }
   }
+  // Repos ciblés (ADR 09) : repoIds explicites ou défaut = tous ceux du projet.
+  await setTaskRepos(task.id, task.repoIds);
   return getTask(task.id);
 }
 
@@ -372,6 +389,52 @@ export async function getTask(id) {
   await ensureSchema();
   const res = await pool().query("SELECT * FROM tasks WHERE id = $1", [id]);
   return rowToTask(res.rows[0]);
+}
+
+// Repos d'une tâche (1..N, ADR 09) — ordre stable.
+export async function getTaskRepos(taskId) {
+  await ensureSchema();
+  const res = await pool().query(
+    `SELECT r.id, r.name, r.git_path, r.git_url, r.workspace, r.main_branch, r.e2e_repo_dir, r.e2e_base_url
+     FROM repos r JOIN task_repos tr ON tr.repo_id = r.id
+     WHERE tr.task_id = $1 ORDER BY r.name ASC`, [taskId],
+  );
+  return res.rows.map((r) => ({
+    id: r.id, name: r.name, repoDir: r.git_path ?? null, gitUrl: r.git_url ?? null,
+    workspace: r.workspace ?? null, mainBranch: r.main_branch ?? null,
+    e2eRepoDir: r.e2e_repo_dir ?? null, e2eBaseUrl: r.e2e_base_url ?? null,
+  }));
+}
+
+// Affecte les repos d'une tâche. Si repoIds absent/vide → défaut = TOUS les
+// repos du projet de la tâche (règle ADR : une tâche couvre tous les repos du
+// projet par défaut).
+export async function setTaskRepos(taskId, repoIds) {
+  await ensureSchema();
+  const task = await getTask(taskId);
+  if (!task) throw new Error(`tâche inconnue : ${taskId}`);
+  let ids = (Array.isArray(repoIds) ? repoIds.map(String).filter(Boolean) : []);
+  if (!ids.length) {
+    const proj = (await pool().query(
+      "SELECT repo_id FROM project_repos WHERE project_id = $1", [task.project],
+    )).rows.map((r) => r.repo_id);
+    ids = proj;
+  }
+  await pool().query("DELETE FROM task_repos WHERE task_id = $1", [taskId]);
+  for (const rid of ids) {
+    const exists = (await pool().query("SELECT 1 FROM repos WHERE id = $1", [rid])).rows[0];
+    if (!exists) continue;
+    await pool().query("INSERT INTO task_repos (task_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [taskId, rid]);
+  }
+  return getTaskRepos(taskId);
+}
+
+// getTask enrichi des repos (lecture standard pour l'outil task_get).
+export async function getTaskWithRepos(id) {
+  const task = await getTask(id);
+  if (!task) return null;
+  task.repos = await getTaskRepos(id);
+  return task;
 }
 
 // Garde-fou (défense en profondeur) : toute opération rattachée à une tâche
@@ -667,7 +730,7 @@ export async function findScopeConflicts(project, scope, excludeTaskId) {
 }
 
 // --- Mise à jour d'une tâche (uniquement en statut queued) -----------------
-export async function updateTask({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution, linkedTasks }) {
+export async function updateTask({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution, linkedTasks, repoIds }) {
   await ensureSchema();
   const task = await getTask(taskId);
   if (!task) throw new Error(`tâche inconnue : ${taskId}`);
@@ -683,6 +746,8 @@ export async function updateTask({ taskId, request, title, acceptanceCriteria, s
   if (scope !== undefined) { params.push(JSON.stringify(scope)); sets.push(`scope = $${params.length}`); }
   if (priority !== undefined) { params.push(priority); sets.push(`priority = $${params.length}`); }
   if (directExecution !== undefined) { params.push(directExecution ? 1 : 0); sets.push(`direct_execution = $${params.length}`); }
+  // Repos ciblés si fournis (ADR 09) — avant le early-return des champs.
+  if (repoIds !== undefined) await setTaskRepos(taskId, repoIds);
   // Remplacement des tâches liées si fournies (AVANT le early-return des champs).
   if (linkedTasks !== undefined) {
     await pool().query("DELETE FROM task_links WHERE task_id = $1", [taskId]);

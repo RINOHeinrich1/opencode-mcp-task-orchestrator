@@ -20,6 +20,8 @@ import { canTaskTransition, isValidState, allowedFrom, VALID_STATES } from "./st
 import {
   createTask,
   getTask,
+  getTaskWithRepos,
+  setTaskRepos,
   listTasks,
   getExecutions,
   getCurrentExecution,
@@ -89,6 +91,7 @@ import {
   linkTaskSession,
   listTaskSessions,
   registerProject,
+  getProject,
   listProjects,
   deleteProject,
   registerRepo,
@@ -186,6 +189,7 @@ server.registerTool("task_register", {
     directExecution: z.boolean().optional().describe("Exécution directe via build-notify (pas d'atomic-plan) pour les tâches simples."),
     taskId: z.string().optional(),
     sessionId: z.string().optional().describe("Session opencode qui crée la tâche (liée par le plugin permission-hook)."),
+    repoIds: z.array(z.string()).optional().describe("Repos ciblés de la tâche (parmi ceux du projet, ADR 09). Défaut : TOUS les repos du projet."),
   },
 }, async (input) => {
   try {
@@ -337,7 +341,7 @@ server.registerTool("task_get", {
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
-    const task = await getTask(taskId);
+    const task = await getTaskWithRepos(taskId);
     if (!task) return err(`tâche inconnue : ${taskId}`);
     const executions = await getExecutions(taskId);
     const participants = await listParticipants(taskId);
@@ -679,10 +683,11 @@ server.registerTool("task_update", {
     priority: z.enum(["low", "normal", "high", "critical"]).optional(),
     directExecution: z.boolean().optional().describe("Exécution directe via build-notify (sans atomic-plan)."),
     linkedTasks: z.array(z.object({ taskId: z.string(), description: z.string().optional() })).optional().describe("Remplace les tâches liées (combo)."),
+    repoIds: z.array(z.string()).optional().describe("Repos ciblés (défaut si absent : inchangé)."),
   },
-}, async ({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution, linkedTasks }) => {
+}, async ({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution, linkedTasks, repoIds }) => {
   try {
-    const task = await updateTask({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution, linkedTasks });
+    const task = await updateTask({ taskId, request, title, acceptanceCriteria, scope, priority, directExecution, linkedTasks, repoIds });
     return text(JSON.stringify({ ok: true, task }, null, 2));
   } catch (e) {
     return err(e.message);
