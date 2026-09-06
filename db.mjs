@@ -245,6 +245,44 @@ async function migrate() {
   // Tâches émergentes : task_links porte une relation_type ('emergent' = créée
   // hors scope pendant la tâche source, liée à sa source).
   await pool().query("ALTER TABLE task_links ADD COLUMN IF NOT EXISTS relation_type TEXT DEFAULT 'linked'");
+  // ADR 11 — Tests E2E rattachés à UN PROJET (produit) + repos traversés (N:N).
+  // `e2e_tests.project` = le PROJET (produit) dont le comportement est vérifié.
+  // `e2e_test_repos` = les REPOS traversés par le comportement (le spec vit dans
+  // l'un d'eux ; l'exécution/sync le déduisent en cherchant spec_file).
+  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_test_repos (
+    e2e_test_id TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+    repo_id     TEXT NOT NULL,
+    PRIMARY KEY (e2e_test_id, repo_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_test_repos_repo ON e2e_test_repos(repo_id)");
+  // Backfill rétrocompat : les anciens « projets couverts » (e2e_test_projects)
+  // deviennent des repos traversés quand un REPO porte ce nom (sinon on déduit
+  // le repo du projet de e2e_tests via project_repos). Ne touche pas aux tests
+  // déjà pourvus.
+  await pool().query(
+    `INSERT INTO e2e_test_repos (e2e_test_id, repo_id)
+     SELECT DISTINCT ep.e2e_test_id, r.id
+     FROM e2e_test_projects ep
+     JOIN repos r ON r.id = ep.project
+     WHERE ep.e2e_test_id NOT IN (SELECT e2e_test_id FROM e2e_test_repos)
+     ON CONFLICT DO NOTHING`,
+  );
+  await pool().query(
+    `INSERT INTO e2e_test_repos (e2e_test_id, repo_id)
+     SELECT DISTINCT e.id, pr.repo_id
+     FROM e2e_tests e
+     JOIN project_repos pr ON pr.project_id = e.project
+     WHERE e.id NOT IN (SELECT e2e_test_id FROM e2e_test_repos)
+     ON CONFLICT DO NOTHING`,
+  );
+  await pool().query(
+    `INSERT INTO e2e_test_repos (e2e_test_id, repo_id)
+     SELECT DISTINCT e.id, r.id
+     FROM e2e_tests e
+     JOIN repos r ON r.id = e.project
+     WHERE e.id NOT IN (SELECT e2e_test_id FROM e2e_test_repos)
+     ON CONFLICT DO NOTHING`,
+  );
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
