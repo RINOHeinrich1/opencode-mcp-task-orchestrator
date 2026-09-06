@@ -1884,7 +1884,44 @@ async function getE2EProjects(e2eTestId) {
   return t ? [t.project] : [];
 }
 
-// Réécrit les projets couverts (N:N) — le repo source est TOUJOURS inclus.
+// Repos traversés par le test (ADR 11) — détail complet.
+async function getE2ERepos(e2eTestId) {
+  const rows = (await pool().query(
+    `SELECT r.id, r.name, r.description, r.git_path, r.workspace, r.main_branch, r.e2e_repo_dir, r.e2e_base_url
+     FROM e2e_test_repos x JOIN repos r ON r.id = x.repo_id
+     WHERE x.e2e_test_id = $1 ORDER BY r.name ASC`, [e2eTestId],
+  )).rows;
+  if (rows.length) {
+    return rows.map((r) => ({
+      id: r.id, name: r.name, description: r.description ?? null, repoDir: r.git_path ?? null,
+      workspace: r.workspace ?? null, mainBranch: r.main_branch ?? null,
+      e2eRepoDir: r.e2e_repo_dir ?? null, e2eBaseUrl: r.e2e_base_url ?? null,
+    }));
+  }
+  // Rétrocompat : aucun repo explicite → déduire depuis project du test.
+  const t = (await pool().query("SELECT project FROM e2e_tests WHERE id = $1", [e2eTestId])).rows[0];
+  if (!t) return [];
+  const viaPrj = (await pool().query(
+    `SELECT r.id, r.name, r.description, r.git_path, r.workspace, r.main_branch, r.e2e_repo_dir, r.e2e_base_url
+     FROM project_repos pr JOIN repos r ON r.id = pr.repo_id WHERE pr.project_id = $1 ORDER BY r.name ASC`, [t.project],
+  )).rows;
+  const map = (r) => ({ id: r.id, name: r.name, description: r.description ?? null, repoDir: r.git_path ?? null, workspace: r.workspace ?? null, mainBranch: r.main_branch ?? null, e2eRepoDir: r.e2e_repo_dir ?? null, e2eBaseUrl: r.e2e_base_url ?? null });
+  if (viaPrj.length) return viaPrj.map(map);
+  const self = (await pool().query("SELECT id,name,description,git_path,workspace,main_branch,e2e_repo_dir,e2e_base_url FROM repos WHERE id=$1", [t.project])).rows;
+  return self.map(map);
+}
+
+// Réécrit les repos traversés (N:N) — le repo contenant le spec est inclus si fourni.
+export async function setE2ERepos(e2eTestId, repoIds) {
+  const ids = [...new Set((Array.isArray(repoIds) ? repoIds : []).map((x) => String(x).trim()).filter(Boolean))];
+  await pool().query("DELETE FROM e2e_test_repos WHERE e2e_test_id = $1", [e2eTestId]);
+  for (const rid of ids) {
+    await pool().query("INSERT INTO e2e_test_repos (e2e_test_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [e2eTestId, rid]);
+  }
+  return getE2ERepos(e2eTestId);
+}
+
+// Réécrit les projets couverts (rétrocompat ADR 08) — désormais = REPOS traversés.
 async function setE2EProjects(e2eTestId, project, coveredProjects) {
   const set = new Set([project, ...(Array.isArray(coveredProjects) ? coveredProjects.map(String) : [])].map((x) => x.trim()).filter(Boolean));
   await pool().query("DELETE FROM e2e_test_projects WHERE e2e_test_id = $1", [e2eTestId]);
@@ -1894,8 +1931,9 @@ async function setE2EProjects(e2eTestId, project, coveredProjects) {
 }
 
 // Enregistre (ou réactive) un test dans le référentiel central. 1 test() = 1 entité.
-// project = REPO SOURCE (où vit le spec) ; coveredProjects[] = projets couverts.
-export async function upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects }) {
+// project = PROJET (produit) ; repoIds = repos traversés (ADR 11) — le spec vit
+// dans l'un d'eux. coveredProjects accepté en rétrocompat (= repos).
+export async function upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects, repoIds }) {
   await ensureSchema();
   if (!project || !specFile || !scenario) throw new Error("project (repo source), specFile et scenario requis");
   const p = String(project).trim();
@@ -1912,6 +1950,8 @@ export async function upsertE2ETest({ project, specFile, scenario, title, descri
     [e2eStableId(p, specFile, scenario), p, String(specFile).trim(), String(scenario).trim(), title ?? null, description ?? null, gherkin ?? null, now],
   )).rows[0];
   await setE2EProjects(r.id, p, coveredProjects);
+  // ADR 11 : repos traversés explicites (sinon déduits par la lecture rétrocompat).
+  if (Array.isArray(repoIds) && repoIds.length) await setE2ERepos(r.id, repoIds);
   return { id: r.id, project: p, specFile: String(specFile).trim(), scenario: String(scenario).trim() };
 }
 
@@ -2012,7 +2052,8 @@ export async function getE2ETest(e2eTestId) {
   await ensureSchema();
   const t = await getE2ETestRow(e2eTestId);
   if (!t) return null;
-  const [projects, params, tasks, lastExec] = await Promise.all([
+  const [repos, projects, params, tasks, lastExec] = await Promise.all([
+    getE2ERepos(e2eTestId),
     getE2EProjects(e2eTestId),
     listE2ETestParamsRow(e2eTestId),
     (async () => (await pool().query(
@@ -2036,7 +2077,8 @@ export async function getE2ETest(e2eTestId) {
     version: t.version,
     firstSeenAt: t.first_seen_at,
     updatedAt: t.updated_at,
-    projects,
+    repos,          // ADR 11 : repos traversés (détail) — le spec vit dans l'un d'eux
+    projects,       // rétrocompat ADR 08 : projets couverts (obsolète, gardé)
     params,
     linkedTasks: tasks,
     lastExecution: lastExec ? {
@@ -2056,7 +2098,7 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
   const params = [];
   if (project) {
     params.push(String(project));
-    conds.push(`t.id IN (SELECT e2e_test_id FROM e2e_test_projects WHERE project = $${params.length})`);
+    conds.push(`t.project = $${params.length}`); // ADR 11 : project = PROJET (produit)
   }
   if (taskId) {
     params.push(String(taskId));
@@ -2075,6 +2117,8 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
                (SELECT jsonb_agg(project ORDER BY project) FILTER (WHERE project IS NOT NULL)
                 FROM e2e_test_projects ep WHERE ep.e2e_test_id = t.id),
                jsonb_build_array(t.project))) AS projects,
+            (SELECT COALESCE(jsonb_agg(xr.repo_id ORDER BY xr.repo_id) FILTER (WHERE xr.repo_id IS NOT NULL), '[]'::jsonb)
+             FROM e2e_test_repos xr WHERE xr.e2e_test_id = t.id) AS repos,
             tk.task_count,
             (SELECT x.status FROM e2e_executions x WHERE x.e2e_test_id = t.id ORDER BY x.created_at DESC LIMIT 1) AS last_status,
             (SELECT x.origin FROM e2e_executions x WHERE x.e2e_test_id = t.id ORDER BY x.created_at DESC LIMIT 1) AS last_origin,
@@ -2095,6 +2139,7 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
     status: r.status,
     sessionId: r.session_id,
     projects: r.projects || [],
+    repos: r.repos || [],
     taskCount: r.task_count || 0,
     lastStatus: r.last_status,
     lastOrigin: r.last_origin,
