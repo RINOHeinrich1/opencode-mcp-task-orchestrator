@@ -98,6 +98,7 @@ async function migrate() {
     CONSTRAINT uq_e2e_tests_scenario UNIQUE (project, spec_file, scenario)
   )`);
   await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS description TEXT");
+  await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS session_id TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_tests_project ON e2e_tests(project)");
   // Projets couverts par le comportement (N:N) — inclut le repo source.
   await pool().query(`CREATE TABLE IF NOT EXISTS e2e_test_projects (
@@ -1600,6 +1601,20 @@ export async function markE2ETestObsolete(e2eTestId) {
   return getE2ETest(e2eTestId);
 }
 
+// Passe un test en DRAFT (entité en cours de création via une session test-agent).
+export async function draftE2ETest(e2eTestId) {
+  await ensureSchema();
+  await pool().query("UPDATE e2e_tests SET status = 'DRAFT', updated_at = $1 WHERE id = $2", [nowIso(), e2eTestId]);
+  return getE2ETest(e2eTestId);
+}
+
+// Rattache (ou retire) la session de création/mise à jour du test.
+export async function setE2ETestSession({ e2eTestId, sessionId }) {
+  await ensureSchema();
+  await pool().query("UPDATE e2e_tests SET session_id = $1, updated_at = $2 WHERE id = $3", [sessionId || null, nowIso(), e2eTestId]);
+  return getE2ETest(e2eTestId);
+}
+
 export async function updateE2ETestMeta({ e2eTestId, title, description, coveredProjects }) {
   await ensureSchema();
   const sets = [];
@@ -1687,6 +1702,7 @@ export async function getE2ETest(e2eTestId) {
     title: t.title,
     description: t.description,
     status: t.status,
+    sessionId: t.session_id,
     version: t.version,
     firstSeenAt: t.first_seen_at,
     updatedAt: t.updated_at,
@@ -1746,6 +1762,7 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
     title: r.title,
     description: r.description,
     status: r.status,
+    sessionId: r.session_id,
     projects: r.projects || [],
     taskCount: r.task_count || 0,
     lastStatus: r.last_status,
@@ -1758,7 +1775,7 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
 export async function listTaskE2E(taskId) {
   await ensureSchema();
   const rows = (await pool().query(
-    `SELECT t.id, t.project, t.spec_file, t.scenario, t.title, t.description, t.status, t.version,
+    `SELECT t.id, t.project, t.spec_file, t.scenario, t.title, t.description, t.status, t.session_id, t.version,
             te.relation_type, te.reason,
             (SELECT x.status FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_status,
             (SELECT x.origin FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_origin,
@@ -1780,6 +1797,7 @@ export async function listTaskE2E(taskId) {
       title: r.title,
       description: r.description,
       status: r.status,
+      sessionId: r.session_id,
       version: r.version,
       relationType: r.relation_type,
       reason: r.reason,

@@ -352,6 +352,7 @@ CREATE TABLE IF NOT EXISTS e2e_tests (
   title          TEXT,
   description    TEXT,
   status         TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | OBSOLETE | QUARANTINE | DRAFT
+  session_id     TEXT,                         -- session de création/mise à jour du test
   version        INTEGER NOT NULL DEFAULT 1,
   meta           JSONB,
   first_seen_at  TEXT NOT NULL,

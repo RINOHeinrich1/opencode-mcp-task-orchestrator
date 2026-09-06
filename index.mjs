@@ -53,6 +53,8 @@ import {
   upsertE2ETest,
   reactivateE2ETest,
   markE2ETestObsolete,
+  draftE2ETest,
+  setE2ETestSession,
   updateE2ETestMeta,
   setE2ETestParams,
   getE2ETest,
@@ -1156,6 +1158,29 @@ server.registerTool("e2e_test_obsolete", {
 }, async ({ e2eTestId }) => {
   try {
     const t = await markE2ETestObsolete(e2eTestId);
+    return text(JSON.stringify({ ok: true, test: t }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_test_draft", {
+  description: "Passe un test E2E en DRAFT (entité créée, spec en cours de rédaction via une session test-agent).",
+  inputSchema: { e2eTestId: z.string() },
+}, async ({ e2eTestId }) => {
+  try {
+    const t = await draftE2ETest(e2eTestId);
+    return text(JSON.stringify({ ok: true, test: t }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_test_session_set", {
+  description: "Rattache (ou retire, sessionId null) la session de création/mise à jour d'un test E2E (session test-agent). Le test affiche alors un bouton de reprise.",
+  inputSchema: {
+    e2eTestId: z.string(),
+    sessionId: z.string().nullable().optional().describe("sessionId opencode (ses_…) à rattacher, ou null pour retirer."),
+  },
+}, async ({ e2eTestId, sessionId }) => {
+  try {
+    const t = await setE2ETestSession({ e2eTestId, sessionId: sessionId || null });
     return text(JSON.stringify({ ok: true, test: t }, null, 2));
   } catch (e) { return err(e.message); }
 });
