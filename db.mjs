@@ -173,6 +173,51 @@ async function migrate() {
     path TEXT, artifact_id TEXT, created_at TEXT NOT NULL
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_documents_recette ON recette_documents(recette_id)");
+  // =========================================================================
+  // ADR 09 — Projets ⇄ Repos (N:N). `projects` = PRODUITS (métier). `repos` =
+  // dépôts de code physiques (workspace, git_path, branches, e2e). Un repo peut
+  // être rattaché à plusieurs produits ; un produit référence plusieurs repos.
+  // =========================================================================
+  await pool().query(`CREATE TABLE IF NOT EXISTS repos (
+    id            TEXT PRIMARY KEY,          -- ex. mada-talk | oniria (repo PBN)
+    name          TEXT,
+    git_path      TEXT,                      -- chemin/url du dépôt git
+    git_url       TEXT,
+    workspace     TEXT,                      -- workspace Coder où vit le checkout
+    branches      TEXT,                      -- JSON array : branches cible(s) de déploiement
+    main_branch   TEXT,                      -- branche principale (alias rapide)
+    e2e_repo_dir  TEXT,                      -- checkout hôte E2E
+    e2e_base_url  TEXT,
+    created_at    TEXT NOT NULL,
+    created_by    TEXT,
+    meta          JSONB
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_repos_workspace ON repos(workspace)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS project_repos (
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    repo_id     TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    role        TEXT,                        -- ex. 'frontend' | 'backend' | 'console' | 'outillage'
+    PRIMARY KEY (project_id, repo_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_project_repos_repo ON project_repos(repo_id)");
+  // --- Backfill idempotent depuis projects (ne supprime rien) ---------------
+  // Chaque projet existant avec des données repo physiques (workspace ou
+  // git_path non nul) génère un repo homonyme + l'association au produit.
+  await pool().query(
+    `INSERT INTO repos (id, name, git_path, workspace, main_branch, e2e_repo_dir, e2e_base_url, created_at, created_by)
+     SELECT p.id, p.name, p.git_path, p.workspace, p.main_branch, p.e2e_repo_dir, p.e2e_base_url, p.created_at, p.created_by
+     FROM projects p
+     WHERE (p.workspace IS NOT NULL OR p.git_path IS NOT NULL OR p.e2e_repo_dir IS NOT NULL)
+       AND p.id NOT IN (SELECT id FROM repos)
+     ON CONFLICT (id) DO NOTHING`,
+  );
+  await pool().query(
+    `INSERT INTO project_repos (project_id, repo_id, role)
+     SELECT p.id, p.id, NULL FROM projects p
+     WHERE (p.workspace IS NOT NULL OR p.git_path IS NOT NULL OR p.e2e_repo_dir IS NOT NULL)
+       AND p.id NOT IN (SELECT project_id FROM project_repos WHERE project_id = p.id AND repo_id = p.id)
+     ON CONFLICT DO NOTHING`,
+  );
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -929,6 +974,88 @@ export async function deleteProject(id) {
   if (!existing) return null;
   await pool().query("DELETE FROM projects WHERE id = $1", [id]);
   return { id, deleted: true };
+}
+
+// --- Repos (ADR 09) : dépôt de code physique, rattaché à 1..N produits -------
+function rowToRepo(r) {
+  if (!r) return null;
+  let branches = r.branches;
+  try { branches = branches ? JSON.parse(branches) : null; } catch { branches = r.branches ? [r.branches] : null; }
+  return {
+    id: r.id, name: r.name, gitPath: r.git_path ?? null, gitUrl: r.git_url ?? null,
+    workspace: r.workspace ?? null, branches, mainBranch: r.main_branch ?? null,
+    e2eRepoDir: r.e2e_repo_dir ?? null, e2eBaseUrl: r.e2e_base_url ?? null,
+    createdAt: r.created_at, createdBy: r.created_by, meta: r.meta ?? null,
+  };
+}
+
+export async function registerRepo({ id, name, workspace, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) {
+  await ensureSchema();
+  if (!id) throw new Error("id requis");
+  await pool().query(
+    `INSERT INTO repos (id, name, git_path, git_url, workspace, branches, main_branch, e2e_repo_dir, e2e_base_url, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+     ON CONFLICT(id) DO UPDATE SET
+       name = EXCLUDED.name, git_path = EXCLUDED.git_path, git_url = EXCLUDED.git_url,
+       workspace = EXCLUDED.workspace, branches = EXCLUDED.branches, main_branch = EXCLUDED.main_branch,
+       e2e_repo_dir = EXCLUDED.e2e_repo_dir, e2e_base_url = EXCLUDED.e2e_base_url`,
+    [id, name ?? id, gitPath ?? null, gitUrl ?? null, workspace ?? null,
+     branches ? JSON.stringify(Array.isArray(branches) ? branches : [branches]) : null,
+     mainBranch ?? null, e2eRepoDir ?? null, e2eBaseUrl ?? null, nowIso(), createdBy ?? null],
+  );
+  return getRepo(id);
+}
+
+export async function getRepo(id) {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM repos WHERE id = $1", [id]);
+  return rowToRepo(res.rows[0]);
+}
+
+export async function listRepos() {
+  await ensureSchema();
+  const res = await pool().query("SELECT * FROM repos ORDER BY name ASC");
+  return res.rows.map(rowToRepo);
+}
+
+// Associe un repo à un projet (N:N). Rôle optionnel (frontend/backend/console/outillage).
+export async function linkRepoToProject({ projectId, repoId, role }) {
+  await ensureSchema();
+  if (!(await getRepo(repoId))) throw new Error(`repo inconnu : ${repoId}`);
+  if (!(await getProject(projectId))) throw new Error(`projet inconnu : ${projectId}`);
+  await pool().query(
+    `INSERT INTO project_repos (project_id, repo_id, role) VALUES ($1,$2,$3)
+     ON CONFLICT (project_id, repo_id) DO UPDATE SET role = COALESCE(EXCLUDED.role, project_repos.role)`,
+    [projectId, repoId, role ?? null],
+  );
+  return { ok: true, projectId, repoId };
+}
+
+export async function unlinkRepoFromProject({ projectId, repoId }) {
+  await ensureSchema();
+  await pool().query("DELETE FROM project_repos WHERE project_id = $1 AND repo_id = $2", [projectId, repoId]);
+  return { ok: true };
+}
+
+export async function listProjectRepos(projectId) {
+  await ensureSchema();
+  const res = await pool().query(
+    `SELECT r.* FROM repos r JOIN project_repos pr ON pr.repo_id = r.id
+     WHERE pr.project_id = $1 ORDER BY r.name ASC`, [projectId],
+  );
+  return res.rows.map(rowToRepo);
+}
+
+export async function listProjectsWithRepos() {
+  await ensureSchema();
+  const projects = await listProjects();
+  const assoc = (await pool().query("SELECT project_id, repo_id, role FROM project_repos ORDER BY repo_id")).rows;
+  const map = new Map();
+  for (const a of assoc) {
+    if (!map.has(a.project_id)) map.set(a.project_id, []);
+    map.get(a.project_id).push({ repoId: a.repo_id, role: a.role ?? null });
+  }
+  return projects.map((p) => ({ ...p, repos: (map.get(p.id) || []).map((x) => x.repoId) }));
 }
 
 // --- Suppression physique d'une tâche et de tout son rattaché ---------------
