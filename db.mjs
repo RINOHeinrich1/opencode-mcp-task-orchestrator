@@ -240,6 +240,9 @@ async function migrate() {
      WHERE t.id NOT IN (SELECT task_id FROM task_repos)
      ON CONFLICT DO NOTHING`,
   );
+  // Tâches émergentes : task_links porte une relation_type ('emergent' = créée
+  // hors scope pendant la tâche source, liée à sa source).
+  await pool().query("ALTER TABLE task_links ADD COLUMN IF NOT EXISTS relation_type TEXT DEFAULT 'linked'");
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -307,23 +310,38 @@ export async function createTask(task) {
       await addTaskLink({ taskId: task.id, linkedTaskId: l.taskId, description: l.description ?? null });
     }
   }
+  // Tâche ÉMERGENTE : créée hors scope pendant une tâche source. On la lie à sa
+  // source avec relation_type='emergent' (tâche émergente → tâche source).
+  if (task.originTaskId) {
+    const src = (await pool().query("SELECT id FROM tasks WHERE id = $1", [task.originTaskId])).rows[0];
+    if (src) {
+      await addTaskLink({
+        taskId: task.id,
+        linkedTaskId: task.originTaskId,
+        relationType: "emergent",
+        description: task.originReason || "créée hors scope pendant la tâche " + task.originTaskId,
+      });
+    }
+  }
   // Repos ciblés (ADR 09) : repoIds explicites ou défaut = tous ceux du projet.
   await setTaskRepos(task.id, task.repoIds);
   return getTask(task.id);
 }
 
 // --- Tâches liées (task_links) ----------------------------------------------
-export async function addTaskLink({ taskId, linkedTaskId, description }) {
+// relation_type : 'linked' (défaut) | 'emergent' (tâche créée hors scope pendant
+// une tâche source, reliée à sa source) — permet de requêter les émergentes.
+export async function addTaskLink({ taskId, linkedTaskId, description, relationType }) {
   await ensureSchema();
   if (!linkedTaskId) throw new Error("linkedTaskId requis");
   if (linkedTaskId === taskId) throw new Error("une tâche ne peut pas être liée à elle-même");
   const target = (await pool().query("SELECT id FROM tasks WHERE id = $1", [linkedTaskId])).rows[0];
   if (!target) throw new Error(`tâche liée inconnue : ${linkedTaskId}`);
   await pool().query(
-    `INSERT INTO task_links (task_id, linked_task_id, description, created_at)
-     VALUES ($1,$2,$3,$4)
-     ON CONFLICT (task_id, linked_task_id) DO UPDATE SET description = EXCLUDED.description`,
-    [taskId, linkedTaskId, description ?? null, nowIso()],
+    `INSERT INTO task_links (task_id, linked_task_id, description, relation_type, created_at)
+     VALUES ($1,$2,$3,$4,$5)
+     ON CONFLICT (task_id, linked_task_id) DO UPDATE SET description = EXCLUDED.description, relation_type = EXCLUDED.relation_type`,
+    [taskId, linkedTaskId, description ?? null, relationType || "linked", nowIso()],
   );
   return listTaskLinks(taskId);
 }
@@ -338,7 +356,7 @@ export async function removeTaskLink({ taskId, linkedTaskId }) {
 export async function listTaskLinks(taskId) {
   await ensureSchema();
   const res = await pool().query(
-    `SELECT l.linked_task_id, l.description, l.created_at,
+    `SELECT l.linked_task_id, l.description, l.relation_type, l.created_at,
             t.request AS linked_request, t.recette_status AS linked_recette,
             (SELECT x.status FROM executions x WHERE x.task_id = l.linked_task_id ORDER BY attempt DESC LIMIT 1) AS linked_status,
             (SELECT COUNT(*) FROM plans p WHERE p.task_id = l.linked_task_id) AS linked_plans,
@@ -352,12 +370,38 @@ export async function listTaskLinks(taskId) {
   return res.rows.map((r) => ({
     linkedTaskId: r.linked_task_id,
     description: r.description,
+    relationType: r.relation_type || "linked",
     createdAt: r.created_at,
     linkedRequest: r.linked_request ?? null,
     linkedRecette: r.linked_recette ?? null,
     linkedStatus: r.linked_status ?? null,
     linkedPlans: Number(r.linked_plans) || 0,
     linkedArtifacts: Number(r.linked_artifacts) || 0,
+  }));
+}
+
+// Tâches liées "émancipées" de la tâche : les tâches émergentes dont la SOURCE
+// est `sourceTaskId` (lien inverse : task_links.task_id = tâche émergente,
+// linked_task_id = source, relation_type='emergent').
+export async function listTaskEmergentFrom(sourceTaskId) {
+  await ensureSchema();
+  const res = await pool().query(
+    `SELECT t.id, t.request, t.title, t.recette_status,
+            (SELECT x.status FROM executions x WHERE x.task_id = t.id ORDER BY attempt DESC LIMIT 1) AS status,
+            l.description AS link_reason
+     FROM task_links l
+     JOIN tasks t ON t.id = l.task_id
+     WHERE l.linked_task_id = $1 AND l.relation_type = 'emergent'
+     ORDER BY l.id ASC`,
+    [sourceTaskId],
+  );
+  return res.rows.map((r) => ({
+    taskId: r.id,
+    request: r.request,
+    title: r.title ?? null,
+    recetteStatus: r.recette_status ?? "pending",
+    status: r.status ?? "queued",
+    reason: r.link_reason ?? null,
   }));
 }
 

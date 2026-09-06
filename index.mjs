@@ -48,6 +48,7 @@ import {
   addTaskLink,
   removeTaskLink,
   listTaskLinks,
+  listTaskEmergentFrom,
   startRecette,
   addRecetteProject,
   removeRecetteProject,
@@ -190,6 +191,8 @@ server.registerTool("task_register", {
     taskId: z.string().optional(),
     sessionId: z.string().optional().describe("Session opencode qui crée la tâche (liée par le plugin permission-hook)."),
     repoIds: z.array(z.string()).optional().describe("Repos ciblés de la tâche (parmi ceux du projet, ADR 09). Défaut : TOUS les repos du projet."),
+    originTaskId: z.string().optional().describe("Si cette tâche est ÉMERGENTE (créée hors scope pendant une tâche source) : taskId de la tâche SOURCE. La nouvelle tâche sera liée à sa source (relation_type='emergent')."),
+    originReason: z.string().optional().describe("Raison de l'émergence (demande hors scope reçue pendant la tâche source)."),
   },
 }, async (input) => {
   try {
@@ -350,8 +353,9 @@ server.registerTool("task_get", {
     const planCommits = await listTaskPlanCommits(taskId);
     const sessions = await listTaskSessions(taskId);
     const linkedTasks = await listTaskLinks(taskId);
+    const emergentFrom = await listTaskEmergentFrom(taskId);
     const recette = await getRecette(taskId).catch(() => null);
-    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks, recette }, null, 2));
+    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks, emergentFrom, recette }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -359,16 +363,17 @@ server.registerTool("task_get", {
 
 // === task_link_add ===
 server.registerTool("task_link_add", {
-  description: "Rattache une tâche associée (source) à une tâche, avec la nature de la liaison. Les tâches liées sont exploitables par atomic-plan (commits, plans, docs).",
+  description: "Rattache une tâche associée (source) à une tâche, avec la nature de la liaison. Les tâches liées sont exploitables par atomic-plan (commits, plans, docs). relationType : 'linked' (défaut) | 'emergent' (tâche émergente reliée à sa source).",
   inputSchema: {
     taskId: z.string().describe("Tâche cible (celle qui exploitera la tâche liée)."),
     linkedTaskId: z.string().describe("taskId de la tâche associée (source)."),
     description: z.string().optional().describe("Nature de la liaison (libre)."),
+    relationType: z.enum(["linked", "emergent"]).optional().describe("linked (défaut) | emergent."),
   },
-}, async ({ taskId, linkedTaskId, description }) => {
+}, async ({ taskId, linkedTaskId, description, relationType }) => {
   try {
     if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
-    const links = await addTaskLink({ taskId, linkedTaskId, description });
+    const links = await addTaskLink({ taskId, linkedTaskId, description, relationType });
     return text(JSON.stringify({ ok: true, taskId, links }, null, 2));
   } catch (e) {
     return err(e.message);
