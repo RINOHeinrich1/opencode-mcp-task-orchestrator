@@ -1560,9 +1560,9 @@ server.registerTool("e2e_run", {
   description: "Déclenche un run E2E Playwright sur un repo applicatif (cible externe déployée, ex. préprod) puis IMPORTE le résultat dans le registre. Le test est une entité de 1er niveau : passer e2eTestId (ou laisser specPattern pour un run libre). origin : task|recette|manual (défaut manual, task si taskId fourni). Le verdict lu par l'IA est le RAPPORT TEXTE ; la vidéo est une preuve humaine.",
   inputSchema: {
     project: z.string(),
-    repoDir: z.string().describe("Répertoire (hôte) du dépôt applicatif avec Playwright (ex: /root/mada-talk-preprod)."),
+    repoDir: z.string().optional().describe("Répertoire (hôte) du dépôt applicatif avec Playwright (ex: /root/mada-talk-preprod). Optionnel si e2eTestId fourni : e2e_run résout le repo d'exécution depuis les repos traversés du test (celui qui contient le spec)."),
     baseUrl: z.string().optional().describe("URL de la cible déployée (défaut : e2e.env E2E_BASE_URL)."),
-    e2eTestId: z.string().optional().describe("Test (entité 1er niveau) à exécuter — résout specPattern + projets couverts depuis le registre."),
+    e2eTestId: z.string().optional().describe("Test (entité 1er niveau) à exécuter — résout specPattern + repos traversés + projets depuis le registre."),
     origin: z.enum(["task", "recette", "manual", "ci", "session"]).optional().describe("Origine du déclenchement."),
     taskId: z.string().optional().describe("Tâche origine à associer (et lier si non déjà liée)."),
     specPattern: z.string().optional().describe("Regex Playwright de filtre de spec à exécuter (positionnelle, transmise après '--' ; défaut : run complet de la config). Ex: madatalk-requests-(chatbot-cycle|support-interactions-kpi|pause-resiliation)\\\\.spec\\\\.ts"),
@@ -1574,10 +1574,9 @@ server.registerTool("e2e_run", {
   },
 }, async ({ project, repoDir, baseUrl, taskId, origin, e2eTestId, specPattern, playwrightConfig, pwArgs, paramValues, secretNames, runFromRef }) => {
   try {
-    if (!repoDir || !existsSync(join(repoDir, "package.json"))) return err(`repoDir invalide ou sans package.json : ${repoDir}`);
     const env = loadE2EEnv();
     if (!env.E2E_USER_EMAIL || !env.E2E_USER_PASSWORD) return err("identifiants E2E absents : renseigner " + E2E_ENV_FILE);
-    // Si un test 1er niveau est donné, on résout specPattern + défauts de params.
+    // Si un test 1er niveau est donné, on résout specPattern + repos traversés.
     let resolvedProject = project;
     let pattern = specPattern;
     let paramOverrides = paramValues || {};
@@ -1590,7 +1589,16 @@ server.registerTool("e2e_run", {
       for (const p of targetTest.params || []) {
         if (p.defaultValue && paramOverrides[p.name] === undefined) paramOverrides[p.name] = p.defaultValue;
       }
+      // ADR 11 : repo d'exécution résolu depuis les repos traversés si repoDir absent.
+      if (!repoDir) {
+        const testRepos = (targetTest.repos || []).filter((r) => r && r.e2eRepoDir);
+        const specRepo = testRepos.find((r) => {
+          try { return existsSync(join(String(r.e2eRepoDir).trim(), String(targetTest.specFile).replace(/^\.\//, ""))); } catch { return false; }
+        }) || testRepos[0];
+        if (specRepo) repoDir = specRepo.e2eRepoDir;
+      }
     }
+    if (!repoDir || !existsSync(join(repoDir, "package.json"))) return err(`repoDir invalide ou sans package.json : ${repoDir || "(non résolu)"}`);
     // --- PRÉ-VOL (solution long terme « spec absent du checkout ») -----------
     // Le spec cible doit exister dans le repoDir où Playwright va s'exécuter.
     // S'il est absent (branche non mergée, checkout périmé) :
