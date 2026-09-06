@@ -1210,38 +1210,39 @@ server.registerTool("task_delete", {
 // ===========================================================================
 
 // === e2e_test_register ===
-// === e2e_test_register (entité 1er niveau) ===
 server.registerTool("e2e_test_register", {
-  description: "Enregistre (ou réactive) un test E2E comme entité de 1er niveau — 1 enregistrement par test() Playwright. project = REPO SOURCE (où vit le spec) ; coveredProjects = projets dont le comportement est vérifié (le repo source est toujours inclus). gherkin = formalisation Gherkin du comportement (test-agent). Indépendant de toute tâche (l'association tâche se fait via e2e_test_link).",
+  description: "Enregistre (ou réactive) un test E2E comme entité de 1er niveau — 1 enregistrement par test() Playwright. project = PROJET (produit) dont le comportement est vérifié (ADR 11) ; repoIds = REPOS DE CODE associés au test (repos traversés par le comportement, le spec vit dans l'un d'eux — ex. ['mada-talk','oniria']) ; coveredProjects = rétrocompat (obsolète, préférer repoIds). gherkin = formalisation Gherkin du comportement (test-agent). Indépendant de toute tâche (l'association tâche se fait via e2e_test_link).",
   inputSchema: {
-    project: z.string().describe("Repo source (projet du dépôt où vit le spec)."),
+    project: z.string().describe("PROJET (produit) dont le comportement est vérifié (ex. mada-talk)."),
     specFile: z.string().describe("Chemin du spec file (ex: tests/e2e/auth/login.spec.ts)."),
     scenario: z.string().describe("Titre du test() Playwright."),
     title: z.string().optional().describe("Titre court / comportement couvert."),
-    description: z.string().optional().describe("Description du comportement vérifié (demande libre, multi-projets éventuel)."),
+    description: z.string().optional().describe("Description du comportement vérifié (demande libre, multi-repos éventuel)."),
     gherkin: z.string().optional().describe("Formalisation Gherkin (Given/When/Then) du comportement — produite par test-agent."),
-    coveredProjects: z.array(z.string()).optional().describe("Projets couverts par le comportement (ex. ['mada-talk','oniria'])."),
+    coveredProjects: z.array(z.string()).optional().describe("Rétrocompat (obsolète) : projets couverts — préférer repoIds."),
+    repoIds: z.array(z.string()).optional().describe("REPOS DE CODE associés au test (repos traversés par le comportement, ex. ['mada-talk','oniria']). Le repo contenant le spec est inclus par défaut. Défaut si absent : repos du projet."),
   },
-}, async ({ project, specFile, scenario, title, description, gherkin, coveredProjects }) => {
+}, async ({ project, specFile, scenario, title, description, gherkin, coveredProjects, repoIds }) => {
   try {
-    const t = await upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects });
+    const t = await upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects, repoIds });
     return text(JSON.stringify({ ok: true, test: await getE2ETest(t.id) }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 // === e2e_test_update / get / obsolete ===
 server.registerTool("e2e_test_update", {
-  description: "Met à jour le titre/description/gherkin/projets couverts d'un test E2E (entité 1er niveau).",
+  description: "Met à jour le titre/description/gherkin d'un test E2E et/ou ses REPOS DE CODE associés (repoIds — repos traversés par le comportement, ADR 11).",
   inputSchema: {
     e2eTestId: z.string(),
     title: z.string().optional(),
     description: z.string().optional(),
     gherkin: z.string().optional(),
-    coveredProjects: z.array(z.string()).optional().describe("Remplace les projets couverts."),
+    coveredProjects: z.array(z.string()).optional().describe("Rétrocompat (obsolète) — préférer repoIds."),
+    repoIds: z.array(z.string()).optional().describe("Remplace les REPOS DE CODE associés au test (repos traversés, ex. ['mada-talk','oniria'])."),
   },
-}, async ({ e2eTestId, title, description, gherkin, coveredProjects }) => {
+}, async ({ e2eTestId, title, description, gherkin, coveredProjects, repoIds }) => {
   try {
-    const t = await updateE2ETestMeta({ e2eTestId, title, description, gherkin, coveredProjects });
+    const t = await updateE2ETestMeta({ e2eTestId, title, description, gherkin, coveredProjects, repoIds });
     return text(JSON.stringify({ ok: true, test: t }, null, 2));
   } catch (e) { return err(e.message); }
 });

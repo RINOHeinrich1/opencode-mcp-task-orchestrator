@@ -1950,8 +1950,17 @@ export async function upsertE2ETest({ project, specFile, scenario, title, descri
     [e2eStableId(p, specFile, scenario), p, String(specFile).trim(), String(scenario).trim(), title ?? null, description ?? null, gherkin ?? null, now],
   )).rows[0];
   await setE2EProjects(r.id, p, coveredProjects);
-  // ADR 11 : repos traversés explicites (sinon déduits par la lecture rétrocompat).
-  if (Array.isArray(repoIds) && repoIds.length) await setE2ERepos(r.id, repoIds);
+  // ADR 11 : repos traversés explicites. Si absents, défaut = les repos du
+  // projet (via project_repos) puis, à défaut, le repo portant l'id du projet.
+  if (Array.isArray(repoIds) && repoIds.length) {
+    await setE2ERepos(r.id, repoIds);
+  } else {
+    const def = (await pool().query(
+      `SELECT repo_id FROM project_repos WHERE project_id = $1
+       UNION SELECT id FROM repos WHERE id = $1 ORDER BY 1`, [p],
+    )).rows.map((x) => x.repo_id);
+    if (def.length) await setE2ERepos(r.id, def);
+  }
   return { id: r.id, project: p, specFile: String(specFile).trim(), scenario: String(scenario).trim() };
 }
 
@@ -1983,7 +1992,7 @@ export async function setE2ETestSession({ e2eTestId, sessionId }) {
   return getE2ETest(e2eTestId);
 }
 
-export async function updateE2ETestMeta({ e2eTestId, title, description, gherkin, coveredProjects }) {
+export async function updateE2ETestMeta({ e2eTestId, title, description, gherkin, coveredProjects, repoIds }) {
   await ensureSchema();
   const sets = [];
   const params = [];
@@ -1999,6 +2008,9 @@ export async function updateE2ETestMeta({ e2eTestId, title, description, gherkin
     const t = await getE2ETestRow(e2eTestId);
     if (t) await setE2EProjects(e2eTestId, t.project, coveredProjects);
   }
+  // ADR 11 : repos traversés (repos de code associés au test = couverture du
+  // comportement). Réécrit la liste N:N quand repoIds est fourni (même vide).
+  if (Array.isArray(repoIds)) await setE2ERepos(e2eTestId, repoIds);
   return getE2ETest(e2eTestId);
 }
 
@@ -2164,10 +2176,12 @@ export async function listTaskE2E(taskId) {
   const out = [];
   for (const r of rows) {
     const projects = await getE2EProjects(r.id);
+    const repos = await getE2ERepos(r.id);
     out.push({
       e2eTestId: r.id,
       project: r.project,
       projects,
+      repos,           // ADR 11 : repos traversés (couverture code du test)
       specFile: r.spec_file,
       scenario: r.scenario,
       title: r.title,
