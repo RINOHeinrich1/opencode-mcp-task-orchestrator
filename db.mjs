@@ -54,6 +54,8 @@ async function migrate() {
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recette_id TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS direct_execution INTEGER NOT NULL DEFAULT 0");
+  // E2E : raison d'un SKIP / échec (précondition de données manquante, bug…).
+  await pool().query("ALTER TABLE e2e_executions ADD COLUMN IF NOT EXISTS skip_reason TEXT");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_tasks (
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
     task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -2203,21 +2205,21 @@ export async function listTaskE2E(taskId) {
 
 // Enregistre une exécution E2E (statut PENDING/RUNNING puis mis à jour via update).
 // L'exécution appartient au TEST ; origin = task|recette|ci|manual|session.
-export async function recordE2EExecution({ e2eTestId, origin = "manual", taskId, deploymentId, planId, env, commitSha, branch, pipelineRef, status = "RUNNING", attempts = 1, paramValues }) {
+export async function recordE2EExecution({ e2eTestId, origin = "manual", taskId, deploymentId, planId, env, commitSha, branch, pipelineRef, status = "RUNNING", attempts = 1, paramValues, skipReason }) {
   await ensureSchema();
   if (!e2eTestId) throw new Error("e2eTestId requis");
   const id = `EXE-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const pv = paramValues ? JSON.stringify(paramValues) : null;
   await pool().query(
-    `INSERT INTO e2e_executions (id, e2e_test_id, origin, task_id, deployment_id, plan_id, env, commit_sha, branch, pipeline_ref, status, attempts, created_at, param_values)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-    [id, e2eTestId, origin ?? null, taskId ?? null, deploymentId ?? null, planId ?? null, env ?? null, commitSha ?? null, branch ?? null, pipelineRef ?? null, status, attempts || 1, nowIso(), pv],
+    `INSERT INTO e2e_executions (id, e2e_test_id, origin, task_id, deployment_id, plan_id, env, commit_sha, branch, pipeline_ref, status, attempts, skip_reason, created_at, param_values)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    [id, e2eTestId, origin ?? null, taskId ?? null, deploymentId ?? null, planId ?? null, env ?? null, commitSha ?? null, branch ?? null, pipelineRef ?? null, status, attempts || 1, skipReason ?? null, nowIso(), pv],
   );
   return { id, e2eTestId, taskId: taskId ?? null, origin: origin ?? null, status };
 }
 
 // Met à jour une exécution (verdict, preuves, durée).
-export async function updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt, origin }) {
+export async function updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, executedAt, origin, skipReason }) {
   await ensureSchema();
   const sets = [];
   const params = [];
@@ -2230,6 +2232,7 @@ export async function updateE2EExecution({ executionId, status, durationMs, repo
   if (verdictBy !== undefined) { params.push(verdictBy); sets.push(`verdict_by = $${params.length}`); }
   if (executedAt !== undefined) { params.push(executedAt); sets.push(`executed_at = $${params.length}`); }
   if (origin !== undefined) { params.push(origin); sets.push(`origin = $${params.length}`); }
+  if (skipReason !== undefined) { params.push(skipReason); sets.push(`skip_reason = $${params.length}`); }
   if (!sets.length) throw new Error("aucun champ à mettre à jour");
   params.push(executionId);
   await pool().query(`UPDATE e2e_executions SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
@@ -2259,6 +2262,7 @@ export async function getE2EExecution(executionId) {
     logsUrl: r.logs_url,
     videoUrl: r.video_url,
     summary: r.summary,
+    skipReason: r.skip_reason,
     verdictBy: r.verdict_by,
     createdAt: r.created_at,
     paramValues: r.param_values,
@@ -2296,6 +2300,7 @@ export async function listE2EExecutions({ e2eTestId, taskId, origin, limit = 100
     logsUrl: r.logs_url,
     videoUrl: r.video_url,
     summary: r.summary,
+    skipReason: r.skip_reason,
     verdictBy: r.verdict_by,
     createdAt: r.created_at,
     paramValues: r.param_values,

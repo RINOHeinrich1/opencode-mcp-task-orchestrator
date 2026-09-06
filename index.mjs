@@ -1389,13 +1389,14 @@ server.registerTool("e2e_execution_update", {
     logsUrl: z.string().optional(),
     videoUrl: z.string().optional().describe("Preuve HUMAINE (vidéo) — jamais analysée par l'IA."),
     summary: z.string().optional().describe("Verdict / synthèse textuelle."),
+    skipReason: z.string().optional().describe("Raison d'un SKIPPED (précondition de données manquante…)."),
     verdictBy: z.string().optional().describe("build-notify | human | agent-recette."),
     origin: z.enum(["task", "recette", "ci", "manual", "session"]).optional(),
     executedAt: z.string().optional(),
   },
-}, async ({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, origin, executedAt }) => {
+}, async ({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, skipReason, verdictBy, origin, executedAt }) => {
   try {
-    const ex = await updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, verdictBy, origin, executedAt });
+    const ex = await updateE2EExecution({ executionId, status, durationMs, reportArtifactId, logsUrl, videoUrl, summary, skipReason, verdictBy, origin, executedAt });
     return text(JSON.stringify({ ok: true, execution: ex }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1441,14 +1442,33 @@ server.registerTool("e2e_collect", {
       if (taskId) await linkTaskE2E({ taskId, e2eTestId, relationType: res.relation || "REGRESSION", reason: res.reason || "Associé à l'exécution CI" });
       const rec = await recordE2EExecution({ e2eTestId, origin: "ci", taskId, env, commitSha, branch, pipelineRef, attempts });
       const reportPath = join(outDir, `report-${rec.id}.json`);
-      writeFileSync(reportPath, JSON.stringify({ runId, executionId: rec.id, e2eTestId, specFile: res.specFile, scenario: res.scenario, status: res.status, durationMs: res.durationMs, error: res.error || null, attempts }, null, 2));
+      // RAPPORT TEXTE RICHE (transcript horodaté) — copié depuis le .txt du runner.
+      let logsUrl = null;
+      let reportText = null;
+      if (res.reportFile && existsSync(join(runDir, res.reportFile))) {
+        const srcTxt = readFileSync(join(runDir, res.reportFile), "utf8");
+        const destTxt = join(outDir, `report-${rec.id}.txt`);
+        writeFileSync(destTxt, srcTxt);
+        logsUrl = destTxt;
+        reportText = srcTxt;
+      }
+      writeFileSync(reportPath, JSON.stringify({ runId, executionId: rec.id, e2eTestId, specFile: res.specFile, scenario: res.scenario, status: res.status, durationMs: res.durationMs, error: res.error || null, skipReason: res.skipReason || null, reportText: reportText ? reportText.slice(0, 60000) : null, attempts }, null, 2));
+      if (!logsUrl) logsUrl = reportPath;
       let videoUrl = null;
       if (res.videoFile && existsSync(join(runDir, res.videoFile))) {
         const dest = join(outDir, `video-${rec.id}${extname(res.videoFile) || ".webm"}`);
         copyFileSync(join(runDir, res.videoFile), dest);
         videoUrl = dest;
       }
-      await updateE2EExecution({ executionId: rec.id, status: res.status || "ERROR", durationMs: res.durationMs || null, logsUrl: reportPath, videoUrl, summary: (res.summary || (res.error ? `Échec : ${String(res.error).slice(0, 400)}` : `PASS ${res.scenario}`)).slice(0, 2000), verdictBy: "build-notify", executedAt: manifest.executedAt || new Date().toISOString() });
+      let summary;
+      if (reportText) {
+        const keep = reportText.split("\n").filter((l) => l && !l.startsWith("[REPORT-TEXTE]") && !l.startsWith("[SCENARIO]") && !l.startsWith("[SPEC]"));
+        summary = keep.slice(-14).join("\n");
+        if (res.skipReason && !reportText.includes("[SKIPPED]")) summary += `\n[SKIPPED] ${res.skipReason}`;
+      } else {
+        summary = res.skipReason ? `SKIPPED : ${res.skipReason}` : (res.summary || (res.error ? `Échec : ${String(res.error).slice(0, 400)}` : `PASS ${res.scenario}`));
+      }
+      await updateE2EExecution({ executionId: rec.id, status: res.status || "ERROR", durationMs: res.durationMs || null, logsUrl, videoUrl, skipReason: res.skipReason || null, summary: summary.slice(0, 2000), verdictBy: "build-notify", executedAt: manifest.executedAt || new Date().toISOString() });
       imported.push({ e2eTestId, executionId: rec.id, status: res.status || "ERROR" });
     }
     writeFileSync(join(outDir, "imported.json"), JSON.stringify({ runId, importedAt: new Date().toISOString(), count: imported.length }, null, 2));
@@ -1745,16 +1765,39 @@ server.registerTool("e2e_run", {
       const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? { ...paramOverrides, varsInjected: injectedVars.length ? injectedVars : undefined, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : ((injectedVars.length || injectedSecrets.length) ? { varsInjected: injectedVars.length ? injectedVars : undefined, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : null) });
       const outDir = join("/root/orchestrator-panel/storage/e2e/runs", runId);
       mkdirSync(outDir, { recursive: true });
+      // RAPPORT TEXTE RICHE (transcript des étapes, horodaté) : le runner a écrit
+      // un .txt par résultat (res.reportFile) quand le spec a posé l'attachment
+      // « rapport-e2e-texte ». On le copie comme artefact de l'exécution. Le JSON
+      // squelettique reste écrit en méta (rétrocompat), mais logsUrl → le .txt.
+      let logsUrl = null;
+      let reportText = null;
+      if (res.reportFile && existsSync(join(runDir, res.reportFile))) {
+        const srcTxt = readFileSync(join(runDir, res.reportFile), "utf8");
+        const destTxt = join(outDir, `report-${rec.id}.txt`);
+        writeFileSync(destTxt, srcTxt);
+        logsUrl = destTxt;
+        reportText = srcTxt;
+      }
       const reportPath = join(outDir, `report-${rec.id}.json`);
-      writeFileSync(reportPath, JSON.stringify({ runId, executionId: rec.id, e2eTestId: reg.id, specFile: res.specFile, scenario: res.scenario, status: res.status, durationMs: res.durationMs, error: res.error || null, attempts: manifest.attempts || 1 }, null, 2));
+      writeFileSync(reportPath, JSON.stringify({ runId, executionId: rec.id, e2eTestId: reg.id, specFile: res.specFile, scenario: res.scenario, status: res.status, durationMs: res.durationMs, error: res.error || null, skipReason: res.skipReason || null, reportText: reportText ? reportText.slice(0, 60000) : null, attempts: manifest.attempts || 1 }, null, 2));
+      if (!logsUrl) logsUrl = reportPath;
       let videoUrl = null;
       if (res.videoFile && existsSync(join(runDir, res.videoFile))) {
         const dest = join(outDir, `video-${rec.id}${extname(res.videoFile) || ".webm"}`);
         copyFileSync(join(runDir, res.videoFile), dest);
         videoUrl = dest;
       }
-      await updateE2EExecution({ executionId: rec.id, status: res.status || "ERROR", durationMs: res.durationMs || null, logsUrl: reportPath, videoUrl, summary: (res.summary || `Résultat ${res.status}`).slice(0, 2000), verdictBy: "build-notify", executedAt: manifest.executedAt || new Date().toISOString() });
-      imported.push({ e2eTestId: reg.id, executionId: rec.id, status: res.status || "ERROR", scenario: res.scenario, summary: (res.summary || "").slice(0, 300) });
+      // Résumé riche : transcript réel quand dispo, sinon verdict dérivé.
+      let summary;
+      if (reportText) {
+        const keep = reportText.split("\n").filter((l) => l && !l.startsWith("[REPORT-TEXTE]") && !l.startsWith("[SCENARIO]") && !l.startsWith("[SPEC]"));
+        summary = keep.slice(-14).join("\n");
+        if (res.skipReason && !reportText.includes("[SKIPPED]")) summary += `\n[SKIPPED] ${res.skipReason}`;
+      } else {
+        summary = res.skipReason ? `SKIPPED : ${res.skipReason}` : (res.summary || `Résultat ${res.status}`);
+      }
+      await updateE2EExecution({ executionId: rec.id, status: res.status || "ERROR", durationMs: res.durationMs || null, logsUrl, videoUrl, skipReason: res.skipReason || null, summary: summary.slice(0, 2000), verdictBy: "build-notify", executedAt: manifest.executedAt || new Date().toISOString() });
+      imported.push({ e2eTestId: reg.id, executionId: rec.id, status: res.status || "ERROR", scenario: res.scenario, summary: (res.skipReason ? `SKIPPED : ${res.skipReason}` : res.summary || "").slice(0, 300) });
     }
     try { rmSync(runDir, { recursive: true, force: true }); } catch {}
     try { if (worktreeToClean) removeRunWorktree(repoDir, worktreeToClean); } catch {}
