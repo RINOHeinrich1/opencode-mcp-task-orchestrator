@@ -1396,12 +1396,13 @@ server.registerTool("e2e_run", {
     let resolvedProject = project;
     let pattern = specPattern;
     let paramOverrides = paramValues || {};
+    let targetTest = null;
     if (e2eTestId) {
-      const t = await getE2ETest(e2eTestId);
-      if (!t) return err(`test inconnu : ${e2eTestId}`);
-      resolvedProject = t.project;
-      pattern = pattern || t.specFile;
-      for (const p of t.params || []) {
+      targetTest = await getE2ETest(e2eTestId);
+      if (!targetTest) return err(`test inconnu : ${e2eTestId}`);
+      resolvedProject = targetTest.project;
+      pattern = pattern || targetTest.specFile;
+      for (const p of targetTest.params || []) {
         if (p.defaultValue && paramOverrides[p.name] === undefined) paramOverrides[p.name] = p.defaultValue;
       }
     }
@@ -1485,10 +1486,10 @@ server.registerTool("e2e_run", {
       // registre) — on y rattache l'exécution SANS créer de doublon (le spec_file
       // du runner peut être relatif ≠ chemin canonique du registre).
       let reg;
-      if (e2eTestId && res.scenario === t.scenario) {
-        reg = { id: t.id };
-      } else if (e2eTestId) {
-        reg = await upsertE2ETest({ project: resolvedProject, specFile: t.specFile, scenario: res.scenario, title: res.title, coveredProjects: null });
+      if (e2eTestId && targetTest && res.scenario === targetTest.scenario) {
+        reg = { id: targetTest.e2eTestId };
+      } else if (e2eTestId && targetTest) {
+        reg = await upsertE2ETest({ project: resolvedProject, specFile: targetTest.specFile, scenario: res.scenario, title: res.title, coveredProjects: null });
       } else {
         reg = await upsertE2ETest({ project: resolvedProject, specFile: res.specFile, scenario: res.scenario, title: res.title, coveredProjects: [resolvedProject] });
       }
