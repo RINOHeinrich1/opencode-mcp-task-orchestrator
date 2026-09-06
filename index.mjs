@@ -94,6 +94,7 @@ import {
   registerRepo,
   getRepo,
   listRepos,
+  deleteRepo,
   linkRepoToProject,
   unlinkRepoFromProject,
   listProjectRepos,
@@ -257,7 +258,8 @@ server.registerTool("repo_register", {
     id: z.string().describe("Identifiant du repo (ex: mada-talk, oniria)."),
     name: z.string().optional().describe("Nom lisible."),
     workspace: z.string().optional().describe("Workspace Coder où vit le checkout."),
-    gitPath: z.string().optional().describe("Chemin/URL du dépôt git."),
+    repoDir: z.string().optional().describe("Répertoire du dépôt (chemin du checkout dans/du workspace)."),
+    gitPath: z.string().optional().describe("[alias] = repoDir (rétrocompat)."),
     gitUrl: z.string().optional(),
     branches: z.array(z.string()).optional().describe("Branches cible(s) de déploiement (ex: ['main'], ['oniria-preprod'])."),
     mainBranch: z.string().optional().describe("Branche de déploiement par défaut (requise pour déployer)."),
@@ -267,8 +269,8 @@ server.registerTool("repo_register", {
   },
 }, async (args) => {
   try {
-    const { id, name, workspace, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy } = args;
-    const repo = await registerRepo({ id, name, workspace, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
+    const { id, name, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy } = args;
+    const repo = await registerRepo({ id, name, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
     return text(JSON.stringify({ ok: true, repo }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -291,6 +293,17 @@ server.registerTool("repo_get", {
     const repo = await getRepo(id);
     if (!repo) return err(`repo inconnu : ${id}`);
     return text(JSON.stringify({ ok: true, repo }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("repo_delete", {
+  description: "Supprime un repo (et ses associations projet). Ne supprime aucun projet.",
+  inputSchema: { id: z.string() },
+}, async ({ id }) => {
+  try {
+    const r = await deleteRepo(id);
+    if (!r) return err(`repo inconnu : ${id}`);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

@@ -978,22 +978,35 @@ export async function deleteProject(id) {
   return { id, deleted: true };
 }
 
+export async function deleteRepo(id) {
+  await ensureSchema();
+  const existing = await getRepo(id);
+  if (!existing) return null;
+  await pool().query("DELETE FROM project_repos WHERE repo_id = $1", [id]);
+  await pool().query("DELETE FROM repos WHERE id = $1", [id]);
+  return { id, deleted: true };
+}
+
 // --- Repos (ADR 09) : dépôt de code physique, rattaché à 1..N produits -------
 function rowToRepo(r) {
   if (!r) return null;
   let branches = r.branches;
   try { branches = branches ? JSON.parse(branches) : null; } catch { branches = r.branches ? [r.branches] : null; }
   return {
-    id: r.id, name: r.name, gitPath: r.git_path ?? null, gitUrl: r.git_url ?? null,
+    id: r.id, name: r.name,
+    repoDir: r.git_path ?? null,        // répertoire du dépôt (dans/du workspace Coder)
+    gitPath: r.git_path ?? null,        // alias rétrocompat (== repoDir)
+    gitUrl: r.git_url ?? null,
     workspace: r.workspace ?? null, branches, mainBranch: r.main_branch ?? null,
     e2eRepoDir: r.e2e_repo_dir ?? null, e2eBaseUrl: r.e2e_base_url ?? null,
     createdAt: r.created_at, createdBy: r.created_by, meta: r.meta ?? null,
   };
 }
 
-export async function registerRepo({ id, name, workspace, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) {
+export async function registerRepo({ id, name, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) {
   await ensureSchema();
   if (!id) throw new Error("id requis");
+  const dir = repoDir ?? gitPath ?? null; // repoDir = terme courant ; gitPath = alias
   await pool().query(
     `INSERT INTO repos (id, name, git_path, git_url, workspace, branches, main_branch, e2e_repo_dir, e2e_base_url, created_at, created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -1001,7 +1014,7 @@ export async function registerRepo({ id, name, workspace, gitPath, gitUrl, branc
        name = EXCLUDED.name, git_path = EXCLUDED.git_path, git_url = EXCLUDED.git_url,
        workspace = EXCLUDED.workspace, branches = EXCLUDED.branches, main_branch = EXCLUDED.main_branch,
        e2e_repo_dir = EXCLUDED.e2e_repo_dir, e2e_base_url = EXCLUDED.e2e_base_url`,
-    [id, name ?? id, gitPath ?? null, gitUrl ?? null, workspace ?? null,
+    [id, name ?? id, dir, gitUrl ?? null, workspace ?? null,
      branches ? JSON.stringify(Array.isArray(branches) ? branches : [branches]) : null,
      mainBranch ?? null, e2eRepoDir ?? null, e2eBaseUrl ?? null, nowIso(), createdBy ?? null],
   );
