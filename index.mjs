@@ -1481,7 +1481,17 @@ server.registerTool("e2e_run", {
     const imported = [];
     for (const res of realResults) {
       if (!res.specFile || !res.scenario) continue;
-      const reg = await upsertE2ETest({ project: resolvedProject, specFile: res.specFile, scenario: res.scenario, title: res.title, coveredProjects: (e2eTestId ? null : [resolvedProject]) });
+      // Run CIBLÉ (e2eTestId) : l'entité existe déjà (grain spec+scenario du
+      // registre) — on y rattache l'exécution SANS créer de doublon (le spec_file
+      // du runner peut être relatif ≠ chemin canonique du registre).
+      let reg;
+      if (e2eTestId && res.scenario === t.scenario) {
+        reg = { id: t.id };
+      } else if (e2eTestId) {
+        reg = await upsertE2ETest({ project: resolvedProject, specFile: t.specFile, scenario: res.scenario, title: res.title, coveredProjects: null });
+      } else {
+        reg = await upsertE2ETest({ project: resolvedProject, specFile: res.specFile, scenario: res.scenario, title: res.title, coveredProjects: [resolvedProject] });
+      }
       if (taskId) await linkTaskE2E({ taskId, e2eTestId: reg.id, relationType: res.relation || "REGRESSION", reason: res.reason || "Run déclenché par la recette/vérification" });
       const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? { ...paramOverrides, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : (injectedSecrets.length ? { secretsInjected: injectedSecrets } : null) });
       const outDir = join("/root/orchestrator-panel/storage/e2e/runs", runId);
