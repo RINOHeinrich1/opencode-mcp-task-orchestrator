@@ -13,7 +13,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, rmSync, unlinkSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, rmSync, unlinkSync, readdirSync, statSync, symlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, extname, relative, resolve } from "node:path";
 import { canTaskTransition, isValidState, allowedFrom, VALID_STATES } from "./statemachine.mjs";
@@ -1372,6 +1372,91 @@ function loadE2EEnv() {
   } catch {}
   return out;
 }
+
+// --- Pré-vol E2E : spec absent du checkout → recherche git (solution long terme).
+// Le run s'exécute dans un checkout hôte (souvent sur main) alors que le spec
+// peut vivre sur une branche de travail non mergée. Au lieu d'un run vide
+// muet, on LOCALISE le spec dans l'historique git (fetch + toutes branches) et
+// on propose un worktree temporaire au commit choisi.
+
+function gitExec(repoDir, args, opts = {}) {
+  try {
+    return execFileSync("git", ["-C", repoDir, ...args], { encoding: "utf8", ...opts }).trim();
+  } catch { return null; }
+}
+
+// Liste les commits où le fichier EXISTE dans l'historique (création +
+// modifications ultérieures, avant une éventuelle suppression), avec la branche
+// la plus proche qui le contient. Cherche dans TOUT l'historique local
+// (git log --all) : utile quand le spec a été purgé de main mais vit encore
+// dans l'historique ou sur une branche non mergée fetchée.
+// Renvoie [] si rien de récupérable, null si git indispo.
+function locateSpecInGit(repoDir, specFile) {
+  if (!existsSync(join(repoDir, ".git"))) return null;
+  // Fetch best-effort (peut échouer sans credentials — on continue sinon).
+  try { gitExec(repoDir, ["fetch", "origin", "--prune"], { timeout: 60 * 1000 }); } catch {}
+  const log = (gitExec(repoDir, ["log", "--all", "--format=%H|%ad|%s", "--date=iso", "--", specFile]) || "");
+  const lines = log.split("\n").filter(Boolean);
+  const out = [];
+  const seen = new Set();
+  for (const line of lines) {
+    const [sha, date, ...rest] = line.split("|");
+    const subject = rest.join("|");
+    if (!sha || seen.has(sha)) continue;
+    // Le fichier doit exister À CE COMMIT (cat-file -e sha:path).
+    if (gitExec(repoDir, ["cat-file", "-e", `${sha}:${specFile}`]) === null) continue;
+    seen.add(sha);
+    // Branche(s) contenant ce commit — première distante sinon locale.
+    const branches = (gitExec(repoDir, ["branch", "-a", "--contains", sha, "--format=%(refname:short)"]) || "")
+      .split("\n").map((b) => b.trim()).filter((b) => b && b !== "HEAD");
+    const branch = branches[0] || "historique";
+    out.push({
+      sha,
+      short: sha.slice(0, 10),
+      branch,
+      branches: branches.slice(0, 3),
+      date,
+      subject: subject || "",
+    });
+    if (out.length >= 10) break;
+  }
+  return out;
+}
+
+// Crée un worktree temporaire détaché au commit donné (spec + helpers + config
+// complets), partage node_modules du checkout d'origine quand les dépendances
+// n'ont pas changé. Retourne le chemin du worktree.
+function createRunWorktree(repoDir, sha, project) {
+  const wtBase = "/root/test-E2E";
+  try { mkdirSync(wtBase, { recursive: true }); } catch {}
+  const wtDir = join(wtBase, `${project}-${Date.now().toString(36)}-${sha.slice(0, 7)}`);
+  const add = gitExec(repoDir, ["worktree", "add", "--detach", wtDir, sha], { timeout: 60 * 1000 });
+  if (add === null || !existsSync(wtDir)) {
+    try { rmSync(wtDir, { recursive: true, force: true }); } catch {}
+    throw new Error(`impossible de créer le worktree au commit ${sha.slice(0, 10)} — la branche est-elle fetchée ?`);
+  }
+  // Partage node_modules si le manifest des dépendances n'a pas changé au commit.
+  const nmBase = join(repoDir, "node_modules");
+  if (existsSync(nmBase) && !existsSync(join(wtDir, "node_modules"))) {
+    const pkgChanged = gitExec(repoDir, ["diff", "--quiet", "HEAD", sha, "--", "package.json", "package-lock.json"]);
+    try {
+      if (pkgChanged === null) {
+        // Commit == HEAD (pkg identique) : symlink sûr.
+        try { symlinkSync(nmBase, join(wtDir, "node_modules")); } catch {}
+      } else {
+        try { symlinkSync(nmBase, join(wtDir, "node_modules")); } catch {}
+      }
+    } catch {}
+  }
+  return wtDir;
+}
+
+function removeRunWorktree(repoDir, wtDir) {
+  if (!wtDir) return;
+  try { gitExec(repoDir, ["worktree", "remove", "--force", wtDir]); } catch {}
+  try { rmSync(wtDir, { recursive: true, force: true }); } catch {}
+}
+
 server.registerTool("e2e_run", {
   description: "Déclenche un run E2E Playwright sur un repo applicatif (cible externe déployée, ex. préprod) puis IMPORTE le résultat dans le registre. Le test est une entité de 1er niveau : passer e2eTestId (ou laisser specPattern pour un run libre). origin : task|recette|manual (défaut manual, task si taskId fourni). Le verdict lu par l'IA est le RAPPORT TEXTE ; la vidéo est une preuve humaine.",
   inputSchema: {
@@ -1386,8 +1471,9 @@ server.registerTool("e2e_run", {
     pwArgs: z.array(z.string()).optional().describe("Arguments Playwright supplémentaires transmis après '--' (ex: ['--project=authenticated']). Sans collision avec 'project' (projet du REGISTRE oniria/mada-talk), ni avec 'playwrightConfig'."),
     paramValues: z.record(z.string(), z.string()).optional().describe("Surcharge des paramètres du test au run (ex. {'baseUrl':'…'} ; les défauts du test sont appliqués sinon)."),
     secretNames: z.array(z.string()).optional().describe("Noms des secrets E2E du projet à injecter au run (défaut : TOUS les secrets du projet). Les valeurs sont déchiffrées en interne et posées dans process.env du run — jamais persistées ni retournées."),
+    runFromRef: z.string().optional().describe("Si le spec du test est ABSENT du repoDir (branche non mergée / checkout périmé) : ref git (branche distante 'origin/...' ou commit sha) depuis laquelle créer un WORKTREE temporaire et y exécuter le run. Le spec + helpers + config sont pris au commit. Sinon, sans cette option, e2e_run renvoie une erreur pré-vol listant les origines git du spec."),
   },
-}, async ({ project, repoDir, baseUrl, taskId, origin, e2eTestId, specPattern, playwrightConfig, pwArgs, paramValues, secretNames }) => {
+}, async ({ project, repoDir, baseUrl, taskId, origin, e2eTestId, specPattern, playwrightConfig, pwArgs, paramValues, secretNames, runFromRef }) => {
   try {
     if (!repoDir || !existsSync(join(repoDir, "package.json"))) return err(`repoDir invalide ou sans package.json : ${repoDir}`);
     const env = loadE2EEnv();
@@ -1404,6 +1490,44 @@ server.registerTool("e2e_run", {
       pattern = pattern || targetTest.specFile;
       for (const p of targetTest.params || []) {
         if (p.defaultValue && paramOverrides[p.name] === undefined) paramOverrides[p.name] = p.defaultValue;
+      }
+    }
+    // --- PRÉ-VOL (solution long terme « spec absent du checkout ») -----------
+    // Le spec cible doit exister dans le repoDir où Playwright va s'exécuter.
+    // S'il est absent (branche non mergée, checkout périmé) :
+    //   - si runFromRef est fourni → worktree temporaire au commit et run là-bas ;
+    //   - sinon → recherche git et erreur structurée listant les origines.
+    let effectiveRepoDir = repoDir;
+    let worktreeToClean = null;
+    if (targetTest && targetTest.specFile) {
+      const specAbsent = !existsSync(join(repoDir, targetTest.specFile));
+      if (specAbsent) {
+        if (runFromRef && String(runFromRef).trim()) {
+          const ref = String(runFromRef).trim();
+          const sha = gitExec(repoDir, ["rev-parse", "--verify", `${ref}^{commit}`]);
+          if (!sha) return err(`ref introuvable pour le worktree : ${ref} (branche fetchée ?)`);
+          try {
+            effectiveRepoDir = createRunWorktree(repoDir, sha, resolvedProject);
+            worktreeToClean = effectiveRepoDir;
+            pattern = pattern || targetTest.specFile;
+          } catch (e) { return err(`worktree impossible : ${e.message}`); }
+        } else {
+          // Recherche git des origines du spec (sans créer de worktree).
+          const candidates = locateSpecInGit(repoDir, targetTest.specFile);
+          if (candidates && candidates.length) {
+            return err(JSON.stringify({
+              code: "SPEC_NOT_IN_CHECKOUT",
+              message: `Le spec « ${targetTest.specFile} » est absent du checkout ${repoDir} (HEAD=${(gitExec(repoDir, ["rev-parse", "--short", "HEAD"]) || "?")}). Il existe dans l'historique git — relancer avec runFromRef=<sha> pour créer un worktree temporaire et l'y exécuter.`,
+              specFile: targetTest.specFile,
+              repoDir,
+              candidates,
+            }));
+          }
+          if (candidates === null) {
+            return err(`spec absent du checkout ${repoDir} et dépôt non git : ${targetTest.specFile}`);
+          }
+          return err(`spec absent du checkout ${repoDir} et introuvable dans l'historique git : ${targetTest.specFile}`);
+        }
       }
     }
     const runOrigin = origin || (taskId ? "task" : "manual");
@@ -1466,11 +1590,14 @@ server.registerTool("e2e_run", {
         if (val !== null) { runEnv[v.name] = val; injectedSecrets.push(v.name); }
       } catch {}
     }
-    execFileSync("node", args, { cwd: repoDir, env: runEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 });
+    execFileSync("node", args, { cwd: effectiveRepoDir, env: runEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 });
     // Import automatique du run dans le registre.
     const runDir = join("/root/orchestrator-panel/storage/e2e/inbox", runId);
     const manifestPath = join(runDir, "manifest.json");
-    if (!existsSync(manifestPath)) return err(`run exécuté mais manifest absent : ${manifestPath}`);
+    if (!existsSync(manifestPath)) {
+      try { if (worktreeToClean) removeRunWorktree(repoDir, worktreeToClean); } catch {}
+      return err(`run exécuté mais manifest absent : ${manifestPath}`);
+    }
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
     // Anti-fantôme : un placeholder « (aucun test exécuté) » (spec "—") n'est
     // PAS une entrée de test — on le saute toujours (défense vs vieux manifs).
@@ -1479,6 +1606,7 @@ server.registerTool("e2e_run", {
     );
     if (!realResults.length) {
       try { rmSync(runDir, { recursive: true, force: true }); } catch {}
+      try { if (worktreeToClean) removeRunWorktree(repoDir, worktreeToClean); } catch {}
       const why = manifest.failedLaunch
         ? (manifest.launchError || "échec de lancement playwright")
         : (manifest.emptyFilter ? "aucun spec ne matche le filtre (filtre vide ou spec introuvable dans le checkout)" : "aucun résultat");
@@ -1521,8 +1649,12 @@ server.registerTool("e2e_run", {
       imported.push({ e2eTestId: reg.id, executionId: rec.id, status: res.status || "ERROR", scenario: res.scenario, summary: (res.summary || "").slice(0, 300) });
     }
     try { rmSync(runDir, { recursive: true, force: true }); } catch {}
-    return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, varsInjected: injectedVars, secretsInjected: injectedSecrets, results: imported }, null, 2));
-  } catch (e) { return err(e.message); }
+    try { if (worktreeToClean) removeRunWorktree(repoDir, worktreeToClean); } catch {}
+    return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, varsInjected: injectedVars, secretsInjected: injectedSecrets, worktreeUsed: worktreeToClean ? true : false, results: imported }, null, 2));
+  } catch (e) {
+    try { if (worktreeToClean) removeRunWorktree(repoDir, worktreeToClean); } catch {}
+    return err(e.message);
+  }
 });
 
 // === e2e_sync_repo (T10 : synchronisation automatique registre ↔ repo) ===
