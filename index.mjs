@@ -265,6 +265,7 @@ server.registerTool("repo_register", {
     id: z.string().describe("Identifiant du repo (ex: mada-talk, oniria)."),
     name: z.string().optional().describe("Nom lisible."),
     description: z.string().optional().describe("À quoi sert ce repo pour le projet."),
+    deploy: z.string().optional().describe("Mécanisme de déploiement CI/CD de CE repo (texte libre, ex: workflows GitHub Actions, branches de déclenchement, cibles) — fourni en contexte à l'orchestrateur."),
     workspace: z.string().optional().describe("Workspace Coder où vit le checkout."),
     repoDir: z.string().optional().describe("Répertoire du dépôt (chemin du checkout dans/du workspace)."),
     gitPath: z.string().optional().describe("[alias] = repoDir (rétrocompat)."),
@@ -277,8 +278,8 @@ server.registerTool("repo_register", {
   },
 }, async (args) => {
   try {
-    const { id, name, description, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy } = args;
-    const repo = await registerRepo({ id, name, description, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
+    const { id, name, description, deploy, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy } = args;
+    const repo = await registerRepo({ id, name, description, deploy, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
     return text(JSON.stringify({ ok: true, repo }, null, 2));
   } catch (e) { return err(e.message); }
 });

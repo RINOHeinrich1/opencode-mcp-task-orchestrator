@@ -182,6 +182,7 @@ async function migrate() {
     id            TEXT PRIMARY KEY,          -- ex. mada-talk | oniria (repo PBN)
     name          TEXT,
     description   TEXT,                      -- à quoi sert ce repo pour le projet
+    deploy        TEXT,                      -- mécanisme de déploiement CI/CD de CE repo (texte libre)
     git_path      TEXT,                      -- chemin/url du dépôt git
     git_url       TEXT,
     workspace     TEXT,                      -- workspace Coder où vit le checkout
@@ -196,6 +197,7 @@ async function migrate() {
   )`);
   await pool().query("ALTER TABLE repos ADD COLUMN IF NOT EXISTS updated_at TEXT");
   await pool().query("ALTER TABLE repos ADD COLUMN IF NOT EXISTS description TEXT");
+  await pool().query("ALTER TABLE repos ADD COLUMN IF NOT EXISTS deploy TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_repos_workspace ON repos(workspace)");
   await pool().query(`CREATE TABLE IF NOT EXISTS project_repos (
     project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -444,12 +446,13 @@ export async function getTask(id) {
 export async function getTaskRepos(taskId) {
   await ensureSchema();
   const res = await pool().query(
-    `SELECT r.id, r.name, r.description, r.git_path, r.git_url, r.workspace, r.main_branch, r.e2e_repo_dir, r.e2e_base_url
+    `SELECT r.id, r.name, r.description, r.deploy, r.git_path, r.git_url, r.workspace, r.main_branch, r.e2e_repo_dir, r.e2e_base_url
      FROM repos r JOIN task_repos tr ON tr.repo_id = r.id
      WHERE tr.task_id = $1 ORDER BY r.name ASC`, [taskId],
   );
   return res.rows.map((r) => ({
-    id: r.id, name: r.name, description: r.description ?? null, repoDir: r.git_path ?? null, gitUrl: r.git_url ?? null,
+    id: r.id, name: r.name, description: r.description ?? null, deploy: r.deploy ?? null,
+    repoDir: r.git_path ?? null, gitUrl: r.git_url ?? null,
     workspace: r.workspace ?? null, mainBranch: r.main_branch ?? null,
     e2eRepoDir: r.e2e_repo_dir ?? null, e2eBaseUrl: r.e2e_base_url ?? null,
   }));
@@ -1107,7 +1110,7 @@ function rowToRepo(r) {
   let branches = r.branches;
   try { branches = branches ? JSON.parse(branches) : null; } catch { branches = r.branches ? [r.branches] : null; }
   return {
-    id: r.id, name: r.name, description: r.description ?? null,
+    id: r.id, name: r.name, description: r.description ?? null, deploy: r.deploy ?? null,
     repoDir: r.git_path ?? null,        // répertoire du dépôt (dans/du workspace Coder)
     gitPath: r.git_path ?? null,        // alias rétrocompat (== repoDir)
     gitUrl: r.git_url ?? null,
@@ -1117,19 +1120,20 @@ function rowToRepo(r) {
   };
 }
 
-export async function registerRepo({ id, name, description, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) {
+export async function registerRepo({ id, name, description, deploy, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) {
   await ensureSchema();
   if (!id) throw new Error("id requis");
   const dir = repoDir ?? gitPath ?? null; // repoDir = terme courant ; gitPath = alias
   await pool().query(
-    `INSERT INTO repos (id, name, description, git_path, git_url, workspace, branches, main_branch, e2e_repo_dir, e2e_base_url, created_at, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+    `INSERT INTO repos (id, name, description, deploy, git_path, git_url, workspace, branches, main_branch, e2e_repo_dir, e2e_base_url, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
      ON CONFLICT(id) DO UPDATE SET
        name = EXCLUDED.name, description = COALESCE(EXCLUDED.description, repos.description),
+       deploy = COALESCE(EXCLUDED.deploy, repos.deploy),
        git_path = EXCLUDED.git_path, git_url = EXCLUDED.git_url,
        workspace = EXCLUDED.workspace, branches = EXCLUDED.branches, main_branch = EXCLUDED.main_branch,
        e2e_repo_dir = EXCLUDED.e2e_repo_dir, e2e_base_url = EXCLUDED.e2e_base_url`,
-    [id, name ?? id, description ?? null, dir, gitUrl ?? null, workspace ?? null,
+    [id, name ?? id, description ?? null, deploy ?? null, dir, gitUrl ?? null, workspace ?? null,
      branches ? JSON.stringify(Array.isArray(branches) ? branches : [branches]) : null,
      mainBranch ?? null, e2eRepoDir ?? null, e2eBaseUrl ?? null, nowIso(), createdBy ?? null],
   );
