@@ -1109,34 +1109,36 @@ server.registerTool("task_delete", {
 // === e2e_test_register ===
 // === e2e_test_register (entité 1er niveau) ===
 server.registerTool("e2e_test_register", {
-  description: "Enregistre (ou réactive) un test E2E comme entité de 1er niveau — 1 enregistrement par test() Playwright. project = REPO SOURCE (où vit le spec) ; coveredProjects = projets dont le comportement est vérifié (le repo source est toujours inclus). Indépendant de toute tâche (l'association tâche se fait via e2e_test_link).",
+  description: "Enregistre (ou réactive) un test E2E comme entité de 1er niveau — 1 enregistrement par test() Playwright. project = REPO SOURCE (où vit le spec) ; coveredProjects = projets dont le comportement est vérifié (le repo source est toujours inclus). gherkin = formalisation Gherkin du comportement (test-agent). Indépendant de toute tâche (l'association tâche se fait via e2e_test_link).",
   inputSchema: {
     project: z.string().describe("Repo source (projet du dépôt où vit le spec)."),
     specFile: z.string().describe("Chemin du spec file (ex: tests/e2e/auth/login.spec.ts)."),
     scenario: z.string().describe("Titre du test() Playwright."),
     title: z.string().optional().describe("Titre court / comportement couvert."),
-    description: z.string().optional().describe("Description du comportement vérifié (multi-projets éventuel)."),
+    description: z.string().optional().describe("Description du comportement vérifié (demande libre, multi-projets éventuel)."),
+    gherkin: z.string().optional().describe("Formalisation Gherkin (Given/When/Then) du comportement — produite par test-agent."),
     coveredProjects: z.array(z.string()).optional().describe("Projets couverts par le comportement (ex. ['mada-talk','oniria'])."),
   },
-}, async ({ project, specFile, scenario, title, description, coveredProjects }) => {
+}, async ({ project, specFile, scenario, title, description, gherkin, coveredProjects }) => {
   try {
-    const t = await upsertE2ETest({ project, specFile, scenario, title, description, coveredProjects });
+    const t = await upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects });
     return text(JSON.stringify({ ok: true, test: await getE2ETest(t.id) }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 // === e2e_test_update / get / obsolete ===
 server.registerTool("e2e_test_update", {
-  description: "Met à jour le titre/description/projets couverts d'un test E2E (entité 1er niveau).",
+  description: "Met à jour le titre/description/gherkin/projets couverts d'un test E2E (entité 1er niveau).",
   inputSchema: {
     e2eTestId: z.string(),
     title: z.string().optional(),
     description: z.string().optional(),
+    gherkin: z.string().optional(),
     coveredProjects: z.array(z.string()).optional().describe("Remplace les projets couverts."),
   },
-}, async ({ e2eTestId, title, description, coveredProjects }) => {
+}, async ({ e2eTestId, title, description, gherkin, coveredProjects }) => {
   try {
-    const t = await updateE2ETestMeta({ e2eTestId, title, description, coveredProjects });
+    const t = await updateE2ETestMeta({ e2eTestId, title, description, gherkin, coveredProjects });
     return text(JSON.stringify({ ok: true, test: t }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1227,11 +1229,11 @@ server.registerTool("e2e_list", {
 
 // === e2e_test_link / unlink (association tâche ↔ test) ===
 server.registerTool("e2e_test_link", {
-  description: "Associe un test E2E à une tâche (N:N pure association). relation_type : CREATED|UPDATED|REGRESSION|EXISTING (+ reason obligatoire). Le test reste indépendant.",
+  description: "Associe un test E2E à une tâche (N:N pure association). relation_type : CREATED|UPDATED|REGRESSION|EXISTING|REQUIRED (+ reason). REQUIRED = la tâche doit être done pour que le test soit considéré PASS (contrat TDD/BDD, « bloqué par »). Le test reste indépendant.",
   inputSchema: {
     taskId: z.string(),
     e2eTestId: z.string(),
-    relationType: z.enum(["CREATED", "UPDATED", "REGRESSION", "EXISTING"]).optional(),
+    relationType: z.enum(["CREATED", "UPDATED", "REGRESSION", "EXISTING", "REQUIRED"]).optional(),
     reason: z.string().optional().describe("Justification (tracée)."),
   },
 }, async ({ taskId, e2eTestId, relationType, reason }) => {

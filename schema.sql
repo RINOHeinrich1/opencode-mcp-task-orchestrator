@@ -351,6 +351,7 @@ CREATE TABLE IF NOT EXISTS e2e_tests (
   scenario       TEXT NOT NULL,                -- titre du test()
   title          TEXT,
   description    TEXT,
+  gherkin        TEXT,                         -- formalisation Gherkin du comportement (test-agent)
   status         TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | OBSOLETE | QUARANTINE | DRAFT
   session_id     TEXT,                         -- session de création/mise à jour du test
   version        INTEGER NOT NULL DEFAULT 1,

@@ -98,6 +98,7 @@ async function migrate() {
     CONSTRAINT uq_e2e_tests_scenario UNIQUE (project, spec_file, scenario)
   )`);
   await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS description TEXT");
+  await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS gherkin TEXT");
   await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS session_id TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_tests_project ON e2e_tests(project)");
   // Projets couverts par le comportement (N:N) — inclut le repo source.
@@ -1569,19 +1570,21 @@ async function setE2EProjects(e2eTestId, project, coveredProjects) {
 
 // Enregistre (ou réactive) un test dans le référentiel central. 1 test() = 1 entité.
 // project = REPO SOURCE (où vit le spec) ; coveredProjects[] = projets couverts.
-export async function upsertE2ETest({ project, specFile, scenario, title, description, coveredProjects }) {
+export async function upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects }) {
   await ensureSchema();
   if (!project || !specFile || !scenario) throw new Error("project (repo source), specFile et scenario requis");
   const p = String(project).trim();
   const now = nowIso();
   const r = (await pool().query(
-    `INSERT INTO e2e_tests (id, project, spec_file, scenario, title, description, status, version, first_seen_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,'ACTIVE',1,$7,$7)
+    `INSERT INTO e2e_tests (id, project, spec_file, scenario, title, description, gherkin, status, version, first_seen_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE',1,$8,$8)
      ON CONFLICT (project, spec_file, scenario)
-     DO UPDATE SET title = EXCLUDED.title, description = COALESCE(EXCLUDED.description, e2e_tests.description),
-                   status = 'ACTIVE', updated_at = $7
+     DO UPDATE SET title = EXCLUDED.title,
+                   description = COALESCE(EXCLUDED.description, e2e_tests.description),
+                   gherkin = COALESCE(EXCLUDED.gherkin, e2e_tests.gherkin),
+                   status = 'ACTIVE', updated_at = $8
      RETURNING id`,
-    [e2eStableId(p, specFile, scenario), p, String(specFile).trim(), String(scenario).trim(), title ?? null, description ?? null, now],
+    [e2eStableId(p, specFile, scenario), p, String(specFile).trim(), String(scenario).trim(), title ?? null, description ?? null, gherkin ?? null, now],
   )).rows[0];
   await setE2EProjects(r.id, p, coveredProjects);
   return { id: r.id, project: p, specFile: String(specFile).trim(), scenario: String(scenario).trim() };
@@ -1615,13 +1618,14 @@ export async function setE2ETestSession({ e2eTestId, sessionId }) {
   return getE2ETest(e2eTestId);
 }
 
-export async function updateE2ETestMeta({ e2eTestId, title, description, coveredProjects }) {
+export async function updateE2ETestMeta({ e2eTestId, title, description, gherkin, coveredProjects }) {
   await ensureSchema();
   const sets = [];
   const params = [];
   const now = nowIso();
   if (title !== undefined) { params.push(title); sets.push(`title = $${params.length}`); }
   if (description !== undefined) { params.push(description); sets.push(`description = $${params.length}`); }
+  if (gherkin !== undefined) { params.push(gherkin); sets.push(`gherkin = $${params.length}`); }
   if (sets.length) {
     params.push(now, e2eTestId);
     await pool().query(`UPDATE e2e_tests SET ${sets.join(", ")}, updated_at = $${params.length - 1} WHERE id = $${params.length}`, params);
@@ -1701,6 +1705,7 @@ export async function getE2ETest(e2eTestId) {
     scenario: t.scenario,
     title: t.title,
     description: t.description,
+    gherkin: t.gherkin,
     status: t.status,
     sessionId: t.session_id,
     version: t.version,
@@ -1761,6 +1766,7 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
     scenario: r.scenario,
     title: r.title,
     description: r.description,
+    gherkin: r.gherkin,
     status: r.status,
     sessionId: r.session_id,
     projects: r.projects || [],
@@ -1775,7 +1781,7 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
 export async function listTaskE2E(taskId) {
   await ensureSchema();
   const rows = (await pool().query(
-    `SELECT t.id, t.project, t.spec_file, t.scenario, t.title, t.description, t.status, t.session_id, t.version,
+    `SELECT t.id, t.project, t.spec_file, t.scenario, t.title, t.description, t.gherkin, t.status, t.session_id, t.version,
             te.relation_type, te.reason,
             (SELECT x.status FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_status,
             (SELECT x.origin FROM e2e_executions x WHERE x.e2e_test_id = t.id AND x.task_id = $1 ORDER BY x.created_at DESC LIMIT 1) AS last_origin,
@@ -1796,6 +1802,7 @@ export async function listTaskE2E(taskId) {
       scenario: r.scenario,
       title: r.title,
       description: r.description,
+      gherkin: r.gherkin,
       status: r.status,
       sessionId: r.session_id,
       version: r.version,
