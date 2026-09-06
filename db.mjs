@@ -228,11 +228,14 @@ async function migrate() {
     PRIMARY KEY (task_id, repo_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_task_repos_repo ON task_repos(repo_id)");
-  // Backfill : les tâches existantes reçoivent les repos de leur projet.
+  // Backfill : les tâches existantes SANS repos explicites reçoivent les repos
+  // de leur projet. Ne touche PAS aux tâches qui ont déjà une sélection (une
+  // tâche restreinte à certains repos ne doit jamais être élargie par rejeu).
   await pool().query(
     `INSERT INTO task_repos (task_id, repo_id)
      SELECT t.id, pr.repo_id FROM tasks t
      JOIN project_repos pr ON pr.project_id = t.project
+     WHERE t.id NOT IN (SELECT task_id FROM task_repos)
      ON CONFLICT DO NOTHING`,
   );
 }
