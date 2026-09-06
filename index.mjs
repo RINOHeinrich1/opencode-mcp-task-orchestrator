@@ -67,10 +67,10 @@ import {
   updateE2EExecution,
   deleteRecetteItem,
   listE2EExecutions,
-  setE2ESecret,
-  listE2ESecrets,
-  getE2ESecretValue,
-  deleteE2ESecret,
+  setE2EVar,
+  listE2EVars,
+  getE2EVarValue,
+  deleteE2EVar,
   getRecette,
   getRecetteById,
   listProjectRecettes,
@@ -1432,26 +1432,38 @@ server.registerTool("e2e_run", {
     for (const [k, v] of Object.entries(env)) {
       if (/^ONIRIA_E2E_/.test(k) && !(k in process.env)) runEnv[k] = v;
     }
-    // Surcharges paramValues exposées comme variables d'environnement (les
-    // specs lisent process.env). baseUrl prioritaire sur paramValues.
-    for (const [k, v] of Object.entries(paramOverrides)) {
-      if (runEnv[k] === undefined && k !== "baseUrl") runEnv[k] = String(v);
-    }
-    // Injection des secrets du projet (module secrets) : valeurs déchiffrées
-    // posées dans process.env du run — jamais persistées dans param_values.
-    const projSecrets = await listE2ESecrets(resolvedProject);
-    const wanted = Array.isArray(secretNames) && secretNames.length
+    // Injection des vars E2E du projet (module vars/secrets unifié) :
+    //  - kind='variable'  : injectées AUTOMATIQUEMENT (défauts projet, en clair) ;
+    //  - kind='secret'    : injectées si sélectionnées (secretNames ; défaut =
+    //    toutes), valeurs déchiffrées en interne — jamais persistées.
+    // L'ordre final : variables projet < surcharges paramValues < secrets.
+    const projVars = await listE2EVars(resolvedProject);
+    const secretNamesSet = projVars.filter((v) => v.kind === "secret").map((v) => v.name);
+    const wantedSecrets = Array.isArray(secretNames) && secretNames.length
       ? secretNames.map((n) => String(n).trim()).filter(Boolean)
-      : projSecrets.map((s) => s.name);
+      : secretNamesSet;
+    const injectedVars = [];
     const injectedSecrets = [];
-    for (const s of projSecrets) {
-      if (!wanted.includes(s.name)) continue;
+    for (const v of projVars) {
+      if (v.kind !== "variable") continue;
+      if (runEnv[v.name] !== undefined) continue; // process.env prioritaire
       try {
-        const val = await getE2ESecretValue(s.project, s.name);
-        if (val !== null) {
-          runEnv[s.name] = val;
-          injectedSecrets.push(s.name);
-        }
+        const val = await getE2EVarValue(v.project, v.name);
+        if (val !== null) { runEnv[v.name] = val; injectedVars.push(v.name); }
+      } catch {}
+    }
+    // Surcharges paramValues (UI) : s'appliquent par-dessus les variables projet,
+    // mais JAMAIS sur une clé déclarée secret.
+    for (const [k, v] of Object.entries(paramOverrides)) {
+      if (k !== "baseUrl" && wantedSecrets.includes(k)) continue; // secret non surchargeable en clair
+      runEnv[k] = String(v);
+    }
+    for (const v of projVars) {
+      if (v.kind !== "secret") continue;
+      if (!wantedSecrets.includes(v.name)) continue;
+      try {
+        const val = await getE2EVarValue(v.project, v.name);
+        if (val !== null) { runEnv[v.name] = val; injectedSecrets.push(v.name); }
       } catch {}
     }
     execFileSync("node", args, { cwd: repoDir, env: runEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 });
@@ -1494,7 +1506,7 @@ server.registerTool("e2e_run", {
         reg = await upsertE2ETest({ project: resolvedProject, specFile: res.specFile, scenario: res.scenario, title: res.title, coveredProjects: [resolvedProject] });
       }
       if (taskId) await linkTaskE2E({ taskId, e2eTestId: reg.id, relationType: res.relation || "REGRESSION", reason: res.reason || "Run déclenché par la recette/vérification" });
-      const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? { ...paramOverrides, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : (injectedSecrets.length ? { secretsInjected: injectedSecrets } : null) });
+      const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? { ...paramOverrides, varsInjected: injectedVars.length ? injectedVars : undefined, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : ((injectedVars.length || injectedSecrets.length) ? { varsInjected: injectedVars.length ? injectedVars : undefined, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : null) });
       const outDir = join("/root/orchestrator-panel/storage/e2e/runs", runId);
       mkdirSync(outDir, { recursive: true });
       const reportPath = join(outDir, `report-${rec.id}.json`);
@@ -1509,7 +1521,7 @@ server.registerTool("e2e_run", {
       imported.push({ e2eTestId: reg.id, executionId: rec.id, status: res.status || "ERROR", scenario: res.scenario, summary: (res.summary || "").slice(0, 300) });
     }
     try { rmSync(runDir, { recursive: true, force: true }); } catch {}
-    return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, secretsInjected: injectedSecrets, results: imported }, null, 2));
+    return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, varsInjected: injectedVars, secretsInjected: injectedSecrets, results: imported }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
@@ -1626,45 +1638,74 @@ server.registerTool("e2e_sync_repo", {
   } catch (e) { return err(e.message); }
 });
 
-// === Secrets E2E (module secrets) — variables d'env par projet, valeur chiffrée ===
-// La valeur n'est JAMAIS retournée en clair : seule la métadonnée (name, purpose)
-// est exposée en lecture ; la valeur sert uniquement à l'injection au run.
-server.registerTool("e2e_secret_set", {
-  description: "Crée/remplace un secret E2E d'un PROJET (variable d'env injectée au run, ex. E2E_ADMIN_PASSWORD). La valeur est chiffrée (AES-256-GCM, clé root-only hors registre) et JAMAIS persistée ni retournée en clair. name = clé d'env que les specs liront via process.env.",
+// === Vars E2E (module vars/secrets unifié) — variables d'env par projet ===
+// kind = 'variable' (non sensible, clair, éditable) | 'secret' (chiffré, jamais
+// de clair en lecture). name = clé d'env injectée au run.
+server.registerTool("e2e_var_set", {
+  description: "Crée/remplace une var E2E d'un PROJET (variable d'env injectée au run, ex. E2E_ADMIN_EMAIL). kind='variable' (défaut, non sensible, stockée en clair) ou 'secret' (chiffrée AES-256-GCM, JAMAIS retournée en clair). name = clé d'env lue par les specs via process.env.",
   inputSchema: {
     project: z.string().describe("Projet (repo source / contexte d'application)."),
-    name: z.string().describe("Nom de la variable d'env (ex. E2E_ADMIN_PASSWORD, E2E_OPERATEUR_PASSWORD)."),
-    value: z.string().describe("Valeur secrète à chiffrer et stocker."),
-    purpose: z.string().optional().describe("Description libre (à quoi sert ce secret)."),
+    name: z.string().describe("Nom de la variable d'env (ex. E2E_ADMIN_EMAIL, E2E_ADMIN_PASSWORD)."),
+    value: z.string().describe("Valeur (stockée en clair si variable, chiffrée si secret)."),
+    kind: z.enum(["variable", "secret"]).optional().describe("variable (défaut) | secret."),
+    purpose: z.string().optional().describe("Description libre."),
   },
-}, async ({ project, name, value, purpose }) => {
+}, async ({ project, name, value, kind, purpose }) => {
   try {
-    const r = await setE2ESecret({ project, name, value, purpose });
+    const r = await setE2EVar({ project, name, value, kind, purpose });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("e2e_secret_list", {
-  description: "Liste les secrets E2E d'un projet (métadonnées SEULES : name, purpose, dates). Jamais la valeur en clair.",
-  inputSchema: { project: z.string().describe("Projet (repo source).") },
-}, async ({ project }) => {
+server.registerTool("e2e_var_list", {
+  description: "Liste les vars E2E d'un projet (métadonnées : name, kind, purpose, dates). La valeur d'un secret n'est JAMAIS retournée ; celle d'une variable (non sensible) est renvoyée. kind optionnel pour filtrer (variable|secret).",
+  inputSchema: {
+    project: z.string().describe("Projet (repo source)."),
+    kind: z.enum(["variable", "secret"]).optional().describe("Filtre par type."),
+  },
+}, async ({ project, kind }) => {
   try {
-    const secrets = await listE2ESecrets(project);
-    return text(JSON.stringify({ ok: true, project, count: secrets.length, secrets }, null, 2));
+    const vars = await listE2EVars(project, kind);
+    return text(JSON.stringify({ ok: true, project, count: vars.length, vars }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("e2e_secret_delete", {
-  description: "Supprime un secret E2E d'un projet (définitif).",
+server.registerTool("e2e_var_delete", {
+  description: "Supprime une var E2E d'un projet (définitif).",
   inputSchema: {
     project: z.string(),
     name: z.string().describe("Nom de la variable d'env à supprimer."),
   },
 }, async ({ project, name }) => {
   try {
-    const r = await deleteE2ESecret({ project, name });
+    const r = await deleteE2EVar({ project, name });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
+});
+
+// Alias rétrocompat (module secrets v0.8.6) — mêmes fonctions, kind=secret forcé.
+server.registerTool("e2e_secret_set", {
+  description: "[alias] Crée/remplace un secret E2E d'un projet (kind='secret', chiffré AES-256-GCM). Préférer e2e_var_set.",
+  inputSchema: { project: z.string(), name: z.string(), value: z.string(), purpose: z.string().optional() },
+}, async ({ project, name, value, purpose }) => {
+  try { return text(JSON.stringify({ ok: true, ...(await setE2EVar({ project, name, value, kind: "secret", purpose })) }, null, 2)); }
+  catch (e) { return err(e.message); }
+});
+server.registerTool("e2e_secret_list", {
+  description: "[alias] Liste les secrets E2E d'un projet (kind='secret', jamais la valeur). Préférer e2e_var_list.",
+  inputSchema: { project: z.string() },
+}, async ({ project }) => {
+  try {
+    const vars = await listE2EVars(project, "secret");
+    return text(JSON.stringify({ ok: true, project, count: vars.length, secrets: vars }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+server.registerTool("e2e_secret_delete", {
+  description: "[alias] Supprime un secret E2E d'un projet. Préférer e2e_var_delete.",
+  inputSchema: { project: z.string(), name: z.string() },
+}, async ({ project, name }) => {
+  try { return text(JSON.stringify({ ok: true, ...(await deleteE2EVar({ project, name })) }, null, 2)); }
+  catch (e) { return err(e.message); }
 });
 
 // === main ===

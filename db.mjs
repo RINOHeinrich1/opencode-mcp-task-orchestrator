@@ -140,19 +140,29 @@ async function migrate() {
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_test ON e2e_executions(e2e_test_id)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_origin ON e2e_executions(origin)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_created ON e2e_executions(created_at)");
-  // Secrets E2E (module secrets, cadrage 08 v2) : variables d'env par PROJET,
-  // valeur CHIFFRÉE (AES-256-GCM, clé root-only hors registre). Le nom = la
-  // clé d'env injectée au run (ex. E2E_ADMIN_PASSWORD). Jamais en clair.
-  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_secrets (
+  // Vars E2E (module vars/secrets unifié, cadrage 08 v3) : variables d'env par
+  // PROJET. kind = 'variable' (non sensible, valeur en clair dans `value`) |
+  // 'secret' (chiffré AES-256-GCM dans `value_enc`, clé root-only hors registre).
+  // name = clé d'env injectée au run (ex. E2E_ADMIN_EMAIL, E2E_ADMIN_PASSWORD).
+  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_vars (
     project      TEXT NOT NULL,
     name         TEXT NOT NULL,
-    value_enc    TEXT NOT NULL,           -- base64url(iv):base64url(tag):base64url(data)
-    purpose      TEXT,                    -- description libre (à quoi sert le secret)
+    kind         TEXT NOT NULL DEFAULT 'variable',   -- variable | secret
+    value        TEXT,                               -- en clair (kind=variable)
+    value_enc    TEXT,                               -- chiffré (kind=secret)
+    purpose      TEXT,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     PRIMARY KEY (project, name)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_secrets_project ON e2e_secrets(project)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_vars_project ON e2e_vars(project)");
+  // Migration rétrocompat : la table e2e_secrets (v0.8.6) devient e2e_vars.
+  await pool().query(
+    `INSERT INTO e2e_vars (project, name, kind, value_enc, purpose, created_at, updated_at)
+     SELECT project, name, 'secret', value_enc, purpose, created_at, updated_at FROM e2e_secrets
+     ON CONFLICT (project, name) DO UPDATE SET kind = 'secret', value_enc = EXCLUDED.value_enc, purpose = COALESCE(EXCLUDED.purpose, e2e_vars.purpose)`,
+  );
+  await pool().query("DROP TABLE IF EXISTS e2e_secrets");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
@@ -1932,49 +1942,76 @@ export async function listE2EExecutions({ e2eTestId, taskId, origin, limit = 100
 }
 
 // ===========================================================================
-// Secrets E2E (module secrets) — variables d'env par PROJET, valeur chiffrée.
+// Vars E2E (module vars/secrets unifié) — variables d'env par PROJET.
+//   kind = 'variable' : valeur non sensible, stockée EN CLAIR (`value`).
+//   kind = 'secret'   : valeur sensible, chiffrée AES-256-GCM (`value_enc`).
+// name = la clé d'env injectée au run (ex. E2E_ADMIN_EMAIL / E2E_ADMIN_PASSWORD).
 // ===========================================================================
 
-// Crée/remplace un secret de projet. La valeur est chiffrée (AES-256-GCM) avant
-// stockage ; elle n'est JAMAIS retournée en clair par les fonctions de lecture.
-export async function setE2ESecret({ project, name, value, purpose }) {
+// Crée/remplace une var de projet. kind=variable → clair ; kind=secret → chiffré.
+// Jamais de retour de valeur sensible en clair par les fonctions de lecture.
+export async function setE2EVar({ project, name, kind, value, purpose }) {
   await ensureSchema();
   if (!project || !name || value === undefined || value === null || value === "") throw new Error("project, name et value requis");
-  const { encryptSecret } = await import("./secret-crypto.mjs");
+  const k = kind === "secret" ? "secret" : "variable";
   const now = nowIso();
-  await pool().query(
-    `INSERT INTO e2e_secrets (project, name, value_enc, purpose, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$5)
-     ON CONFLICT (project, name) DO UPDATE
-       SET value_enc = EXCLUDED.value_enc,
-           purpose = COALESCE(EXCLUDED.purpose, e2e_secrets.purpose),
-           updated_at = EXCLUDED.updated_at`,
-    [String(project).trim(), String(name).trim(), encryptSecret(String(value)), purpose ?? null, now],
-  );
-  return { ok: true, project: String(project).trim(), name: String(name).trim() };
+  if (k === "secret") {
+    const { encryptSecret } = await import("./secret-crypto.mjs");
+    await pool().query(
+      `INSERT INTO e2e_vars (project, name, kind, value, value_enc, purpose, created_at, updated_at)
+       VALUES ($1,$2,'secret',NULL,$3,$4,$5,$5)
+       ON CONFLICT (project, name) DO UPDATE SET
+         kind = 'secret', value = NULL, value_enc = EXCLUDED.value_enc,
+         purpose = COALESCE(EXCLUDED.purpose, e2e_vars.purpose), updated_at = EXCLUDED.updated_at`,
+      [String(project).trim(), String(name).trim(), encryptSecret(String(value)), purpose ?? null, now],
+    );
+  } else {
+    await pool().query(
+      `INSERT INTO e2e_vars (project, name, kind, value, value_enc, purpose, created_at, updated_at)
+       VALUES ($1,$2,'variable',$3,NULL,$4,$5,$5)
+       ON CONFLICT (project, name) DO UPDATE SET
+         kind = 'variable', value = EXCLUDED.value, value_enc = NULL,
+         purpose = COALESCE(EXCLUDED.purpose, e2e_vars.purpose), updated_at = EXCLUDED.updated_at`,
+      [String(project).trim(), String(name).trim(), String(value), purpose ?? null, now],
+    );
+  }
+  return { ok: true, project: String(project).trim(), name: String(name).trim(), kind: k };
 }
 
-// Liste les secrets d'un projet — métadonnées SEULES (jamais la valeur).
-export async function listE2ESecrets(project) {
+// Liste les vars d'un projet — métadonnées SEULES, jamais la valeur secrète.
+// kind optionnel (variable | secret) pour filtrer.
+export async function listE2EVars(project, kind) {
   await ensureSchema();
+  const params = [String(project).trim()];
+  let where = "project = $1";
+  if (kind === "variable" || kind === "secret") { params.push(kind); where += " AND kind = $" + params.length; }
   const rows = (await pool().query(
-    "SELECT project, name, purpose, created_at, updated_at FROM e2e_secrets WHERE project = $1 ORDER BY name",
-    [String(project).trim()],
+    `SELECT project, name, kind, value, purpose, created_at, updated_at FROM e2e_vars WHERE ${where} ORDER BY name`,
+    params,
   )).rows;
-  return rows.map((r) => ({ project: r.project, name: r.name, purpose: r.purpose, createdAt: r.created_at, updatedAt: r.updated_at }));
+  return rows.map((r) => ({
+    project: r.project,
+    name: r.name,
+    kind: r.kind,
+    value: r.kind === "variable" ? r.value : null, // secret : jamais de clair
+    purpose: r.purpose,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }));
 }
 
-// Retourne la valeur DÉCHIFFRÉE d'un secret (usage interne : injection au run).
-export async function getE2ESecretValue(project, name) {
+// Retourne la valeur d'une var (déchiffrée si secret) — usage interne : injection run.
+export async function getE2EVarValue(project, name) {
   await ensureSchema();
-  const r = (await pool().query("SELECT value_enc FROM e2e_secrets WHERE project = $1 AND name = $2", [String(project).trim(), String(name).trim()])).rows[0];
+  const r = (await pool().query("SELECT kind, value, value_enc FROM e2e_vars WHERE project = $1 AND name = $2", [String(project).trim(), String(name).trim()])).rows[0];
   if (!r) return null;
+  if (r.kind === "variable") return r.value;
   const { decryptSecret } = await import("./secret-crypto.mjs");
   return decryptSecret(r.value_enc);
 }
 
-export async function deleteE2ESecret({ project, name }) {
+export async function deleteE2EVar({ project, name }) {
   await ensureSchema();
-  await pool().query("DELETE FROM e2e_secrets WHERE project = $1 AND name = $2", [String(project).trim(), String(name).trim()]);
+  await pool().query("DELETE FROM e2e_vars WHERE project = $1 AND name = $2", [String(project).trim(), String(name).trim()]);
   return { ok: true };
 }

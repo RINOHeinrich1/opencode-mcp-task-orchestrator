@@ -421,16 +421,20 @@ CREATE INDEX IF NOT EXISTS idx_e2e_executions_created ON e2e_executions(created_
 -- NOTE : idx_e2e_executions_origin est créé par migrate() APRÈS l'ALTER ADD COLUMN
 -- origin (rétrocompat base existante) — ne pas le déclarer ici avant l'ALTER.
 
--- Secrets E2E (module secrets) : variables d'env par PROJET, valeur CHIFFRÉE
--- (AES-256-GCM, clé root-only hors registre : ~/.config/opencode/e2e-secrets.key).
--- name = clé d'env injectée au run (ex. E2E_ADMIN_PASSWORD). Jamais en clair.
-CREATE TABLE IF NOT EXISTS e2e_secrets (
+-- Vars E2E (module vars/secrets unifié) : variables d'env par PROJET.
+-- kind = 'variable' (non sensible, valeur EN CLAIR dans value) | 'secret'
+-- (chiffré AES-256-GCM dans value_enc, clé root-only hors registre).
+-- name = clé d'env injectée au run (ex. E2E_ADMIN_EMAIL / E2E_ADMIN_PASSWORD).
+-- NOTE : l'ancienne table e2e_secrets (v0.8.6) est migrée par migrate() dans e2e_vars.
+CREATE TABLE IF NOT EXISTS e2e_vars (
   project      TEXT NOT NULL,
   name         TEXT NOT NULL,
-  value_enc    TEXT NOT NULL,   -- base64url(iv):base64url(tag):base64url(data)
+  kind         TEXT NOT NULL DEFAULT 'variable',   -- variable | secret
+  value        TEXT,                               -- en clair (kind=variable)
+  value_enc    TEXT,                               -- chiffré (kind=secret)
   purpose      TEXT,
   created_at   TEXT NOT NULL,
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (project, name)
 );
-CREATE INDEX IF NOT EXISTS idx_e2e_secrets_project ON e2e_secrets(project);
+CREATE INDEX IF NOT EXISTS idx_e2e_vars_project ON e2e_vars(project);
