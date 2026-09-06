@@ -189,9 +189,11 @@ async function migrate() {
     e2e_repo_dir  TEXT,                      -- checkout hôte E2E
     e2e_base_url  TEXT,
     created_at    TEXT NOT NULL,
+    updated_at    TEXT,
     created_by    TEXT,
     meta          JSONB
   )`);
+  await pool().query("ALTER TABLE repos ADD COLUMN IF NOT EXISTS updated_at TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_repos_workspace ON repos(workspace)");
   await pool().query(`CREATE TABLE IF NOT EXISTS project_repos (
     project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
