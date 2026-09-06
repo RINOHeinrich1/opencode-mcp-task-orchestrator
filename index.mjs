@@ -67,6 +67,10 @@ import {
   updateE2EExecution,
   deleteRecetteItem,
   listE2EExecutions,
+  setE2ESecret,
+  listE2ESecrets,
+  getE2ESecretValue,
+  deleteE2ESecret,
   getRecette,
   getRecetteById,
   listProjectRecettes,
@@ -1378,11 +1382,12 @@ server.registerTool("e2e_run", {
     origin: z.enum(["task", "recette", "manual", "ci", "session"]).optional().describe("Origine du déclenchement."),
     taskId: z.string().optional().describe("Tâche origine à associer (et lier si non déjà liée)."),
     specPattern: z.string().optional().describe("Regex Playwright de filtre de spec à exécuter (positionnelle, transmise après '--' ; défaut : run complet de la config). Ex: madatalk-requests-(chatbot-cycle|support-interactions-kpi|pause-resiliation)\\\\.spec\\\\.ts"),
-    playwrightConfig: z.string().optional().describe("Config Playwright dédiée (ex: playwright.madatalk-requests.recette.config.ts) — passée à Playwright via --config (placée AVANT les filtres de spec)."),
+    playwrightConfig: z.string().optional(),
     pwArgs: z.array(z.string()).optional().describe("Arguments Playwright supplémentaires transmis après '--' (ex: ['--project=authenticated']). Sans collision avec 'project' (projet du REGISTRE oniria/mada-talk), ni avec 'playwrightConfig'."),
     paramValues: z.record(z.string(), z.string()).optional().describe("Surcharge des paramètres du test au run (ex. {'baseUrl':'…'} ; les défauts du test sont appliqués sinon)."),
+    secretNames: z.array(z.string()).optional().describe("Noms des secrets E2E du projet à injecter au run (défaut : TOUS les secrets du projet). Les valeurs sont déchiffrées en interne et posées dans process.env du run — jamais persistées ni retournées."),
   },
-}, async ({ project, repoDir, baseUrl, taskId, origin, e2eTestId, specPattern, playwrightConfig, pwArgs, paramValues }) => {
+}, async ({ project, repoDir, baseUrl, taskId, origin, e2eTestId, specPattern, playwrightConfig, pwArgs, paramValues, secretNames }) => {
   try {
     if (!repoDir || !existsSync(join(repoDir, "package.json"))) return err(`repoDir invalide ou sans package.json : ${repoDir}`);
     const env = loadE2EEnv();
@@ -1431,18 +1436,54 @@ server.registerTool("e2e_run", {
     for (const [k, v] of Object.entries(paramOverrides)) {
       if (runEnv[k] === undefined && k !== "baseUrl") runEnv[k] = String(v);
     }
+    // Injection des secrets du projet (module secrets) : valeurs déchiffrées
+    // posées dans process.env du run — jamais persistées dans param_values.
+    const projSecrets = await listE2ESecrets(resolvedProject);
+    const wanted = Array.isArray(secretNames) && secretNames.length
+      ? secretNames.map((n) => String(n).trim()).filter(Boolean)
+      : projSecrets.map((s) => s.name);
+    const injectedSecrets = [];
+    for (const s of projSecrets) {
+      if (!wanted.includes(s.name)) continue;
+      try {
+        const val = await getE2ESecretValue(s.project, s.name);
+        if (val !== null) {
+          runEnv[s.name] = val;
+          injectedSecrets.push(s.name);
+        }
+      } catch {}
+    }
     execFileSync("node", args, { cwd: repoDir, env: runEnv, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, timeout: 15 * 60 * 1000 });
     // Import automatique du run dans le registre.
     const runDir = join("/root/orchestrator-panel/storage/e2e/inbox", runId);
     const manifestPath = join(runDir, "manifest.json");
     if (!existsSync(manifestPath)) return err(`run exécuté mais manifest absent : ${manifestPath}`);
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+    // Anti-fantôme : un placeholder « (aucun test exécuté) » (spec "—") n'est
+    // PAS une entrée de test — on le saute toujours (défense vs vieux manifs).
+    const realResults = (manifest.results || []).filter(
+      (res) => res && res.specFile && res.scenario && res.specFile !== "—" && res.scenario !== "(aucun test exécuté)",
+    );
+    if (!realResults.length) {
+      try { rmSync(runDir, { recursive: true, force: true }); } catch {}
+      const why = manifest.failedLaunch
+        ? (manifest.launchError || "échec de lancement playwright")
+        : (manifest.emptyFilter ? "aucun spec ne matche le filtre (filtre vide ou spec introuvable dans le checkout)" : "aucun résultat");
+      // Run CIBLÉ (e2eTestId) : on enregistre une exécution ERROR sur le test
+      // (le run a bien eu lieu mais n'a rien exécuté) — pas de nouvelle entité.
+      if (e2eTestId) {
+        const rec = await recordE2EExecution({ e2eTestId, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1 });
+        await updateE2EExecution({ executionId: rec.id, status: "ERROR", summary: `Aucun test exécuté : ${why}`.slice(0, 2000), verdictBy: "build-notify", executedAt: manifest.executedAt || new Date().toISOString() });
+        return err(`Aucun test exécuté (${why}). Exécution ERROR ${rec.id} tracée sur ${e2eTestId}.`);
+      }
+      return err(`Aucun test exécuté : ${why}`);
+    }
     const imported = [];
-    for (const res of manifest.results || []) {
+    for (const res of realResults) {
       if (!res.specFile || !res.scenario) continue;
       const reg = await upsertE2ETest({ project: resolvedProject, specFile: res.specFile, scenario: res.scenario, title: res.title, coveredProjects: (e2eTestId ? null : [resolvedProject]) });
       if (taskId) await linkTaskE2E({ taskId, e2eTestId: reg.id, relationType: res.relation || "REGRESSION", reason: res.reason || "Run déclenché par la recette/vérification" });
-      const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? paramOverrides : null });
+      const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? { ...paramOverrides, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : (injectedSecrets.length ? { secretsInjected: injectedSecrets } : null) });
       const outDir = join("/root/orchestrator-panel/storage/e2e/runs", runId);
       mkdirSync(outDir, { recursive: true });
       const reportPath = join(outDir, `report-${rec.id}.json`);
@@ -1457,7 +1498,7 @@ server.registerTool("e2e_run", {
       imported.push({ e2eTestId: reg.id, executionId: rec.id, status: res.status || "ERROR", scenario: res.scenario, summary: (res.summary || "").slice(0, 300) });
     }
     try { rmSync(runDir, { recursive: true, force: true }); } catch {}
-    return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, results: imported }, null, 2));
+    return text(JSON.stringify({ ok: true, runId, origin: runOrigin, count: imported.length, secretsInjected: injectedSecrets, results: imported }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
@@ -1571,6 +1612,47 @@ server.registerTool("e2e_sync_repo", {
       obsolete: obsolete.length, unchanged: updatedSpecs.size,
       detail: dry ? { created, reactivated, obsolete } : undefined,
     }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === Secrets E2E (module secrets) — variables d'env par projet, valeur chiffrée ===
+// La valeur n'est JAMAIS retournée en clair : seule la métadonnée (name, purpose)
+// est exposée en lecture ; la valeur sert uniquement à l'injection au run.
+server.registerTool("e2e_secret_set", {
+  description: "Crée/remplace un secret E2E d'un PROJET (variable d'env injectée au run, ex. E2E_ADMIN_PASSWORD). La valeur est chiffrée (AES-256-GCM, clé root-only hors registre) et JAMAIS persistée ni retournée en clair. name = clé d'env que les specs liront via process.env.",
+  inputSchema: {
+    project: z.string().describe("Projet (repo source / contexte d'application)."),
+    name: z.string().describe("Nom de la variable d'env (ex. E2E_ADMIN_PASSWORD, E2E_OPERATEUR_PASSWORD)."),
+    value: z.string().describe("Valeur secrète à chiffrer et stocker."),
+    purpose: z.string().optional().describe("Description libre (à quoi sert ce secret)."),
+  },
+}, async ({ project, name, value, purpose }) => {
+  try {
+    const r = await setE2ESecret({ project, name, value, purpose });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_secret_list", {
+  description: "Liste les secrets E2E d'un projet (métadonnées SEULES : name, purpose, dates). Jamais la valeur en clair.",
+  inputSchema: { project: z.string().describe("Projet (repo source).") },
+}, async ({ project }) => {
+  try {
+    const secrets = await listE2ESecrets(project);
+    return text(JSON.stringify({ ok: true, project, count: secrets.length, secrets }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("e2e_secret_delete", {
+  description: "Supprime un secret E2E d'un projet (définitif).",
+  inputSchema: {
+    project: z.string(),
+    name: z.string().describe("Nom de la variable d'env à supprimer."),
+  },
+}, async ({ project, name }) => {
+  try {
+    const r = await deleteE2ESecret({ project, name });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

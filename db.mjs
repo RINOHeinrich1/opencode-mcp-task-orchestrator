@@ -140,6 +140,19 @@ async function migrate() {
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_test ON e2e_executions(e2e_test_id)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_origin ON e2e_executions(origin)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_executions_created ON e2e_executions(created_at)");
+  // Secrets E2E (module secrets, cadrage 08 v2) : variables d'env par PROJET,
+  // valeur CHIFFRÉE (AES-256-GCM, clé root-only hors registre). Le nom = la
+  // clé d'env injectée au run (ex. E2E_ADMIN_PASSWORD). Jamais en clair.
+  await pool().query(`CREATE TABLE IF NOT EXISTS e2e_secrets (
+    project      TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    value_enc    TEXT NOT NULL,           -- base64url(iv):base64url(tag):base64url(data)
+    purpose      TEXT,                    -- description libre (à quoi sert le secret)
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (project, name)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_secrets_project ON e2e_secrets(project)");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
     id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
@@ -1916,4 +1929,52 @@ export async function listE2EExecutions({ e2eTestId, taskId, origin, limit = 100
     createdAt: r.created_at,
     paramValues: r.param_values,
   }));
+}
+
+// ===========================================================================
+// Secrets E2E (module secrets) — variables d'env par PROJET, valeur chiffrée.
+// ===========================================================================
+
+// Crée/remplace un secret de projet. La valeur est chiffrée (AES-256-GCM) avant
+// stockage ; elle n'est JAMAIS retournée en clair par les fonctions de lecture.
+export async function setE2ESecret({ project, name, value, purpose }) {
+  await ensureSchema();
+  if (!project || !name || value === undefined || value === null || value === "") throw new Error("project, name et value requis");
+  const { encryptSecret } = await import("./secret-crypto.mjs");
+  const now = nowIso();
+  await pool().query(
+    `INSERT INTO e2e_secrets (project, name, value_enc, purpose, created_at, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$5)
+     ON CONFLICT (project, name) DO UPDATE
+       SET value_enc = EXCLUDED.value_enc,
+           purpose = COALESCE(EXCLUDED.purpose, e2e_secrets.purpose),
+           updated_at = EXCLUDED.updated_at`,
+    [String(project).trim(), String(name).trim(), encryptSecret(String(value)), purpose ?? null, now],
+  );
+  return { ok: true, project: String(project).trim(), name: String(name).trim() };
+}
+
+// Liste les secrets d'un projet — métadonnées SEULES (jamais la valeur).
+export async function listE2ESecrets(project) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    "SELECT project, name, purpose, created_at, updated_at FROM e2e_secrets WHERE project = $1 ORDER BY name",
+    [String(project).trim()],
+  )).rows;
+  return rows.map((r) => ({ project: r.project, name: r.name, purpose: r.purpose, createdAt: r.created_at, updatedAt: r.updated_at }));
+}
+
+// Retourne la valeur DÉCHIFFRÉE d'un secret (usage interne : injection au run).
+export async function getE2ESecretValue(project, name) {
+  await ensureSchema();
+  const r = (await pool().query("SELECT value_enc FROM e2e_secrets WHERE project = $1 AND name = $2", [String(project).trim(), String(name).trim()])).rows[0];
+  if (!r) return null;
+  const { decryptSecret } = await import("./secret-crypto.mjs");
+  return decryptSecret(r.value_enc);
+}
+
+export async function deleteE2ESecret({ project, name }) {
+  await ensureSchema();
+  await pool().query("DELETE FROM e2e_secrets WHERE project = $1 AND name = $2", [String(project).trim(), String(name).trim()]);
+  return { ok: true };
 }
