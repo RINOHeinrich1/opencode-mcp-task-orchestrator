@@ -89,9 +89,15 @@ import {
   linkTaskSession,
   listTaskSessions,
   registerProject,
-  getProject,
   listProjects,
   deleteProject,
+  registerRepo,
+  getRepo,
+  listRepos,
+  linkRepoToProject,
+  unlinkRepoFromProject,
+  listProjectRepos,
+  listProjectsWithRepos,
   deleteTask,
   resolveDecisionAndTransition,
   resolveRecette,
@@ -219,11 +225,11 @@ server.registerTool("project_register", {
 
 // === project_list ===
 server.registerTool("project_list", {
-  description: "Liste les projets enregistrés dans le registre.",
+  description: "Liste les projets (produits) enregistrés, avec leurs repos associés (N:N — ADR 09).",
   inputSchema: {},
 }, async () => {
   try {
-    const projects = await listProjects();
+    const projects = await listProjectsWithRepos();
     return text(JSON.stringify({ count: projects.length, projects }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -232,7 +238,7 @@ server.registerTool("project_list", {
 
 // === project_delete ===
 server.registerTool("project_delete", {
-  description: "Supprime un projet du registre.",
+  description: "Supprime un projet (produit) du registre.",
   inputSchema: { id: z.string() },
 }, async ({ id }) => {
   try {
@@ -243,6 +249,74 @@ server.registerTool("project_delete", {
     return err(e.message);
   }
 });
+
+// === Repos (ADR 09) — dépôts de code physiques, rattachables à 1..N produits ===
+server.registerTool("repo_register", {
+  description: "Enregistre (ou met à jour) un REPO (dépôt de code physique : workspace, git_path, branches, checkout E2E). Indépendant des produits : il est rattaché à un ou plusieurs projets via project_repo_link.",
+  inputSchema: {
+    id: z.string().describe("Identifiant du repo (ex: mada-talk, oniria)."),
+    name: z.string().optional().describe("Nom lisible."),
+    workspace: z.string().optional().describe("Workspace Coder où vit le checkout."),
+    gitPath: z.string().optional().describe("Chemin/URL du dépôt git."),
+    gitUrl: z.string().optional(),
+    branches: z.array(z.string()).optional().describe("Branches cible(s) de déploiement (ex: ['main'], ['oniria-preprod'])."),
+    mainBranch: z.string().optional().describe("Branche de déploiement par défaut (requise pour déployer)."),
+    e2eRepoDir: z.string().optional().describe("Checkout hôte des runs E2E."),
+    e2eBaseUrl: z.string().optional().describe("URL de test par défaut."),
+    createdBy: z.string().optional(),
+  },
+}, async (args) => {
+  try {
+    const { id, name, workspace, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy } = args;
+    const repo = await registerRepo({ id, name, workspace, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
+    return text(JSON.stringify({ ok: true, repo }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("repo_list", {
+  description: "Liste tous les repos enregistrés (ADR 09).",
+  inputSchema: { projectId: z.string().optional().describe("Si fourni : repos associés à ce projet.") },
+}, async ({ projectId }) => {
+  try {
+    const repos = projectId ? await listProjectRepos(projectId) : await listRepos();
+    return text(JSON.stringify({ count: repos.length, repos }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("repo_get", {
+  description: "Détail d'un repo (ADR 09).",
+  inputSchema: { id: z.string() },
+}, async ({ id }) => {
+  try {
+    const repo = await getRepo(id);
+    if (!repo) return err(`repo inconnu : ${id}`);
+    return text(JSON.stringify({ ok: true, repo }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("project_repo_link", {
+  description: "Rattache un repo à un projet (produit) — N:N (ADR 09). Un repo peut servir plusieurs produits (ex. le repo oniria est lié à mada-talk ET oniria).",
+  inputSchema: {
+    projectId: z.string(),
+    repoId: z.string(),
+    role: z.string().optional().describe("Rôle : frontend | backend | console | outillage…"),
+  },
+}, async ({ projectId, repoId, role }) => {
+  try {
+    return text(JSON.stringify({ ok: true, ...(await linkRepoToProject({ projectId, repoId, role })) }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("project_repo_unlink", {
+  description: "Retire un repo d'un projet (ADR 09).",
+  inputSchema: { projectId: z.string(), repoId: z.string() },
+}, async ({ projectId, repoId }) => {
+  try {
+    return text(JSON.stringify({ ok: true, ...(await unlinkRepoFromProject({ projectId, repoId })) }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+
 
 // === task_get ===
 server.registerTool("task_get", {
