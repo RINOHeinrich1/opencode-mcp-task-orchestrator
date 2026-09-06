@@ -104,6 +104,13 @@ import {
   listProjectRepos,
   listProjectsWithRepos,
   deleteTask,
+  registerDoc,
+  updateDoc,
+  deleteDoc,
+  getDoc,
+  listDocs,
+  docsForProjectContext,
+  DOC_KINDS,
   resolveDecisionAndTransition,
   resolveRecette,
   resetRecette,
@@ -313,6 +320,87 @@ server.registerTool("repo_delete", {
     const r = await deleteRepo(id);
     if (!r) return err(`repo inconnu : ${id}`);
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === Documents de référence (ADR-12) : contexte architecture & comportement ===
+// Registre générique N:N docs ⇄ projets et/ou repos. Un doc n'a PAS de contenu
+// en base : `path` pointe le fichier (workspace/checkout) que les agents LISENT.
+// kind : adr-tech (architecture technique : stack, archi cible, composants,
+// patterns, structure de dossiers) | specs-fonctionnelles (User stories + règles
+// métier) | scenarios-gherkin (scénarios Gherkin).
+server.registerTool("doc_register", {
+  description: "Enregistre un DOCUMENT de référence (ADR-12) — registre générique N:N rattaché à un projet et/ou un repo. kind : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin. path = chemin du fichier (workspace Coder / checkout) que les agents liront en contexte — jamais de contenu en base.",
+  inputSchema: {
+    kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]),
+    title: z.string().optional().describe("Titre lisible (ex. 'ADR — Architecture madatalk')."),
+    path: z.string().describe("Chemin du fichier (ex. /home/coder/mada-talk/docs/adr-technique.md ou tests/docs/specs.md)."),
+    description: z.string().optional(),
+    projectId: z.string().optional().describe("Projet (produit) rattaché."),
+    repoId: z.string().optional().describe("Repo (dépôt de code) rattaché."),
+    createdBy: z.string().optional(),
+  },
+}, async ({ kind, title, path, description, projectId, repoId, createdBy }) => {
+  try {
+    const doc = await registerDoc({ kind, title, path, description, projectId, repoId, createdBy });
+    return text(JSON.stringify({ ok: true, doc }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("doc_update", {
+  description: "Met à jour un document de référence (ADR-12) — titre/kind/path/description + rattachements (addProjectId/addRepoId).",
+  inputSchema: {
+    docId: z.string(),
+    kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
+    title: z.string().optional(),
+    path: z.string().optional(),
+    description: z.string().optional(),
+    addProjectId: z.string().optional(),
+    addRepoId: z.string().optional(),
+  },
+}, async ({ docId, kind, title, path, description, addProjectId, addRepoId }) => {
+  try {
+    const doc = await updateDoc({ docId, kind, title, path, description, addProjectId, addRepoId });
+    if (!doc) return err(`doc inconnu : ${docId}`);
+    return text(JSON.stringify({ ok: true, doc }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("doc_delete", {
+  description: "Supprime un document de référence (ADR-12). Ne supprime aucun projet/repo.",
+  inputSchema: { docId: z.string() },
+}, async ({ docId }) => {
+  try {
+    const r = await deleteDoc(docId);
+    if (!r) return err(`doc inconnu : ${docId}`);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("doc_get", {
+  description: "Détail d'un document de référence (ADR-12).",
+  inputSchema: { docId: z.string() },
+}, async ({ docId }) => {
+  try {
+    const doc = await getDoc(docId);
+    if (!doc) return err(`doc inconnu : ${docId}`);
+    return text(JSON.stringify({ ok: true, doc }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("doc_list", {
+  description: "Liste les documents de référence (ADR-12). Filtres : kind, projet (projectId), repo (repoId), includeRepoDocs (docs des repos du projet inclus — contexte projet). Chaque doc expose projects[] et repos[] (cibles).",
+  inputSchema: {
+    kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
+    projectId: z.string().optional().describe("Si fourni : docs rattachés au projet."),
+    repoId: z.string().optional().describe("Si fourni : docs rattachés au repo."),
+    includeRepoDocs: z.boolean().optional().describe("Avec projectId : inclure les docs des repos du projet (contexte projet complet)."),
+    limit: z.number().int().optional(),
+  },
+}, async ({ kind, projectId, repoId, includeRepoDocs, limit }) => {
+  try {
+    const docs = await listDocs({ kind, projectId, repoId, includeRepoDocs, limit });
+    return text(JSON.stringify({ count: docs.length, docs }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

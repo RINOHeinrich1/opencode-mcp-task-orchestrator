@@ -208,6 +208,36 @@ async function migrate() {
     PRIMARY KEY (project_id, repo_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_project_repos_repo ON project_repos(repo_id)");
+  // =========================================================================
+  // ADR-12 — Documents de référence (contexte architecture & comportement).
+  // Registre générique N:N : un DOCUMENT (kind = adr-tech | specs-fonctionnelles
+  // | scenarios-gherkin, chemin + titre) est rattaché à des projets ET/OU des
+  // repos (N:N). Il n'y a PAS de contenu en base : le `path` pointe le fichier
+  // (workspace Coder / checkout) que les agents LISENT en contexte (test-agent à
+  // la création d'un test, agent-recette en début de recette).
+  // =========================================================================
+  await pool().query(`CREATE TABLE IF NOT EXISTS docs (
+    id          TEXT PRIMARY KEY,          -- doc-<ts>-<rand>
+    kind        TEXT NOT NULL,             -- adr-tech | specs-fonctionnelles | scenarios-gherkin
+    title       TEXT,
+    path        TEXT NOT NULL,             -- chemin du fichier (lu par l'agent)
+    description TEXT,
+    created_at  TEXT NOT NULL,
+    created_by  TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_docs_kind ON docs(kind)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS doc_projects (
+    doc_id     TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (doc_id, project_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_projects_project ON doc_projects(project_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS doc_repos (
+    doc_id  TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+    repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    PRIMARY KEY (doc_id, repo_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_repos_repo ON doc_repos(repo_id)");
   // --- Backfill idempotent depuis projects (ne supprime rien) ---------------
   // Chaque projet existant avec des données repo physiques (workspace ou
   // git_path non nul) génère un repo homonyme + l'association au produit.
@@ -1110,7 +1140,9 @@ export async function registerProject({ id, name, workspace, gitPath, mainBranch
 export async function getProject(id) {
   await ensureSchema();
   const res = await pool().query("SELECT * FROM projects WHERE id = $1", [id]);
-  return rowToProject(res.rows[0]);
+  const p = rowToProject(res.rows[0]);
+  if (p) p.docs = await docsForProjectContext(id); // ADR-12 : contexte architecture & comportement
+  return p;
 }
 
 export async function listProjects() {
@@ -1183,13 +1215,31 @@ export async function registerRepo({ id, name, description, deploy, workspace, r
 export async function getRepo(id) {
   await ensureSchema();
   const res = await pool().query("SELECT * FROM repos WHERE id = $1", [id]);
-  return rowToRepo(res.rows[0]);
+  const r = rowToRepo(res.rows[0]);
+  if (r) r.docs = await listDocs({ repoId: id }); // ADR-12 : docs du repo
+  return r;
 }
 
 export async function listRepos() {
   await ensureSchema();
   const res = await pool().query("SELECT * FROM repos ORDER BY name ASC");
-  return res.rows.map(rowToRepo);
+  const rows = res.rows.map(rowToRepo);
+  // ADR-12 : docs rattachés à chaque repo (lecture groupée).
+  if (rows.length) {
+    const map = {};
+    const docs = (await pool().query(
+      "SELECT d.*, dr.repo_id AS rid FROM docs d JOIN doc_repos dr ON dr.doc_id = d.id ORDER BY d.kind, d.title NULLS LAST",
+    )).rows;
+    const enriched = await enrichDocs(docs);
+    const byRepo = {};
+    for (const d of docs) (byRepo[d.rid] = byRepo[d.rid] || []).push(d.id);
+    const byId = {};
+    for (const e of enriched) byId[e.docId] = e;
+    for (const r of rows) {
+      r.docs = (byRepo[r.id] || []).map((id) => byId[id]).filter(Boolean);
+    }
+  }
+  return rows;
 }
 
 // Associe un repo à un projet (N:N). Rôle optionnel (frontend/backend/console/outillage).
@@ -1229,7 +1279,233 @@ export async function listProjectsWithRepos() {
     if (!map.has(a.project_id)) map.set(a.project_id, []);
     map.get(a.project_id).push({ repoId: a.repo_id, role: a.role ?? null });
   }
-  return projects.map((p) => ({ ...p, repos: (map.get(p.id) || []).map((x) => x.repoId) }));
+  // ADR-12 : docs applicables par projet (docs du projet + docs de ses repos).
+  const repoIdsByProject = {};
+  for (const p of projects) repoIdsByProject[p.id] = (map.get(p.id) || []).map((x) => x.repoId);
+  const allProjectIds = projects.map((p) => p.id);
+  const allRepoIds = [...new Set(Object.values(repoIdsByProject).flat())];
+  const docsByTarget = await docsByProjectRepoBatch(allProjectIds, allRepoIds);
+  return projects.map((p) => ({
+    ...p,
+    repos: repoIdsByProject[p.id],
+    docs: (docsByTarget.projects[p.id] || []).concat(docsByTarget.reposForProject[p.id] || []),
+  }));
+}
+
+// Lecture groupée des docs rattachés à des projets/repos (évite le N+1).
+// Retourne { projects: {pid: [doc…]}, reposForProject: {pid: [doc…]}, repos: {rid: [doc…]} }.
+async function docsByProjectRepoBatch(projectIds, repoIds) {
+  const out = { projects: {}, reposForProject: {}, repos: {} };
+  const enrich = async (rows) => enrichDocs(rows);
+  if (projectIds.length) {
+    const rows = (await pool().query(
+      `SELECT DISTINCT d.* FROM docs d JOIN doc_projects dp ON dp.doc_id = d.id
+       WHERE dp.project_id = ANY($1) ORDER BY d.kind, d.title NULLS LAST`, [projectIds],
+    )).rows;
+    for (const e of await enrich(rows)) (out.projects[e.projects[0]] = out.projects[e.projects[0]] || []).push(e);
+  }
+  if (repoIds.length) {
+    const rows = (await pool().query(
+      `SELECT DISTINCT d.* FROM docs d JOIN doc_repos dr ON dr.doc_id = d.id
+       WHERE dr.repo_id = ANY($1) ORDER BY d.kind, d.title NULLS LAST`, [repoIds],
+    )).rows;
+    for (const e of await enrich(rows)) (out.repos[e.repos[0]] = out.repos[e.repos[0]] || []).push(e);
+  }
+  // Mappe les docs des repos vers chaque projet qui les traverse.
+  const assoc = (await pool().query("SELECT project_id, repo_id FROM project_repos")).rows;
+  for (const a of assoc) {
+    const rdocs = out.repos[a.repo_id];
+    if (rdocs && rdocs.length) {
+      const seen = new Set((out.projects[a.project_id] || []).map((d) => d.docId));
+      for (const d of rdocs) {
+        if (!seen.has(d.docId)) { (out.reposForProject[a.project_id] = out.reposForProject[a.project_id] || []).push(d); seen.add(d.docId); }
+      }
+    }
+  }
+  return out;
+}
+
+// ===========================================================================
+// ADR-12 — Documents de référence (contexte architecture & comportement).
+// Registre générique N:N docs ⇄ projets et/ou repos. `path` pointe le fichier
+// (workspace/checkout) que les agents lisent — jamais de contenu en base.
+// kind : adr-tech | specs-fonctionnelles | scenarios-gherkin.
+// ===========================================================================
+
+export const DOC_KINDS = ["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"];
+
+function rowToDoc(r) {
+  if (!r) return null;
+  return {
+    docId: r.id, kind: r.kind, title: r.title ?? null, path: r.path,
+    description: r.description ?? null, createdAt: r.created_at, createdBy: r.created_by,
+  };
+}
+
+// Retourne {docId, projectId | repoId, kind, title, path, description, createdBy}
+// — avec la cible (projet et/ou repo) pour un affichage contexte.
+function hydrateDocs(rows) {
+  const out = [];
+  for (const r of rows) out.push(rowToDoc(r));
+  return out;
+}
+
+async function docTargets(docId) {
+  const [projects, repos] = await Promise.all([
+    (await pool().query("SELECT project_id FROM doc_projects WHERE doc_id = $1 ORDER BY project_id", [docId])).rows.map((r) => r.project_id),
+    (await pool().query("SELECT repo_id FROM doc_repos WHERE doc_id = $1 ORDER BY repo_id", [docId])).rows.map((r) => r.repo_id),
+  ]);
+  return { projects, repos };
+}
+
+// Docs rattachés à des projets (N:N).
+async function getProjectsForDocs(rows) {
+  if (!rows.length) return {};
+  const ids = [...new Set(rows.map((r) => r.id))];
+  const links = (await pool().query(
+    "SELECT doc_id, project_id FROM doc_projects WHERE doc_id = ANY($1) ORDER BY project_id", [ids],
+  )).rows;
+  const map = {};
+  for (const l of links) (map[l.doc_id] = map[l.doc_id] || []).push(l.project_id);
+  return map;
+}
+
+// Docs rattachés à des repos (N:N).
+async function getReposForDocs(rows) {
+  if (!rows.length) return {};
+  const ids = [...new Set(rows.map((r) => r.id))];
+  const links = (await pool().query(
+    "SELECT doc_id, repo_id FROM doc_repos WHERE doc_id = ANY($1) ORDER BY repo_id", [ids],
+  )).rows;
+  const map = {};
+  for (const l of links) (map[l.doc_id] = map[l.doc_id] || []).push(l.repo_id);
+  return map;
+}
+
+// Un doc enrichi avec ses cibles (projets/repos). rows = lignes docs.
+async function enrichDocs(rows) {
+  if (!rows.length) return [];
+  const [projMap, repoMap] = await Promise.all([getProjectsForDocs(rows), getReposForDocs(rows)]);
+  return rows.map((r) => ({ ...rowToDoc(r), projects: projMap[r.id] || [], repos: repoMap[r.id] || [] }));
+}
+
+export async function registerDoc({ kind, title, path, description, projectId, repoId, createdBy }) {
+  await ensureSchema();
+  if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind} (attendu : ${DOC_KINDS.join(" | ")})`);
+  if (!path || !String(path).trim()) throw new Error("path (chemin du fichier) requis");
+  const k = String(kind).trim();
+  const p = String(path).trim();
+  const id = `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO docs (id, kind, title, path, description, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+    [id, k, title ? String(title).trim() : null, p, description ? String(description).trim() : null, nowIso(), createdBy ?? null],
+  );
+  if (projectId) {
+    await pool().query("INSERT INTO doc_projects (doc_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, String(projectId).trim()]);
+  }
+  if (repoId) {
+    await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, String(repoId).trim()]);
+  }
+  return getDoc(id);
+}
+
+export async function updateDoc({ docId, kind, title, path, description, addProjectId, addRepoId }) {
+  await ensureSchema();
+  const sets = [];
+  const params = [];
+  if (kind !== undefined) {
+    if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind}`);
+    params.push(kind); sets.push(`kind = $${params.length}`);
+  }
+  if (title !== undefined) { params.push(title === null ? null : String(title).trim()); sets.push(`title = $${params.length}`); }
+  if (path !== undefined) { params.push(String(path).trim()); sets.push(`path = $${params.length}`); }
+  if (description !== undefined) { params.push(description === null ? null : String(description).trim()); sets.push(`description = $${params.length}`); }
+  if (sets.length) {
+    params.push(nowIso(), docId);
+    await pool().query(`UPDATE docs SET ${sets.join(", ")} WHERE id = $${params.length - 1}`, params);
+  }
+  if (addProjectId) await pool().query("INSERT INTO doc_projects (doc_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addProjectId).trim()]);
+  if (addRepoId) await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addRepoId).trim()]);
+  return getDoc(docId);
+}
+
+export async function deleteDoc(docId) {
+  await ensureSchema();
+  const existing = await getDoc(docId);
+  if (!existing) return null;
+  await pool().query("DELETE FROM docs WHERE id = $1", [docId]);
+  return { docId, deleted: true };
+}
+
+export async function getDoc(docId) {
+  await ensureSchema();
+  const r = (await pool().query("SELECT * FROM docs WHERE id = $1", [docId])).rows[0];
+  if (!r) return null;
+  const [e] = await enrichDocs([r]);
+  return e;
+}
+
+// Liste des docs, filtrée par kind / projet / repo.
+// - projectId : docs rattachés au projet (et à ses repos ? via includeRepoDocs).
+// - repoId : docs rattachés au repo.
+export async function listDocs({ kind, projectId, repoId, includeRepoDocs = false, limit = 500 } = {}) {
+  await ensureSchema();
+  const conds = [];
+  const params = [];
+  if (kind) {
+    if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind}`);
+    params.push(kind); conds.push(`d.kind = $${params.length}`);
+  }
+  let rows;
+  if (projectId) {
+    // docs du projet + (option) docs des repos du projet (dédupliqués).
+    const prj = String(projectId);
+    if (includeRepoDocs) {
+      params.push(prj, prj);
+      rows = (await pool().query(
+        `SELECT DISTINCT d.* FROM docs d
+         WHERE d.id IN (SELECT doc_id FROM doc_projects WHERE project_id = $${params.length - 1})
+            OR d.id IN (SELECT dr.doc_id FROM doc_repos dr JOIN project_repos pr ON pr.repo_id = dr.repo_id WHERE pr.project_id = $${params.length})
+         ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`,
+        params,
+      )).rows;
+    } else {
+      params.push(prj);
+      rows = (await pool().query(
+        `SELECT DISTINCT d.* FROM docs d JOIN doc_projects dp ON dp.doc_id = d.id WHERE dp.project_id = $${params.length}
+         ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`,
+        params,
+      )).rows;
+    }
+  } else if (repoId) {
+    params.push(String(repoId));
+    rows = (await pool().query(
+      `SELECT DISTINCT d.* FROM docs d JOIN doc_repos dr ON dr.doc_id = d.id WHERE dr.repo_id = $${params.length}
+       ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`,
+      params,
+    )).rows;
+  } else {
+    rows = (await pool().query(
+      `SELECT d.* FROM docs d ${conds.length ? "WHERE " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC LIMIT ${Number(limit) || 500}`,
+      params,
+    )).rows;
+  }
+  return enrichDocs(rows);
+}
+
+// Docs applicables à un PROJET (contextes test-agent / recette) : docs portés
+// par le projet + docs portés par chacun de ses repos. Chaque doc enrichi d'une
+// liste d'origines (projectIds/repoIds) pour l'affichage contexte.
+export async function docsForProjectContext(projectId) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT DISTINCT d.* FROM docs d
+     WHERE d.id IN (SELECT doc_id FROM doc_projects WHERE project_id = $1)
+        OR d.id IN (SELECT dr.doc_id FROM doc_repos dr JOIN project_repos pr ON pr.repo_id = dr.repo_id WHERE pr.project_id = $1)
+     ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`, [projectId],
+  )).rows;
+  return enrichDocs(rows);
 }
 
 // --- Suppression physique d'une tâche et de tout son rattaché ---------------
@@ -2066,7 +2342,7 @@ export async function getE2ETest(e2eTestId) {
   await ensureSchema();
   const t = await getE2ETestRow(e2eTestId);
   if (!t) return null;
-  const [repos, projects, params, tasks, lastExec] = await Promise.all([
+  const [repos, projects, params, tasks, lastExec, docs] = await Promise.all([
     getE2ERepos(e2eTestId),
     getE2EProjects(e2eTestId),
     listE2ETestParamsRow(e2eTestId),
@@ -2077,6 +2353,7 @@ export async function getE2ETest(e2eTestId) {
       `SELECT x.status, x.origin, x.task_id, x.created_at, x.duration_ms FROM e2e_executions x
        WHERE x.e2e_test_id = $1 ORDER BY x.created_at DESC LIMIT 1`, [e2eTestId],
     )).rows[0] || null)(),
+    docsForProjectContext(t.project), // ADR-12 : docs du projet (le test peut en dépendre)
   ]);
   return {
     e2eTestId: t.id,
@@ -2095,6 +2372,7 @@ export async function getE2ETest(e2eTestId) {
     projects,       // rétrocompat ADR 08 : projets couverts (obsolète, gardé)
     params,
     linkedTasks: tasks,
+    docs,           // ADR-12 : docs de référence du projet (adr-tech/specs/gherkin)
     lastExecution: lastExec ? {
       status: lastExec.status,
       origin: lastExec.origin,
