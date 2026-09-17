@@ -664,9 +664,10 @@ server.registerTool("recette_item_add", {
 
 // === recette_item_update ===
 server.registerTool("recette_item_update", {
-  description: "Met à jour un élément de recette (classification, discussion, scope, projet cible, statut, tâche créée).",
+  description: "Met à jour un élément de recette (contenu, classification, discussion, scope, projet cible, titre, critère d'acceptation, ordre, vigilance, statut, tâche créée).",
   inputSchema: {
     itemId: z.number().int(),
+    content: z.string().optional().describe("Contenu de l'élément (remarque/demande/constat) — non vide si fourni."),
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional(),
     discussion: z.string().optional(),
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins)."),
@@ -678,9 +679,9 @@ server.registerTool("recette_item_update", {
     status: z.enum(["open", "task_created"]).optional(),
     createdTaskId: z.string().optional(),
   },
-}, async ({ itemId, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId }) => {
+}, async ({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId }) => {
   try {
-    const item = await updateRecetteItem({ itemId, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId });
+    const item = await updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);

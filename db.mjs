@@ -2045,10 +2045,14 @@ export async function addRecetteItem({ recetteId, project, content, classificati
   return getRecetteItem(Number(r.id));
 }
 
-export async function updateRecetteItem({ itemId, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId }) {
+export async function updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId }) {
   await ensureSchema();
   const sets = [];
   const params = [];
+  if (content !== undefined) {
+    if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
+    params.push(String(content).trim()); sets.push(`content = ${params.length}`);
+  }
   if (classification) { params.push(classification); sets.push(`classification = $${params.length}`); }
   if (discussion !== undefined) { params.push(discussion); sets.push(`discussion = $${params.length}`); }
   if (scope !== undefined) { params.push(scope && scope.length ? JSON.stringify(scope) : null); sets.push(`scope = $${params.length}`); }
