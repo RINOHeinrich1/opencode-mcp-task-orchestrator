@@ -50,8 +50,6 @@ import {
   listTaskLinks,
   listTaskEmergentFrom,
   startRecette,
-  addRecetteProject,
-  removeRecetteProject,
   unlinkRecetteTask,
   upsertE2ETest,
   reactivateE2ETest,
@@ -121,6 +119,24 @@ import {
   addPlanCommit,
   listPlanCommits,
   listTaskPlanCommits,
+  createBatch,
+  getBatch,
+  listBatches,
+  addBatchTask,
+  removeBatchTask,
+  setBatchSession,
+  setBatchStatus,
+  setBatchLaunchMode,
+  batchReadiness,
+  batchConflictMatrix,
+  registerOrganization,
+  listOrganizations,
+  getOrganization,
+  deleteOrganization,
+  setDefaultOrganization,
+  addOrgGitToken,
+  listOrgGitTokens,
+  deleteOrgGitToken,
 } from "./db.mjs";
 
 function text(content) {
@@ -200,6 +216,8 @@ server.registerTool("task_register", {
     repoIds: z.array(z.string()).optional().describe("Repos ciblés de la tâche (parmi ceux du projet, ADR 09). Défaut : TOUS les repos du projet."),
     originTaskId: z.string().optional().describe("Si cette tâche est ÉMERGENTE (créée hors scope pendant une tâche source) : taskId de la tâche SOURCE. La nouvelle tâche sera liée à sa source (relation_type='emergent')."),
     originReason: z.string().optional().describe("Raison de l'émergence (demande hors scope reçue pendant la tâche source)."),
+    createdBy: z.string().optional().describe("Utilisateur (username) qui crée la tâche (attribution)."),
+    organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
   },
 }, async (input) => {
   try {
@@ -227,11 +245,12 @@ server.registerTool("project_register", {
     mainBranch: z.string().optional().describe("Branche principale du projet (ex: main, oniria-preprod) — requise pour déployer."),
     e2eRepoDir: z.string().optional().describe("Checkout hôte des runs E2E (ex: /root/oniria-preprod)."),
     e2eBaseUrl: z.string().optional().describe("URL de test par défaut (ex: https://preprod.madatalk.fr)."),
+    organizationId: z.string().optional().describe("Organisation (tenant) du projet. Défaut : organisation courante."),
     createdBy: z.string().optional(),
   },
-}, async ({ id, name, workspace, gitPath, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy }) => {
+}, async ({ id, name, workspace, gitPath, mainBranch, e2eRepoDir, e2eBaseUrl, organizationId, createdBy }) => {
   try {
-    const project = await registerProject({ id, name, workspace, gitPath, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
+    const project = await registerProject({ id, name, workspace, gitPath, mainBranch, e2eRepoDir, e2eBaseUrl, organizationId, createdBy });
     return text(JSON.stringify({ ok: true, project }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -281,22 +300,23 @@ server.registerTool("repo_register", {
     mainBranch: z.string().optional().describe("Branche de déploiement par défaut (requise pour déployer)."),
     e2eRepoDir: z.string().optional().describe("Checkout hôte des runs E2E."),
     e2eBaseUrl: z.string().optional().describe("URL de test par défaut."),
+    organizationId: z.string().optional().describe("Organisation (tenant). Défaut : organisation courante."),
     createdBy: z.string().optional(),
   },
 }, async (args) => {
   try {
-    const { id, name, description, deploy, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy } = args;
-    const repo = await registerRepo({ id, name, description, deploy, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, createdBy });
+    const { id, name, description, deploy, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, organizationId, createdBy } = args;
+    const repo = await registerRepo({ id, name, description, deploy, workspace, repoDir, gitPath, gitUrl, branches, mainBranch, e2eRepoDir, e2eBaseUrl, organizationId, createdBy });
     return text(JSON.stringify({ ok: true, repo }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("repo_list", {
-  description: "Liste tous les repos enregistrés (ADR 09).",
-  inputSchema: { projectId: z.string().optional().describe("Si fourni : repos associés à ce projet.") },
+  description: "Liste tous les repos enregistrés (ADR 09). Si projectId est fourni : les repos de CE projet (associés) en premier, et chaque repo expose role + gitTokenId (token git choisi pour la liaison).",
+  inputSchema: { projectId: z.string().optional().describe("Si fourni : repos associés à ce projet (+ détails de liaison role/gitTokenId).") },
 }, async ({ projectId }) => {
   try {
-    const repos = projectId ? await listProjectRepos(projectId) : await listRepos();
+    const repos = projectId ? await listRepos(projectId) : await listRepos();
     return text(JSON.stringify({ count: repos.length, repos }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -338,11 +358,12 @@ server.registerTool("doc_register", {
     description: z.string().optional(),
     projectId: z.string().optional().describe("Projet (produit) rattaché."),
     repoId: z.string().optional().describe("Repo (dépôt de code) rattaché."),
+    organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
     createdBy: z.string().optional(),
   },
-}, async ({ kind, title, path, description, projectId, repoId, createdBy }) => {
+}, async ({ kind, title, path, description, projectId, repoId, organizationId, createdBy }) => {
   try {
-    const doc = await registerDoc({ kind, title, path, description, projectId, repoId, createdBy });
+    const doc = await registerDoc({ kind, title, path, description, projectId, repoId, organizationId, createdBy });
     return text(JSON.stringify({ ok: true, doc }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -405,15 +426,16 @@ server.registerTool("doc_list", {
 });
 
 server.registerTool("project_repo_link", {
-  description: "Rattache un repo à un projet (produit) — N:N (ADR 09). Un repo peut servir plusieurs produits (ex. le repo oniria est lié à mada-talk ET oniria).",
+  description: "Rattache un repo à un projet (produit) — N:N (ADR 09). Un repo peut servir plusieurs produits (ex. le repo oniria est lié à mada-talk ET oniria). gitTokenId : token git de l'ORGANISATION du projet à utiliser pour ce repo (clone/pull/push) — choisi parmi les gitTokens de l'organisation (org_git_token_add). Absent = inchangé (fallback token par défaut de l'org).",
   inputSchema: {
     projectId: z.string(),
     repoId: z.string(),
     role: z.string().optional().describe("Rôle : frontend | backend | console | outillage…"),
+    gitTokenId: z.string().optional().describe("Token git de l'organisation du projet à utiliser pour ce repo (choisi dans org_git_tokens)."),
   },
-}, async ({ projectId, repoId, role }) => {
+}, async ({ projectId, repoId, role, gitTokenId }) => {
   try {
-    return text(JSON.stringify({ ok: true, ...(await linkRepoToProject({ projectId, repoId, role })) }, null, 2));
+    return text(JSON.stringify({ ok: true, ...(await linkRepoToProject({ projectId, repoId, role, gitTokenId: gitTokenId || undefined })) }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
@@ -483,25 +505,26 @@ server.registerTool("task_link_remove", {
 });
 
 // === recette_start ===
- server.registerTool("recette_start", {
-  description: "Crée une opération de recette de PROJET (v0.9.0) : 1..N projets rattachés + titre + 0..N tâches couvertes + session dédiée. La recette est un objet de premier niveau rattaché à UN OU PLUSIEURS projets.",
-  inputSchema: {
-    project: z.string().optional().describe("Projet principal/historique (1er projet). Rétrocompat : requis si `projects` absent."),
-    projects: z.array(z.string()).optional().describe("Projets rattachés (1..N — recommandé). Au moins un projet est requis au total."),
-    title: z.string().optional().describe("Titre court compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
-    description: z.string().optional().describe("Description longue (détail du périmètre vérifié)."),
-    taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N)."),
-    status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
-    sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
-  },
-}, async ({ project, projects, title, description, taskIds, status, sessionId }) => {
-  try {
-    const recette = await startRecette({ project, projects, title, description, taskIds, status: status || "pending", sessionId: sessionId || null });
-    return text(JSON.stringify({ ok: true, recette }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
+  server.registerTool("recette_start", {
+   description: "Crée une opération de recette de PROJET : 1 recette = 1 PROJET unique (produit). Les REPOS TRANSVERSES du projet (project_repos, ex: mada-talk traverse le repo oniria) couvrent la portée — pas d'ajout de projets supplémentaires. + titre + 0..N tâches couvertes (du projet) + session dédiée.",
+   inputSchema: {
+     project: z.string().describe("Projet (produit) unique de la recette — ses repos transverses sont la portée."),
+     title: z.string().optional().describe("Titre court compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
+     description: z.string().optional().describe("Description longue (détail du périmètre vérifié)."),
+     taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N — doivent appartenir au projet de la recette)."),
+     status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
+     sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
+     createdBy: z.string().optional().describe("Utilisateur (username) qui crée la recette."),
+     organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
+   },
+  }, async ({ project, title, description, taskIds, status, sessionId, createdBy, organizationId }) => {
+   try {
+     const recette = await startRecette({ project, title, description, taskIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
+     return text(JSON.stringify({ ok: true, recette }, null, 2));
+   } catch (e) {
+     return err(e.message);
+   }
+ });
 
 // === recette_list ===
 server.registerTool("recette_list", {
@@ -518,7 +541,7 @@ server.registerTool("recette_list", {
 
 // === recette_get ===
 server.registerTool("recette_get", {
-  description: "Détail d'une recette (titre, projet, statut, tâches couvertes, éléments).",
+  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments).",
   inputSchema: { recetteId: z.string() },
 }, async ({ recetteId }) => {
   try {
@@ -586,7 +609,7 @@ server.registerTool("recette_doc_remove", {
 
 // === recette_link_task ===
 server.registerTool("recette_link_task", {
-  description: "Rattache une tâche à une recette (tâche couverte). Garde : la tâche doit appartenir à l'un des projets rattachés à la recette.",
+  description: "Rattache une tâche à une recette (tâche couverte). Garde : la tâche doit appartenir au PROJET de la recette (1 recette = 1 projet ; les repos transverses du projet sont la portée).",
   inputSchema: { recetteId: z.string(), taskId: z.string() },
 }, async ({ recetteId, taskId }) => {
   try {
@@ -612,50 +635,38 @@ server.registerTool("recette_unlink_task", {
   }
 });
 
-// === recette_project_add ===
-server.registerTool("recette_project_add", {
-  description: "Ajoute un projet à une recette existante (recette multi-projets : 1 recette = 1..N projets, pas de projet principal).",
-  inputSchema: { recetteId: z.string(), project: z.string().describe("Projet à rattacher à la recette.") },
-}, async ({ recetteId, project }) => {
-  try {
-    const recette = await addRecetteProject({ recetteId, project });
-    return text(JSON.stringify({ ok: true, recette }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_project_remove ===
-server.registerTool("recette_project_remove", {
-  description: "Retire un projet d'une recette existante. Refus si c'est le dernier projet, ou si la recette couvre encore des tâches de ce projet.",
-  inputSchema: { recetteId: z.string(), project: z.string().describe("Projet à retirer de la recette.") },
-}, async ({ recetteId, project }) => {
-  try {
-    const recette = await removeRecetteProject({ recetteId, project });
-    return text(JSON.stringify({ ok: true, recette }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
 // === recette_item_add ===
 server.registerTool("recette_item_add", {
-  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature), son PROJET CIBLE (1 item = 1 projet) et le périmètre (scope) suggéré.",
+  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature), son projet cible (= projet unique de la recette — les repos transverses sont des repos, pas des projets), le périmètre (scope) suggéré et, si le constat implique de faire évoluer des TESTS et/ou des DOCUMENTS de référence du projet, une intention structurée (testIntent / docIntent).",
   inputSchema: {
     recetteId: z.string(),
     content: z.string().describe("La remarque / demande / constat."),
     classification: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Nature de l'élément (défaut rework)."),
-    project: z.string().optional().describe("Projet CIBLE de l'élément (doit être l'un des projets de la recette). Défaut : premier projet de la recette."),
+    project: z.string().optional().describe("Projet cible de l'élément (= projet unique de la recette ; fourni par défaut, ignoré sinon). Les repos transverses du projet ne sont pas des projets."),
     discussion: z.string().optional().describe("Échanges associés."),
     scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins) — transmis à la tâche créée à la confirmation."),
     title: z.string().optional().describe("Titre court de la tâche qui sera créée à la confirmation."),
     acceptance: z.string().optional().describe("Critère d'acceptation / livrable attendu de la tâche qui sera créée."),
     execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = exécutable en parallèle)."),
     vigilance: z.string().optional().describe("Point de vigilance / écart sémantique détecté pour cet élément."),
+    testIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]).describe("Action sur le(s) test(s) : create (nouveau test pour le comportement voulu/bug) | update (adapter un test existant) | obsolete (test devenu obsolète)."),
+      testType: z.enum(["unit", "e2e"]).optional().describe("Type de test concerné : unit (unitaire, dans le repo) | e2e (entité E2E Playwright). Défaut unit."),
+      target: z.string().optional().describe("Cible : e2eTestId, specFile (E2E) ou chemin du test unitaire (ex. tests/mon-test.spec.ts)."),
+      scenario: z.string().optional().describe("Scénario / comportement à couvrir ou à vérifier."),
+      reason: z.string().optional().describe("Pourquoi ce besoin test (bug non couvert, comportement changé, test obsolète…)."),
+    }).optional().describe("Intention test structurée — à renseigner quand le constat requiert d'ajouter/modifier/obsoléter un test du projet pour couvrir le comportement voulu ou le bug détecté."),
+    docIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]).describe("Action sur le(s) document(s) de référence : update (mettre à jour) | create (documenter une règle nouvelle) | obsolete (document devenu obsolète)."),
+      docType: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional().describe("Type de document concerné (ADR-12) : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin (scénarios BDD)."),
+      target: z.string().optional().describe("Cible : docId ou chemin du document à faire évoluer."),
+      summary: z.string().optional().describe("Ce que le document doit refléter après la recette."),
+      reason: z.string().optional().describe("Pourquoi ce besoin doc (la recette rend un document inexact/obsolète, ou une règle doit être documentée)."),
+    }).optional().describe("Intention document structurée — à renseigner quand une décision de recette impose de mettre à jour/créer/obsoléter un document de référence du projet (ADR technique, specs fonctionnelles, scénarios Gherkin)."),
   },
-}, async ({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance }) => {
+}, async ({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent }) => {
   try {
-    const item = await addRecetteItem({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance });
+    const item = await addRecetteItem({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -664,7 +675,7 @@ server.registerTool("recette_item_add", {
 
 // === recette_item_update ===
 server.registerTool("recette_item_update", {
-  description: "Met à jour un élément de recette (contenu, classification, discussion, scope, projet cible, titre, critère d'acceptation, ordre, vigilance, statut, tâche créée).",
+  description: "Met à jour un élément de recette (contenu, classification, discussion, scope, projet cible, titre, critère d'acceptation, ordre, vigilance, intentions test/document, statut, tâche créée).",
   inputSchema: {
     itemId: z.number().int(),
     content: z.string().optional().describe("Contenu de l'élément (remarque/demande/constat) — non vide si fourni."),
@@ -676,12 +687,26 @@ server.registerTool("recette_item_update", {
     acceptance: z.string().optional(),
     execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = parallèle)."),
     vigilance: z.string().optional().describe("Point de vigilance / écart sémantique."),
+    testIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]),
+      testType: z.enum(["unit", "e2e"]).optional(),
+      target: z.string().optional(),
+      scenario: z.string().optional(),
+      reason: z.string().optional(),
+    }).optional().describe("Intention test structurée (remplace l'existante ; null/absent ne la change pas)."),
+    docIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]),
+      docType: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
+      target: z.string().optional(),
+      summary: z.string().optional(),
+      reason: z.string().optional(),
+    }).optional().describe("Intention document structurée (remplace l'existante ; null/absent ne la change pas)."),
     status: z.enum(["open", "task_created"]).optional(),
     createdTaskId: z.string().optional(),
   },
-}, async ({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId }) => {
+}, async ({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId }) => {
   try {
-    const item = await updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, status, createdTaskId });
+    const item = await updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -711,6 +736,255 @@ server.registerTool("recette_confirm", {
   try {
     const recette = await confirmRecette({ recetteId, confirmedBy });
     return text(JSON.stringify({ ok: true, recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === batch (v0.9.0) : orchestration multi-tâches — une session, N tâches ===
+// Phase 1 : lecture + enregistrement (aucun auto-avancement). Readiness et
+// matrice de conflit fichiers sont CALCULÉES à la volée.
+server.registerTool("batch_register", {
+  description: "Enregistre un batch d'orchestration : groupe de tâches pilotées par une session d'orchestration unique. Source naturelle = recette (recetteId) ou ad-hoc. maxParallel = plafond d'écrivains simultanés (défaut 2). launchMode : batch (le worker batch-pilot lance les tâches automatiquement) | session (une session orchestrateur unique pilote le batch) | manual (aucun auto-lancement — l'utilisateur lance chaque tâche).",
+  inputSchema: {
+    project: z.string().describe("Projet (produit) cible du batch."),
+    title: z.string().describe("Titre court du batch."),
+    recetteId: z.string().optional().describe("Recette source (si le batch regroupe les tâches d'une recette)."),
+    taskIds: z.array(z.string()).optional().describe("Tâches du batch (0..N)."),
+    maxParallel: z.number().int().min(1).max(8).optional().describe("Plafond d'écrivains simultanés (défaut 2)."),
+    launchMode: z.enum(["batch", "session", "manual"]).optional().describe("Mode de lancement (défaut batch)."),
+    sessionId: z.string().optional().describe("Session d'orchestration unique (rattachée après lancement)."),
+    createdBy: z.string().optional(),
+  },
+}, async ({ project, title, recetteId, taskIds, maxParallel, launchMode, sessionId, createdBy }) => {
+  try {
+    const batch = await createBatch({ project, title, recetteId, taskIds, maxParallel: maxParallel || 2, launchMode: launchMode || "batch", sessionId: sessionId || null, createdBy });
+    return text(JSON.stringify({ ok: true, batch }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_set_launch_mode", {
+  description: "Change le mode de lancement d'un batch : batch (worker auto) | session (session unique) | manual (aucun auto).",
+  inputSchema: { batchId: z.string(), launchMode: z.enum(["batch", "session", "manual"]) },
+}, async ({ batchId, launchMode }) => {
+  try {
+    const batch = await setBatchLaunchMode(batchId, launchMode);
+    return text(JSON.stringify({ ok: true, batch }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_get", {
+  description: "Détail d'un batch : tâches, readiness (qui est prêt/bloqué/en cours) et matrice de conflit fichiers (tâches qui se chevauchent).",
+  inputSchema: { batchId: z.string() },
+}, async ({ batchId }) => {
+  try {
+    const batch = await getBatch(batchId);
+    if (!batch) return err(`batch inconnu : ${batchId}`);
+    return text(JSON.stringify({ batch }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_list", {
+  description: "Liste les batches (tous ou filtrés par projet).",
+  inputSchema: { project: z.string().optional() },
+}, async ({ project }) => {
+  try {
+    const batches = await listBatches(project);
+    return text(JSON.stringify({ count: batches.length, batches }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_add_task", {
+  description: "Ajoute une tâche à un batch.",
+  inputSchema: { batchId: z.string(), taskId: z.string() },
+}, async ({ batchId, taskId }) => {
+  try {
+    const batch = await addBatchTask(batchId, taskId);
+    return text(JSON.stringify({ ok: true, batch }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_remove_task", {
+  description: "Retire une tâche d'un batch.",
+  inputSchema: { batchId: z.string(), taskId: z.string() },
+}, async ({ batchId, taskId }) => {
+  try {
+    const batch = await removeBatchTask(batchId, taskId);
+    return text(JSON.stringify({ ok: true, batch }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_set_session", {
+  description: "Rattache (ou retire) la session d'orchestration unique d'un batch.",
+  inputSchema: { batchId: z.string(), sessionId: z.string().optional() },
+}, async ({ batchId, sessionId }) => {
+  try {
+    const batch = await setBatchSession(batchId, sessionId || null);
+    return text(JSON.stringify({ ok: true, batch }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_set_status", {
+  description: "Change le statut d'un batch : active | completed | aborted.",
+  inputSchema: { batchId: z.string(), status: z.enum(["active", "completed", "aborted"]) },
+}, async ({ batchId, status }) => {
+  try {
+    const batch = await setBatchStatus(batchId, status);
+    return text(JSON.stringify({ ok: true, batch }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_readiness", {
+  description: "Readiness d'un batch (Phase 3 — granularité ÉTAPE) : pour chaque tâche — active/done, dépendances non satisfaites, étapes todo bloquées par une étape d'une autre tâche (blockedSteps), tâches interleavables, et « ready » (prêt à lancer : deps satisfaites + aucune étape bloquée).",
+  inputSchema: { batchId: z.string() },
+}, async ({ batchId }) => {
+  try {
+    const readiness = await batchReadiness(batchId);
+    return text(JSON.stringify({ batchId, readiness }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("batch_conflict_matrix", {
+  description: "Matrice de conflit fichiers d'un batch (Phase 3 — granularité ÉTAPE) : paires de tâches dont des ÉTAPES de plan se chevauchent sur des fichiers (déclarés par étape + réels via commits). Une paire sans conflit d'étape est interleavable.",
+  inputSchema: { batchId: z.string() },
+}, async ({ batchId }) => {
+  try {
+    const matrix = await batchConflictMatrix(batchId);
+    return text(JSON.stringify({ batchId, conflictMatrix: matrix }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === organisations (v0.9.47) — tenant de premier niveau ======================
+server.registerTool("org_register", {
+  description: "Enregistre (ou met à jour) une ORGANISATION (tenant) : id (slug), nom, description. Les entités de 1er niveau (projets, repos, tâches, recettes, tests, docs, artefacts) portent organization_id.",
+  inputSchema: {
+    id: z.string().describe("Identifiant/slug de l'organisation (ex. onirtech)."),
+    name: z.string().describe("Nom lisible (ex. ONIRTECH)."),
+    description: z.string().optional().describe("Description de l'organisation."),
+    isDefault: z.boolean().optional().describe("Définir cette organisation comme organisation par défaut (seule à configurer l'écosystème)."),
+    coderUrl: z.string().optional().describe("URL du serveur Coder de l'organisation (ex. https://ide.madatalk.fr)."),
+    coderToken: z.string().optional().describe("Token d'accès Coder (stocké CHIFFRÉ, jamais renvoyé). Absent = inchangé."),
+    coderTemplate: z.string().optional().describe("Nom du template Coder utilisé pour créer les workspaces."),
+    gitToken: z.string().optional().describe("Token git (PAT) pour clone/pull/push (stocké CHIFFRÉ, jamais renvoyé). Absent = inchangé."),
+    createdBy: z.string().optional(),
+  },
+}, async ({ id, name, description, isDefault, coderUrl, coderToken, coderTemplate, gitToken, createdBy }) => {
+  try {
+    const organization = await registerOrganization({ id, name, description, isDefault, coderUrl, coderToken, coderTemplate, gitToken, createdBy });
+    return text(JSON.stringify({ ok: true, organization }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("org_set_default", {
+  description: "Définit l'organisation PAR DÉFAUT (une seule) : seule autorisée à configurer l'écosystème.",
+  inputSchema: { id: z.string() },
+}, async ({ id }) => {
+  try {
+    const organization = await setDefaultOrganization(id);
+    return text(JSON.stringify({ ok: true, organization }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("org_list", {
+  description: "Liste les organisations enregistrées.",
+  inputSchema: {},
+}, async () => {
+  try {
+    const organizations = await listOrganizations();
+    return text(JSON.stringify({ count: organizations.length, organizations }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("org_get", {
+  description: "Détail d'une organisation (id, nom, description).",
+  inputSchema: { id: z.string() },
+}, async ({ id }) => {
+  try {
+    const organization = await getOrganization(id);
+    if (!organization) return err(`organisation inconnue : ${id}`);
+    return text(JSON.stringify({ organization }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("org_delete", {
+  description: "Supprime une organisation (refusé si des projets y sont rattachés).",
+  inputSchema: { id: z.string() },
+}, async ({ id }) => {
+  try {
+    const r = await deleteOrganization(id);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === tokens git multiples par organisation (v0.10) ============================
+server.registerTool("org_git_token_add", {
+  description: "Ajoute un token git (PAT) à une organisation — plusieurs tokens possibles par organisation. Le token à utiliser pour un repo associé à un projet est choisi lors de project_repo_link (gitTokenId). Stocké CHIFFRÉ, jamais renvoyé en clair.",
+  inputSchema: {
+    org: z.string().describe("Identifiant de l'organisation (tenant)."),
+    name: z.string().describe("Libellé lisible (ex: 'PAT GitHub Rino', 'compte dev onirtech')."),
+    token: z.string().describe("Token git (PAT) — stocké chiffré, jamais renvoyé."),
+    createdBy: z.string().optional(),
+  },
+}, async ({ org, name, token, createdBy }) => {
+  try {
+    const t = await addOrgGitToken({ org, name, token, createdBy });
+    return text(JSON.stringify({ ok: true, ...t }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("org_git_token_list", {
+  description: "Liste les tokens git d'une organisation (id + libellé uniquement — la valeur N'EST JAMAIS renvoyée).",
+  inputSchema: { org: z.string().describe("Identifiant de l'organisation (tenant).") },
+}, async ({ org }) => {
+  try {
+    const tokens = await listOrgGitTokens(org);
+    return text(JSON.stringify({ org, count: tokens.length, tokens }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+server.registerTool("org_git_token_delete", {
+  description: "Supprime un token git d'une organisation. Les liaisons repo↔projet qui le référençaient repassent au token par défaut de l'organisation.",
+  inputSchema: {
+    id: z.string().describe("Identifiant du token (gt_…)."),
+    org: z.string().describe("Identifiant de l'organisation (tenant)."),
+  },
+}, async ({ id, org }) => {
+  try {
+    return text(JSON.stringify({ ok: true, ...(await deleteOrgGitToken({ id, org })) }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -1310,10 +1584,12 @@ server.registerTool("e2e_test_register", {
     gherkin: z.string().optional().describe("Formalisation Gherkin (Given/When/Then) du comportement — produite par test-agent."),
     coveredProjects: z.array(z.string()).optional().describe("Rétrocompat (obsolète) : projets couverts — préférer repoIds."),
     repoIds: z.array(z.string()).optional().describe("REPOS DE CODE associés au test (repos traversés par le comportement, ex. ['mada-talk','oniria']). Le repo contenant le spec est inclus par défaut. Défaut si absent : repos du projet."),
+    organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
+    createdBy: z.string().optional().describe("Utilisateur (username) qui crée le test."),
   },
-}, async ({ project, specFile, scenario, title, description, gherkin, coveredProjects, repoIds }) => {
+}, async ({ project, specFile, scenario, title, description, gherkin, coveredProjects, repoIds, organizationId, createdBy }) => {
   try {
-    const t = await upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects, repoIds });
+    const t = await upsertE2ETest({ project, specFile, scenario, title, description, gherkin, coveredProjects, repoIds, organizationId, createdBy });
     return text(JSON.stringify({ ok: true, test: await getE2ETest(t.id) }, null, 2));
   } catch (e) { return err(e.message); }
 });

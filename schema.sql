@@ -30,6 +30,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   version        INTEGER NOT NULL DEFAULT 0        -- optimistic lock
 );
 
+-- Organisations : tenant de premier niveau (multi-organisation). Toutes les
+-- entités de 1er niveau (projets, repos, tâches, recettes, tests, docs,
+-- artefacts) portent `organization_id`. Un utilisateur appartient à une org.
+CREATE TABLE IF NOT EXISTS organizations (
+  id          TEXT PRIMARY KEY,                 -- slug (ex. onirtech)
+  name        TEXT NOT NULL,                    -- nom lisible (ex. ONIRTECH)
+  description TEXT,
+  created_at  TEXT NOT NULL,
+  created_by  TEXT
+);
+
 -- Projets : entité de première classe (enregistrement explicite).
 CREATE TABLE IF NOT EXISTS projects (
   id            TEXT PRIMARY KEY,
@@ -39,6 +50,7 @@ CREATE TABLE IF NOT EXISTS projects (
   main_branch   TEXT,                              -- branche principale (garde déploiement)
   e2e_repo_dir  TEXT,                              -- checkout hôte où s'exécutent les runs E2E
   e2e_base_url  TEXT,                              -- URL de test par défaut (E2E)
+  organization_id TEXT,                            -- organisation (tenant)
   created_at    TEXT NOT NULL,
   created_by    TEXT
 );
@@ -191,9 +203,12 @@ CREATE TABLE IF NOT EXISTS recette_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id);
 
--- Projets rattachés à une recette (1..N — une recette peut couvrir plusieurs projets).
--- `recettes.project` (colonne legacy) reste le PREMIER projet (jamais NULL) ; la
--- source de vérité multi-projets est cette table.
+-- Projets rattachés à une recette — LÉGACY multi-projets (1..N), PLUS UTILISÉE.
+-- Depuis v0.9.34 : 1 recette = 1 PROJET unique (`recettes.project`) ; la portée
+-- réelle est couverte par les REPOS TRANSVERSES du projet (`project_repos`,
+-- ADR 11 — ex: mada-talk traverse les repos mada-talk et oniria). La table est
+-- conservée pour l'historique des anciennes recettes multi-projets (aucune
+-- écriture/lecture par la logique actuelle).
 CREATE TABLE IF NOT EXISTS recette_projects (
   recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
   project    TEXT NOT NULL,
@@ -214,6 +229,8 @@ CREATE TABLE IF NOT EXISTS recette_items (
   created_task_id  TEXT,                    -- tâche créée après confirmation
   exec_order       INTEGER,                 -- ordre d'exécution recommandé (même n = parallèle)
   vigilance        TEXT,                    -- point de vigilance / écart sémantique
+  test_intent      TEXT,                    -- JSON : besoin TEST capturé en recette
+  doc_intent       TEXT,                    -- JSON : besoin DOCUMENT (ADR/specs/Gherkin) capturé
   created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id);
@@ -289,6 +306,7 @@ CREATE TABLE IF NOT EXISTS plan_steps (
   position   INTEGER NOT NULL DEFAULT 0,
   status     TEXT NOT NULL DEFAULT 'todo',        -- todo | in_progress | done | blocked | skipped
   note       TEXT,
+  files      TEXT,                                -- JSON array des fichiers touchés par l'étape (Phase 3)
   updated_at TEXT,
   PRIMARY KEY (plan_id, step_id)
 );
@@ -438,3 +456,37 @@ CREATE TABLE IF NOT EXISTS e2e_vars (
   PRIMARY KEY (project, name)
 );
 CREATE INDEX IF NOT EXISTS idx_e2e_vars_project ON e2e_vars(project);
+
+-- ===========================================================================
+-- Batch d'orchestration (v0.9.0) : groupe de tâches pilotées par UNE session
+-- d'orchestration. Source naturelle = recette (recette_id), ou ad-hoc.
+-- La READINESS et la MATRICE DE CONFLIT sont CALCULÉES (pas stockées) depuis :
+--   - dépendances (tasks.dependencies) → précédence ;
+--   - fichiers déclarés (plans.file / absolute_path) + réels (plan_commits.files)
+--     → détection fine de conflit entre tâches.
+-- `max_parallel` = plafond d'écrivains simultanés (défaut 2). Phase 1 : LECTURE +
+-- enregistrement (aucun auto-avancement) — l'orchestrateur voit le DAG et la
+-- matrice, mais reste conduit semi-manuellement.
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS batches (
+  id            TEXT PRIMARY KEY,                 -- BATCH-<ts>-<rand>
+  project       TEXT NOT NULL,                    -- projet cible
+  title         TEXT NOT NULL,
+  recette_id    TEXT,                             -- source naturelle (nullable si ad-hoc)
+  session_id    TEXT,                             -- session d'orchestration unique
+  max_parallel  INTEGER NOT NULL DEFAULT 2,       -- plafond d'écrivains simultanés
+  launch_mode   TEXT NOT NULL DEFAULT 'batch',    -- batch (worker auto) | session (session unique) | manual (aucun auto)
+  status        TEXT NOT NULL DEFAULT 'active',   -- active | completed | aborted
+  created_at    TEXT NOT NULL,
+  created_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_batches_project ON batches(project);
+CREATE INDEX IF NOT EXISTS idx_batches_recette ON batches(recette_id);
+
+CREATE TABLE IF NOT EXISTS batch_tasks (
+  batch_id  TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+  task_id   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  position  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (batch_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_batch_tasks_task ON batch_tasks(task_id);
