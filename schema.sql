@@ -133,6 +133,33 @@ CREATE TABLE IF NOT EXISTS doc_repos (
 );
 CREATE INDEX IF NOT EXISTS idx_doc_repos_repo ON doc_repos(repo_id);
 
+-- Pièces jointes d'ADR (item 122) : une ADR (docs.kind='adr-tech') peut être
+-- rattachée à 0..N documents/fichiers. Table de liaison DÉDIÉE (distincte de
+-- doc_projects/doc_repos = rattachement projet/repo) : elle donne un ID stable
+-- (retrait d'une pièce précise), distingue les natures et préfigure la table
+-- polymorphe `artifacts` (T8) par un mapping 1:1 (doc_type/content_id/kind/
+-- nature/source/meta).
+--   source='registry' → target_doc_id : document du registre (target_doc_id)
+--   source='import'   → path : fichier importé (stocké sous storage/ref-docs)
+--   source='ref'      → path : fichier référencé par chemin (workspace/checkout)
+CREATE TABLE IF NOT EXISTS doc_attachments (
+  attachment_id TEXT PRIMARY KEY,                    -- att-<ts>-<rand>
+  doc_id        TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,       -- ADR porteuse
+  doc_type      TEXT NOT NULL DEFAULT 'adr_file',    -- préfigure artifacts.doc_type (T8)
+  content_id    TEXT,                                -- = doc_id (préfigure artifacts.content_id)
+  kind          TEXT,                                -- libellé libre (annexe, spec, capture…)
+  nature        TEXT,                                -- document | fichier | lien
+  title         TEXT,
+  path          TEXT,                                -- source import/ref : chemin du fichier
+  target_doc_id TEXT REFERENCES docs(id) ON DELETE CASCADE,                -- source registry
+  source        TEXT NOT NULL DEFAULT 'registry',    -- registry | import | ref
+  meta          TEXT,                                -- JSON sérialisé
+  created_at    TEXT NOT NULL,
+  created_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_doc_attachments_doc ON doc_attachments(doc_id);
+CREATE INDEX IF NOT EXISTS idx_doc_attachments_target ON doc_attachments(target_doc_id);
+
 -- État opérationnel d'une exécution (le "comment", mutable par l'orchestrateur seul).
 CREATE TABLE IF NOT EXISTS executions (
   execution_id  TEXT PRIMARY KEY,

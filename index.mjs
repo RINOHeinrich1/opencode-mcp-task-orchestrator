@@ -108,8 +108,12 @@ import {
   getDoc,
   listDocs,
   docsForProjectContext,
+  addDocAttachment,
+  removeDocAttachment,
+  listDocAttachments,
   DOC_KINDS,
   ADR_STATUS,
+  DOC_ATTACHMENT_SOURCES,
   resolveDecisionAndTransition,
   resolveRecette,
   resetRecette,
@@ -438,6 +442,55 @@ server.registerTool("doc_list", {
   try {
     const docs = await listDocs({ kind, status, projectId, repoId, includeRepoDocs, limit });
     return text(JSON.stringify({ count: docs.length, docs }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// Pièces jointes d'ADR (item 122) : une ADR (docs.kind='adr-tech') peut être
+// rattachée à 0..N documents/fichiers. source='registry' (targetDocId),
+// source='import' (fichier importé, path) ou source='ref' (fichier référencé
+// par chemin, path). Retourne le doc porteur enrichi (champ attachments).
+server.registerTool("doc_attachment_add", {
+  description: "Rattache une pièce jointe à un document de référence (ADR-12). 3 sources : 'registry' (document du registre via targetDocId), 'import' (fichier importé via path, stocké sous storage/ref-docs) ou 'ref' (fichier référencé par chemin via path, workspace/checkout). kind/nature/title libres. Retourne le doc porteur avec ses pièces jointes (0..N).",
+  inputSchema: {
+    docId: z.string().describe("docId de l'ADR (document porteur) à laquelle rattacher la pièce jointe."),
+    targetDocId: z.string().optional().describe("source='registry' : docId du document du registre à rattacher."),
+    path: z.string().optional().describe("source='import'|'ref' : chemin du fichier."),
+    title: z.string().optional().describe("Libellé lisible de la pièce jointe."),
+    kind: z.string().optional().describe("Libellé libre (annexe, spec, capture…)."),
+    nature: z.string().optional().describe("Nature : document | fichier | lien (défaut selon la source)."),
+    source: z.enum(DOC_ATTACHMENT_SOURCES).optional().describe("Source : registry | import | ref (défaut registry)."),
+    meta: z.record(z.string(), z.any()).optional().describe("Métadonnées libres (JSON)."),
+  },
+}, async ({ docId, targetDocId, path, title, kind, nature, source, meta }) => {
+  try {
+    const doc = await addDocAttachment({ docId, targetDocId, path, title, kind, nature, source, meta });
+    return text(JSON.stringify({ ok: true, doc }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("doc_attachment_remove", {
+  description: "Retire une pièce jointe d'une ADR (ADR-12) par son attachmentId stable. docId optionnel (vérifie l'appartenance). Ne touche ni au fichier ni aux rattachements projet/repo.",
+  inputSchema: {
+    attachmentId: z.string().describe("attachmentId de la pièce jointe à retirer."),
+    docId: z.string().optional().describe("docId de l'ADR porteuse (vérification d'appartenance)."),
+  },
+}, async ({ attachmentId, docId }) => {
+  try {
+    const r = await removeDocAttachment({ attachmentId, docId });
+    if (!r) return err(`pièce jointe inconnue : ${attachmentId}`);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("doc_attachment_list", {
+  description: "Liste les pièces jointes d'un document de référence (ADR-12). Retourne { count, attachments }.",
+  inputSchema: {
+    docId: z.string().describe("docId de l'ADR porteuse."),
+  },
+}, async ({ docId }) => {
+  try {
+    const attachments = await listDocAttachments({ docId });
+    return text(JSON.stringify({ count: attachments.length, attachments }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

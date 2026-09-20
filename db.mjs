@@ -254,6 +254,26 @@ async function migrate() {
     PRIMARY KEY (doc_id, repo_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_repos_repo ON doc_repos(repo_id)");
+  // Pièces jointes d'ADR (item 122) : DDL identique à schema.sql (source
+  // logique) pour créer la table sur une base PostgreSQL déjà migrée, de façon
+  // idempotente (mapping 1:1 vers `artifacts` de T8).
+  await pool().query(`CREATE TABLE IF NOT EXISTS doc_attachments (
+    attachment_id TEXT PRIMARY KEY,
+    doc_id        TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+    doc_type      TEXT NOT NULL DEFAULT 'adr_file',
+    content_id    TEXT,
+    kind          TEXT,
+    nature        TEXT,
+    title         TEXT,
+    path          TEXT,
+    target_doc_id TEXT REFERENCES docs(id) ON DELETE CASCADE,
+    source        TEXT NOT NULL DEFAULT 'registry',
+    meta          TEXT,
+    created_at    TEXT NOT NULL,
+    created_by    TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_attachments_doc ON doc_attachments(doc_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_attachments_target ON doc_attachments(target_doc_id)");
   // --- Backfill idempotent depuis projects (ne supprime rien) ---------------
   // Chaque projet existant avec des données repo physiques (workspace ou
   // git_path non nul) génère un repo homonyme + l'association au produit.
@@ -1487,11 +1507,46 @@ function assertAdrStatus(status) {
   return s;
 }
 
+// Pièces jointes d'ADR (item 122) : référentiel unique des sources, partagé
+// avec index.mjs (zod). registry = document du registre ; import = fichier
+// importé (storage/ref-docs) ; ref = fichier référencé par chemin.
+export const DOC_ATTACHMENT_SOURCES = ["registry", "import", "ref"];
+
+// Valide une source de pièce jointe. `undefined`/`null`/"" → 'registry'.
+function assertAttachmentSource(source) {
+  const s = source === undefined || source === null || String(source).trim() === "" ? "registry" : String(source).trim();
+  if (!DOC_ATTACHMENT_SOURCES.includes(s)) {
+    throw new Error(`source invalide : ${source} (attendu : ${DOC_ATTACHMENT_SOURCES.join(" | ")})`);
+  }
+  return s;
+}
+
 // `meta` est stocké en TEXT (JSON sérialisé) — tolérant aux valeurs legacy.
 function parseDocMeta(raw) {
   if (raw === null || raw === undefined) return null;
   if (typeof raw === "object") return raw;
   try { return JSON.parse(raw); } catch { return raw; }
+}
+
+// Sérialise une ligne `doc_attachments` (camelCase) — réutilisé par les
+// fonctions et les tools. `meta` tolérant aux valeurs legacy.
+function rowToAttachment(r) {
+  if (!r) return null;
+  return {
+    attachmentId: r.attachment_id,
+    docId: r.doc_id,
+    docType: r.doc_type,
+    contentId: r.content_id,
+    kind: r.kind ?? null,
+    nature: r.nature ?? null,
+    title: r.title ?? null,
+    path: r.path ?? null,
+    targetDocId: r.target_doc_id ?? null,
+    source: r.source,
+    meta: parseDocMeta(r.meta),
+    createdAt: r.created_at,
+    createdBy: r.created_by ?? null,
+  };
 }
 
 function rowToDoc(r) {
@@ -1551,11 +1606,31 @@ async function getReposForDocs(rows) {
   return map;
 }
 
-// Un doc enrichi avec ses cibles (projets/repos). rows = lignes docs.
+// Pièces jointes d'ADR rattachées à des docs (0..N) — une requête batch.
+async function getAttachmentsForDocs(rows) {
+  if (!rows.length) return {};
+  const ids = [...new Set(rows.map((r) => r.id))];
+  const links = (await pool().query(
+    "SELECT * FROM doc_attachments WHERE doc_id = ANY($1) ORDER BY created_at", [ids],
+  )).rows;
+  const map = {};
+  for (const l of links) (map[l.doc_id] = map[l.doc_id] || []).push(rowToAttachment(l));
+  return map;
+}
+
+// Un doc enrichi avec ses cibles (projets/repos) et ses pièces jointes (0..N).
+// rows = lignes docs. Le champ `attachments` est additif (rétrocompat item 120).
 async function enrichDocs(rows) {
   if (!rows.length) return [];
-  const [projMap, repoMap] = await Promise.all([getProjectsForDocs(rows), getReposForDocs(rows)]);
-  return rows.map((r) => ({ ...rowToDoc(r), projects: projMap[r.id] || [], repos: repoMap[r.id] || [] }));
+  const [projMap, repoMap, attMap] = await Promise.all([
+    getProjectsForDocs(rows), getReposForDocs(rows), getAttachmentsForDocs(rows),
+  ]);
+  return rows.map((r) => ({
+    ...rowToDoc(r),
+    projects: projMap[r.id] || [],
+    repos: repoMap[r.id] || [],
+    attachments: attMap[r.id] || [],
+  }));
 }
 
 export async function registerDoc({
@@ -1668,6 +1743,77 @@ export async function deleteDoc(docId) {
   if (!existing) return null;
   await pool().query("DELETE FROM docs WHERE id = $1", [docId]);
   return { docId, deleted: true };
+}
+
+// --- Pièces jointes d'ADR (item 122) ---------------------------------------
+// Le registre ne stocke JAMAIS de contenu : une pièce jointe est un lien vers
+// un document du registre (target_doc_id) ou un chemin de fichier (import/ref).
+// 3 natures : registry (document), import (fichier importé), ref (fichier
+// référencé par chemin). Retourne le doc porteur enrichi (attachments à jour).
+export async function addDocAttachment({
+  docId, targetDocId, path, title, kind, nature, source, meta, createdBy,
+}) {
+  await ensureSchema();
+  if (!docId) throw new Error("docId requis");
+  const doc = (await pool().query("SELECT id FROM docs WHERE id = $1", [docId])).rows[0];
+  if (!doc) throw new Error(`doc porteur inconnu : ${docId}`);
+  const src = assertAttachmentSource(source);
+  let target = null;
+  let p = null;
+  if (src === "registry") {
+    target = targetDocId ? String(targetDocId).trim() : "";
+    if (!target) throw new Error("source='registry' exige targetDocId (document du registre)");
+    if (target === String(docId)) throw new Error("une pièce jointe ne peut pas cibler l'ADR porteuse elle-même");
+    const t = (await pool().query("SELECT id FROM docs WHERE id = $1", [target])).rows[0];
+    if (!t) throw new Error(`document cible inconnu : ${target}`);
+  } else {
+    p = path ? String(path).trim() : "";
+    if (!p) throw new Error(`source='${src}' exige path (chemin du fichier)`);
+  }
+  const defaultNature = { registry: "document", import: "fichier", ref: "lien" };
+  const nat = nature && String(nature).trim() ? String(nature).trim() : defaultNature[src];
+  const metaStr = meta === undefined || meta === null
+    ? null
+    : (typeof meta === "string" ? meta : JSON.stringify(meta));
+  const id = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const ts = nowIso();
+  await pool().query(
+    `INSERT INTO doc_attachments
+       (attachment_id, doc_id, doc_type, content_id, kind, nature, title, path, target_doc_id, source, meta, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+    [
+      id, String(docId), "adr_file", String(docId),
+      kind ? String(kind).trim() : null,
+      nat,
+      title ? String(title).trim() : null,
+      p, target, src, metaStr, ts, createdBy ?? null,
+    ],
+  );
+  return getDoc(docId);
+}
+
+// Retrait d'une pièce jointe par son ID stable. Si `docId` est fourni, vérifie
+// l'appartenance. Ne touche ni au fichier ni aux rattachements projet/repo.
+export async function removeDocAttachment({ attachmentId, docId }) {
+  await ensureSchema();
+  if (!attachmentId) throw new Error("attachmentId requis");
+  const row = (await pool().query("SELECT * FROM doc_attachments WHERE attachment_id = $1", [attachmentId])).rows[0];
+  if (!row) return null;
+  if (docId && String(docId) !== String(row.doc_id)) {
+    throw new Error(`la pièce jointe ${attachmentId} n'appartient pas au doc ${docId}`);
+  }
+  await pool().query("DELETE FROM doc_attachments WHERE attachment_id = $1", [attachmentId]);
+  return { attachmentId, docId: row.doc_id, deleted: true };
+}
+
+// Lecture dédiée des pièces jointes d'une ADR (symétrie artifact_list).
+export async function listDocAttachments({ docId }) {
+  await ensureSchema();
+  if (!docId) throw new Error("docId requis");
+  const rows = (await pool().query(
+    "SELECT * FROM doc_attachments WHERE doc_id = $1 ORDER BY created_at", [String(docId)],
+  )).rows;
+  return rows.map(rowToAttachment);
 }
 
 export async function getDoc(docId) {
