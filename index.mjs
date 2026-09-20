@@ -109,6 +109,7 @@ import {
   listDocs,
   docsForProjectContext,
   DOC_KINDS,
+  ADR_STATUS,
   resolveDecisionAndTransition,
   resolveRecette,
   resetRecette,
@@ -350,38 +351,52 @@ server.registerTool("repo_delete", {
 // patterns, structure de dossiers) | specs-fonctionnelles (User stories + règles
 // métier) | scenarios-gherkin (scénarios Gherkin).
 server.registerTool("doc_register", {
-  description: "Enregistre un DOCUMENT de référence (ADR-12) — registre générique N:N rattaché à un projet et/ou un repo. kind : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin. path = chemin du fichier (workspace Coder / checkout) que les agents liront en contexte — jamais de contenu en base.",
+  description: "Enregistre un DOCUMENT de référence (ADR-12) — registre générique N:N rattaché à un projet et/ou 1..N repos. kind : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin. ADR structurée : status (Proposé | Accepté | Déprécié | Remplacé), context, decision, consequences, replacedBy. Rattachement repos : repoId (1) ou repoIds (1..N) ; global=true rattache TOUS les repos du projet (ADR globale). path = chemin du fichier que les agents liront en contexte — jamais de contenu en base.",
   inputSchema: {
     kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]),
     title: z.string().optional().describe("Titre lisible (ex. 'ADR — Architecture madatalk')."),
     path: z.string().describe("Chemin du fichier (ex. /home/coder/mada-talk/docs/adr-technique.md ou tests/docs/specs.md)."),
     description: z.string().optional(),
+    status: z.enum(ADR_STATUS).optional().describe("Statut ADR : Proposé | Accepté | Déprécié | Remplacé."),
+    context: z.string().optional().describe("ADR : contexte."),
+    decision: z.string().optional().describe("ADR : décision."),
+    consequences: z.string().optional().describe("ADR : conséquences."),
+    replacedBy: z.string().optional().describe("ADR : docId de l'ADR qui remplace celle-ci (statut Remplacé)."),
     projectId: z.string().optional().describe("Projet (produit) rattaché."),
-    repoId: z.string().optional().describe("Repo (dépôt de code) rattaché."),
+    repoId: z.string().optional().describe("Repo (dépôt de code) rattaché (rétrocompat — 1 repo)."),
+    repoIds: z.array(z.string()).optional().describe("Repos (dépôt de code) rattachés — 1..N."),
+    global: z.boolean().optional().describe("ADR globale : rattachée à TOUS les repos du projet (exige projectId)."),
     organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
     createdBy: z.string().optional(),
   },
-}, async ({ kind, title, path, description, projectId, repoId, organizationId, createdBy }) => {
+}, async ({ kind, title, path, description, status, context, decision, consequences, replacedBy, projectId, repoId, repoIds, global: isGlobal, organizationId, createdBy }) => {
   try {
-    const doc = await registerDoc({ kind, title, path, description, projectId, repoId, organizationId, createdBy });
+    const doc = await registerDoc({ kind, title, path, description, status, context, decision, consequences, replacedBy, projectId, repoId, repoIds, global: isGlobal, organizationId, createdBy });
     return text(JSON.stringify({ ok: true, doc }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("doc_update", {
-  description: "Met à jour un document de référence (ADR-12) — titre/kind/path/description + rattachements (addProjectId/addRepoId).",
+  description: "Met à jour un document de référence (ADR-12) — titre/kind/path/description + champs ADR (status, context, decision, consequences, replacedBy) + rattachements (addProjectId/addRepoId/addRepoIds, setGlobal pour rattacher tous les repos du projet).",
   inputSchema: {
     docId: z.string(),
     kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
     title: z.string().optional(),
     path: z.string().optional(),
     description: z.string().optional(),
+    status: z.enum(ADR_STATUS).optional().describe("Statut ADR : Proposé | Accepté | Déprécié | Remplacé."),
+    context: z.string().optional().describe("ADR : contexte."),
+    decision: z.string().optional().describe("ADR : décision."),
+    consequences: z.string().optional().describe("ADR : conséquences."),
+    replacedBy: z.string().optional().describe("ADR : docId de l'ADR qui remplace celle-ci."),
     addProjectId: z.string().optional(),
     addRepoId: z.string().optional(),
+    addRepoIds: z.array(z.string()).optional().describe("Repos à rattacher (1..N)."),
+    setGlobal: z.boolean().optional().describe("true : rattacher TOUS les repos des projets du doc + is_global=1 ; false : is_global=0."),
   },
-}, async ({ docId, kind, title, path, description, addProjectId, addRepoId }) => {
+}, async ({ docId, kind, title, path, description, status, context, decision, consequences, replacedBy, addProjectId, addRepoId, addRepoIds, setGlobal }) => {
   try {
-    const doc = await updateDoc({ docId, kind, title, path, description, addProjectId, addRepoId });
+    const doc = await updateDoc({ docId, kind, title, path, description, status, context, decision, consequences, replacedBy, addProjectId, addRepoId, addRepoIds, setGlobal });
     if (!doc) return err(`doc inconnu : ${docId}`);
     return text(JSON.stringify({ ok: true, doc }, null, 2));
   } catch (e) { return err(e.message); }
@@ -410,17 +425,18 @@ server.registerTool("doc_get", {
 });
 
 server.registerTool("doc_list", {
-  description: "Liste les documents de référence (ADR-12). Filtres : kind, projet (projectId), repo (repoId), includeRepoDocs (docs des repos du projet inclus — contexte projet). Chaque doc expose projects[] et repos[] (cibles).",
+  description: "Liste les documents de référence (ADR-12). Filtres : kind, statut ADR (status), projet (projectId), repo (repoId), includeRepoDocs (docs des repos du projet inclus — contexte projet, rétrocompat). Chaque doc expose projects[] et repos[] (cibles) + champs ADR (status/context/decision/consequences/replacedBy/isGlobal/meta/updatedAt).",
   inputSchema: {
     kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
+    status: z.enum(ADR_STATUS).optional().describe("Filtre ADR par statut : Proposé | Accepté | Déprécié | Remplacé."),
     projectId: z.string().optional().describe("Si fourni : docs rattachés au projet."),
     repoId: z.string().optional().describe("Si fourni : docs rattachés au repo."),
     includeRepoDocs: z.boolean().optional().describe("Avec projectId : inclure les docs des repos du projet (contexte projet complet)."),
     limit: z.number().int().optional(),
   },
-}, async ({ kind, projectId, repoId, includeRepoDocs, limit }) => {
+}, async ({ kind, status, projectId, repoId, includeRepoDocs, limit }) => {
   try {
-    const docs = await listDocs({ kind, projectId, repoId, includeRepoDocs, limit });
+    const docs = await listDocs({ kind, status, projectId, repoId, includeRepoDocs, limit });
     return text(JSON.stringify({ count: docs.length, docs }, null, 2));
   } catch (e) { return err(e.message); }
 });

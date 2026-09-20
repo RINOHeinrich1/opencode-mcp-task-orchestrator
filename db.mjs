@@ -218,10 +218,30 @@ async function migrate() {
     title       TEXT,
     path        TEXT NOT NULL,             -- chemin du fichier (lu par l'agent)
     description TEXT,
+    status      TEXT,                      -- ADR : Proposé | Accepté | Déprécié | Remplacé
+    context     TEXT,                      -- ADR : contexte
+    decision    TEXT,                      -- ADR : décision
+    consequences TEXT,                     -- ADR : conséquences
+    replaced_by TEXT,                      -- ADR : docId de l'ADR qui remplace celle-ci (statut Remplacé)
+    is_global   INTEGER NOT NULL DEFAULT 0,-- ADR globale : rattachée à tous les repos du projet
+    meta        TEXT,                      -- JSON sérialisé (préservable pour la fusion artifacts)
+    updated_at  TEXT,                      -- dernière mise à jour
     created_at  TEXT NOT NULL,
     created_by  TEXT
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_docs_kind ON docs(kind)");
+  // ADR structurées (item 120) : bases PostgreSQL EXISTANTES (branche
+  // feature/migration-postgresql) → migrer sans perte. `ALTER ... IF NOT EXISTS`
+  // idempotent : les docs legacy restent lisibles, champs ADR `null` (rétrocompat).
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS status TEXT");
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS context TEXT");
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS decision TEXT");
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS consequences TEXT");
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS replaced_by TEXT");
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS is_global INTEGER NOT NULL DEFAULT 0");
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS meta TEXT");
+  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS updated_at TEXT");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_docs_status ON docs(status)");
   await pool().query(`CREATE TABLE IF NOT EXISTS doc_projects (
     doc_id     TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -1454,11 +1474,40 @@ async function docsByProjectRepoBatch(projectIds, repoIds) {
 
 export const DOC_KINDS = ["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"];
 
+// ADR (item 120) : référentiel unique des statuts, partagé avec index.mjs (zod).
+export const ADR_STATUS = ["Proposé", "Accepté", "Déprécié", "Remplacé"];
+
+// Valide un statut ADR. `undefined`/`null`/"" → null (docs legacy sans statut).
+function assertAdrStatus(status) {
+  if (status === undefined || status === null || String(status).trim() === "") return null;
+  const s = String(status).trim();
+  if (!ADR_STATUS.includes(s)) {
+    throw new Error(`status invalide : ${status} (attendu : ${ADR_STATUS.join(" | ")})`);
+  }
+  return s;
+}
+
+// `meta` est stocké en TEXT (JSON sérialisé) — tolérant aux valeurs legacy.
+function parseDocMeta(raw) {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "object") return raw;
+  try { return JSON.parse(raw); } catch { return raw; }
+}
+
 function rowToDoc(r) {
   if (!r) return null;
   return {
     docId: r.id, kind: r.kind, title: r.title ?? null, path: r.path,
-    description: r.description ?? null, createdAt: r.created_at, createdBy: r.created_by,
+    description: r.description ?? null,
+    status: r.status ?? null,
+    context: r.context ?? null,
+    decision: r.decision ?? null,
+    consequences: r.consequences ?? null,
+    replacedBy: r.replaced_by ?? null,
+    isGlobal: r.is_global === 1 || r.is_global === true,
+    meta: parseDocMeta(r.meta),
+    updatedAt: r.updated_at ?? null,
+    createdAt: r.created_at, createdBy: r.created_by,
   };
 }
 
@@ -1509,29 +1558,62 @@ async function enrichDocs(rows) {
   return rows.map((r) => ({ ...rowToDoc(r), projects: projMap[r.id] || [], repos: repoMap[r.id] || [] }));
 }
 
-export async function registerDoc({ kind, title, path, description, projectId, repoId, organizationId, createdBy }) {
+export async function registerDoc({
+  kind, title, path, description, projectId, repoId,
+  status, context, decision, consequences, replacedBy, repoIds, global: isGlobal,
+  organizationId, createdBy,
+}) {
   await ensureSchema();
   if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind} (attendu : ${DOC_KINDS.join(" | ")})`);
   if (!path || !String(path).trim()) throw new Error("path (chemin du fichier) requis");
+  if (isGlobal === true && !projectId) {
+    throw new Error("global=true exige projectId (une ADR globale est rattachée à tous les repos du projet)");
+  }
   const k = String(kind).trim();
   const p = String(path).trim();
+  const st = assertAdrStatus(status);
   const org = organizationId || (projectId ? await orgIdOfProject(projectId) : null) || await defaultOrganizationId();
   const id = `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const globalFlag = isGlobal === true ? 1 : 0;
+  const ts = nowIso();
   await pool().query(
-    `INSERT INTO docs (id, kind, title, path, description, organization_id, created_at, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-    [id, k, title ? String(title).trim() : null, p, description ? String(description).trim() : null, org, nowIso(), createdBy ?? null],
+    `INSERT INTO docs (id, kind, title, path, description, status, context, decision, consequences,
+                       replaced_by, is_global, organization_id, created_at, created_by, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    [
+      id, k, title ? String(title).trim() : null, p,
+      description ? String(description).trim() : null,
+      st,
+      context === undefined || context === null ? null : String(context),
+      decision === undefined || decision === null ? null : String(decision),
+      consequences === undefined || consequences === null ? null : String(consequences),
+      replacedBy === undefined || replacedBy === null ? null : String(replacedBy).trim(),
+      globalFlag, org, ts, createdBy ?? null, ts,
+    ],
   );
   if (projectId) {
     await pool().query("INSERT INTO doc_projects (doc_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, String(projectId).trim()]);
   }
-  if (repoId) {
-    await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, String(repoId).trim()]);
+  // Rattachement repos : repoId legacy + repoIds (1..N) + ADR globale (tous les
+  // repos du projet, résolus depuis project_repos).
+  const repoSet = new Set();
+  if (repoId) repoSet.add(String(repoId).trim());
+  if (Array.isArray(repoIds)) for (const r of repoIds) { if (r) repoSet.add(String(r).trim()); }
+  if (globalFlag === 1) {
+    const rows = (await pool().query("SELECT repo_id FROM project_repos WHERE project_id = $1", [String(projectId).trim()])).rows;
+    for (const r of rows) repoSet.add(r.repo_id);
+  }
+  for (const r of repoSet) {
+    await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, r]);
   }
   return getDoc(id);
 }
 
-export async function updateDoc({ docId, kind, title, path, description, addProjectId, addRepoId }) {
+export async function updateDoc({
+  docId, kind, title, path, description,
+  status, context, decision, consequences, replacedBy,
+  addProjectId, addRepoId, addRepoIds, setGlobal,
+}) {
   await ensureSchema();
   const sets = [];
   const params = [];
@@ -1542,12 +1624,41 @@ export async function updateDoc({ docId, kind, title, path, description, addProj
   if (title !== undefined) { params.push(title === null ? null : String(title).trim()); sets.push(`title = $${params.length}`); }
   if (path !== undefined) { params.push(String(path).trim()); sets.push(`path = $${params.length}`); }
   if (description !== undefined) { params.push(description === null ? null : String(description).trim()); sets.push(`description = $${params.length}`); }
+  if (status !== undefined) { params.push(assertAdrStatus(status)); sets.push(`status = $${params.length}`); }
+  if (context !== undefined) { params.push(context === null ? null : String(context)); sets.push(`context = $${params.length}`); }
+  if (decision !== undefined) { params.push(decision === null ? null : String(decision)); sets.push(`decision = $${params.length}`); }
+  if (consequences !== undefined) { params.push(consequences === null ? null : String(consequences)); sets.push(`consequences = $${params.length}`); }
+  if (replacedBy !== undefined) { params.push(replacedBy === null ? null : String(replacedBy).trim()); sets.push(`replaced_by = $${params.length}`); }
   if (sets.length) {
-    params.push(nowIso(), docId);
-    await pool().query(`UPDATE docs SET ${sets.join(", ")} WHERE id = $${params.length - 1}`, params);
+    // `updated_at` référencé par un placeholder (correction du param `nowIso()`
+    // auparavant poussé sans placeholder → UPDATE avec un paramètre en trop).
+    params.push(nowIso());
+    sets.push(`updated_at = $${params.length}`);
+    params.push(docId);
+    await pool().query(`UPDATE docs SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
   }
   if (addProjectId) await pool().query("INSERT INTO doc_projects (doc_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addProjectId).trim()]);
   if (addRepoId) await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addRepoId).trim()]);
+  if (Array.isArray(addRepoIds)) {
+    for (const r of addRepoIds) {
+      if (r) await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(r).trim()]);
+    }
+  }
+  // ADR globale : `setGlobal=true` rattache TOUS les repos des projets du doc
+  // (+ is_global=1) ; `setGlobal=false` remet is_global=0 sans retirer les liens.
+  if (setGlobal === true) {
+    const projectIds = (await pool().query("SELECT project_id FROM doc_projects WHERE doc_id = $1", [docId])).rows.map((r) => r.project_id);
+    if (!projectIds.length) throw new Error("setGlobal=true exige au moins un projet rattaché au doc");
+    await pool().query("UPDATE docs SET is_global = 1, updated_at = $2 WHERE id = $1", [docId, nowIso()]);
+    for (const pid of projectIds) {
+      const rows = (await pool().query("SELECT repo_id FROM project_repos WHERE project_id = $1", [pid])).rows;
+      for (const r of rows) {
+        await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, r.repo_id]);
+      }
+    }
+  } else if (setGlobal === false) {
+    await pool().query("UPDATE docs SET is_global = 0, updated_at = $2 WHERE id = $1", [docId, nowIso()]);
+  }
   return getDoc(docId);
 }
 
@@ -1570,13 +1681,19 @@ export async function getDoc(docId) {
 // Liste des docs, filtrée par kind / projet / repo.
 // - projectId : docs rattachés au projet (et à ses repos ? via includeRepoDocs).
 // - repoId : docs rattachés au repo.
-export async function listDocs({ kind, projectId, repoId, includeRepoDocs = false, limit = 500 } = {}) {
+export async function listDocs({ kind, status, projectId, repoId, includeRepoDocs = false, limit = 500 } = {}) {
   await ensureSchema();
   const conds = [];
   const params = [];
   if (kind) {
     if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind}`);
     params.push(kind); conds.push(`d.kind = $${params.length}`);
+  }
+  // Filtre ADR par statut (ajoute une condition — le SQL `includeRepoDocs` et
+  // `repoId` ci-dessous restent inchangés : rétrocompat préservée).
+  if (status) {
+    const s = assertAdrStatus(status);
+    params.push(s); conds.push(`d.status = $${params.length}`);
   }
   let rows;
   if (projectId) {

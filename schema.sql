@@ -55,6 +55,84 @@ CREATE TABLE IF NOT EXISTS projects (
   created_by    TEXT
 );
 
+-- Repos : dépôts de code physiques (ADR 09). Un repo peut être rattaché à
+-- plusieurs projets (N:N via project_repos). Une ADR se rattache à un projet
+-- et à 1..N de ses repos (doc_repos).
+CREATE TABLE IF NOT EXISTS repos (
+  id            TEXT PRIMARY KEY,                  -- ex. mada-talk | oniria
+  name          TEXT,
+  description   TEXT,                              -- à quoi sert ce repo pour le projet
+  deploy        TEXT,                              -- mécanisme de déploiement CI/CD (texte libre)
+  git_path      TEXT,                              -- chemin/url du dépôt git
+  git_url       TEXT,
+  workspace     TEXT,                              -- workspace Coder où vit le checkout
+  branches      TEXT,                              -- JSON array : branches cible(s) de déploiement
+  main_branch   TEXT,                              -- branche principale (alias rapide)
+  e2e_repo_dir  TEXT,                              -- checkout hôte E2E
+  e2e_base_url  TEXT,
+  organization_id TEXT,                            -- organisation (tenant)
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT,
+  created_by    TEXT,
+  meta          JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_repos_workspace ON repos(workspace);
+
+-- Projets ⇄ Repos (N:N).
+CREATE TABLE IF NOT EXISTS project_repos (
+  project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  repo_id     TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  role        TEXT,                                -- ex. frontend | backend | console | outillage
+  git_token_id TEXT,                               -- token git de l'organisation (choisi par liaison)
+  PRIMARY KEY (project_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_repos_repo ON project_repos(repo_id);
+
+-- Documents de référence (ADR-12) + ADR STRUCTURÉES (item 120). Le registre
+-- porte Titre/Statut/Contexte/Décision/Conséquences ; `path` pointe le fichier
+-- que les agents LISENT en contexte (jamais de contenu en base).
+--   status      : Proposé | Accepté | Déprécié | Remplacé (null pour un doc legacy)
+--   replaced_by : docId de l'ADR qui remplace celle-ci (statut Remplacé)
+--   is_global   : 1 = ADR globale, rattachée à TOUS les repos du projet
+--   meta        : JSON sérialisé — champs préservables pour la fusion `artifacts`
+--   updated_at  : dernière mise à jour
+CREATE TABLE IF NOT EXISTS docs (
+  id            TEXT PRIMARY KEY,                  -- doc-<ts>-<rand>
+  kind          TEXT NOT NULL,                     -- adr-tech | specs-fonctionnelles | scenarios-gherkin
+  title         TEXT,
+  path          TEXT NOT NULL,                     -- chemin du fichier (lu par l'agent)
+  description   TEXT,
+  status        TEXT,                              -- ADR : Proposé | Accepté | Déprécié | Remplacé
+  context       TEXT,                              -- ADR : contexte
+  decision      TEXT,                              -- ADR : décision
+  consequences  TEXT,                              -- ADR : conséquences
+  replaced_by   TEXT,                              -- ADR : docId de l'ADR qui remplace
+  is_global     INTEGER NOT NULL DEFAULT 0,        -- ADR globale : tous les repos du projet
+  meta          TEXT,                              -- JSON sérialisé (préservable pour `artifacts`)
+  organization_id TEXT,                            -- organisation (tenant)
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT,                              -- dernière mise à jour
+  created_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_docs_kind ON docs(kind);
+-- NB : l'index sur `status` est créé par migrate() APRÈS les ALTER (une base
+-- existante n'a pas encore la colonne au moment où schema.sql est chargé).
+
+-- Docs ⇄ Projets (N:N) et Docs ⇄ Repos (N:N).
+CREATE TABLE IF NOT EXISTS doc_projects (
+  doc_id     TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  PRIMARY KEY (doc_id, project_id)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_projects_project ON doc_projects(project_id);
+
+CREATE TABLE IF NOT EXISTS doc_repos (
+  doc_id  TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+  repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  PRIMARY KEY (doc_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_doc_repos_repo ON doc_repos(repo_id);
+
 -- État opérationnel d'une exécution (le "comment", mutable par l'orchestrateur seul).
 CREATE TABLE IF NOT EXISTS executions (
   execution_id  TEXT PRIMARY KEY,
