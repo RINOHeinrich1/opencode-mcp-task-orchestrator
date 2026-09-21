@@ -2074,15 +2074,18 @@ export async function buildAdrContext({ projectId, scope, adrIds, taskId } = {})
   }
   let adrs;
   if (Array.isArray(adrIds) && adrIds.length) {
+    // Sélection EXPLICITE : elle PRIME sur le filtre de scope (la sélection de
+    // l'utilisateur doit produire le bloc injecté — pas être filtrée).
     const fetched = await Promise.all(adrIds.map((id) => getAdr(id)));
     adrs = fetched.filter(Boolean);
   } else {
+    // Liste AUTOMATIQUE : ADR actives (Proposé/Accepté) du projet, filtrées par scope.
     const docs = await listDocs({ kind: "adr-tech", projectId: pid, includeRepoDocs: true });
     adrs = docs
       .filter((d) => d.status === "Proposé" || d.status === "Accepté")
       .map((d) => ({ ...d, adrId: d.docId }));
+    if (sc.length) adrs = adrs.filter((a) => adrMatchesScope(a, sc));
   }
-  if (sc.length) adrs = adrs.filter((a) => adrMatchesScope(a, sc));
   const context = renderAdrContextBlock(adrs, pid);
   return { projectId: pid, count: adrs.length, adrs, context };
 }
