@@ -145,6 +145,17 @@ import {
   autoCloseExpiredSprints,
   reopenSprint,
   classifyEmergence,
+  // CARDINALITÉS HEURISTIQUES + GOUVERNANCE DE L'ÉMERGENCE (T6, ADR-001 §5).
+  EMERGENT_ORIGINS,
+  CARDINALITY_RULES,
+  CARDINALITY_VIEWS,
+  checkCardinality,
+  recordCardinalitySignal,
+  listCardinalitySignals,
+  resolveCardinalitySignal,
+  cardinalityView,
+  cardinalityReport,
+  ensureDefaultSprintLink,
   // FONCTIONNALITÉS / RÈGLES / LIAISONS (T5) — CRUD + liens N:N + workflow ADR.
   registerFeature,
   updateFeature,
@@ -285,6 +296,9 @@ server.registerTool("task_register", {
     taskId: z.string().optional(),
     sessionId: z.string().optional().describe("Session opencode qui crée la tâche (liée par le plugin permission-hook)."),
     repoIds: z.array(z.string()).optional().describe("Repos ciblés de la tâche (parmi ceux du projet, ADR 09). Défaut : TOUS les repos du projet."),
+    featureIds: z.array(z.string()).optional().describe("Fonctionnalités liées à la tâche (optionnel, T6) — leur absence marque la tâche émergente `sans_fonctionnalite`."),
+    sprintId: z.string().optional().describe("Sprint explicite (optionnel, T6) ; sinon rattachement au sprint par défaut SI le projet n'a aucun sprint."),
+    adrIds: z.array(z.string()).optional().describe("ADR PROPOSÉES pour la tâche (optionnel, T6) — lien `propose`, effectif après validation humaine en recette."),
     originTaskId: z.string().optional().describe("Si cette tâche est ÉMERGENTE (créée hors scope pendant une tâche source) : taskId de la tâche SOURCE. La nouvelle tâche sera liée à sa source (relation_type='emergent')."),
     originReason: z.string().optional().describe("Raison de l'émergence (demande hors scope reçue pendant la tâche source)."),
     createdBy: z.string().optional().describe("Utilisateur (username) qui crée la tâche (attribution)."),
@@ -299,7 +313,10 @@ server.registerTool("task_register", {
     }
     const executionId = newExecutionId(taskId);
     const task = await createTask({ ...input, id: taskId, executionId });
-    return text(JSON.stringify({ ok: true, taskId, executionId, task }, null, 2));
+    // CARDINALITÉ (T6, lecture seule, NON bloquante) : manques éventuels
+    // (sprint / fonctionnalité / ADR effectif) signalés sans bloquer.
+    const cardinalite = await checkCardinality({ entityType: "task", entityId: taskId }).catch(() => null);
+    return text(JSON.stringify({ ok: true, taskId, executionId, task, cardinalite }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -779,11 +796,12 @@ server.registerTool("feature_register", {
     role: z.string().optional().describe("Rôle / acteur de la fonctionnalité."),
     userStory: z.string().describe("User story (formulation du besoin)."),
     sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
+    recetteId: z.string().optional().describe("Recette d'origine (optionnel, T6) — marque l'élément émergent d'origine `recette`."),
     createdBy: z.string().optional().describe("Acteur créateur."),
   },
-}, async ({ projectId, ref, role, userStory, sourcedPieceId, createdBy }) => {
+}, async ({ projectId, ref, role, userStory, sourcedPieceId, recetteId, createdBy }) => {
   try {
-    const feature = await registerFeature({ projectId, ref, role, userStory, sourcedPieceId, createdBy });
+    const feature = await registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, createdBy });
     return text(JSON.stringify({ ok: true, feature }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -838,11 +856,12 @@ server.registerTool("rule_register", {
     ref: z.string().describe("Référence de la règle (ex. RM-xxxx)."),
     content: z.string().describe("Contenu de la règle métier."),
     sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
+    recetteId: z.string().optional().describe("Recette d'origine (optionnel, T6) — marque la règle émergente d'origine `recette`."),
     createdBy: z.string().optional().describe("Acteur créateur."),
   },
-}, async ({ projectId, ref, content, sourcedPieceId, createdBy }) => {
+}, async ({ projectId, ref, content, sourcedPieceId, recetteId, createdBy }) => {
   try {
-    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, createdBy });
+    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, recetteId, createdBy });
     return text(JSON.stringify({ ok: true, rule }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1374,6 +1393,60 @@ server.registerTool("adr_vigilance_resolve", {
   } catch (e) { return err(e.message); }
 });
 
+// ===========================================================================
+// CARDINALITÉS HEURISTIQUES + GOUVERNANCE DE L'ÉMERGENCE (T6, ADR-001 §5).
+// SIGNALEMENT + TRAÇAGE, JAMAIS BLOQUANT. Ces tools sont en LECTURE SEULE
+// (sauf `cardinality_signal_resolve`, clôture tracée) et alimentent le panneau
+// (T7). L'émergence n'est jamais rétroactive (aucun backfill).
+// ===========================================================================
+
+server.registerTool("cardinality_report", {
+  description: "AGRÉGAT de traçage des cardinalités heuristiques d'un projet (T6) : compteurs + vues complètes (tâche sans ADR/fonctionnalité/sprint, recette sans ADR/fonctionnalité/sprint, ADR sans fonctionnalité, sprint sans fonctionnalité/règle, émergents) + synthèse des signaux (total/open/resolved/stale). `view` (optionnel) restreint à une seule vue. Lecture seule, NON bloquant.",
+  inputSchema: {
+    projectId: z.string().describe("Projet (produit) dont on veut les cardinalités."),
+    view: z.string().optional().describe(`Vue unique (sinon rapport complet) : ${CARDINALITY_VIEWS.join(" | ")}.`),
+  },
+}, async ({ projectId, view }) => {
+  try {
+    if (view) {
+      const v = await cardinalityView({ projectId, view });
+      return text(JSON.stringify({ ok: true, ...v }, null, 2));
+    }
+    const report = await cardinalityReport({ projectId });
+    return text(JSON.stringify({ ok: true, ...report }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("cardinality_signals_list", {
+  description: "HISTORIQUE filtrable des signaux de cardinalité (T6, append-only) : `projectId`, `entityType` (recette|task|adr|sprint), `entityId`, `status` (open|resolved). Chaque signal est enrichi de `currentGaps` (manques live) et `stale` (signal OPEN désormais comblé). Lecture seule.",
+  inputSchema: {
+    projectId: z.string().optional().describe("Filtre projet."),
+    entityType: z.string().optional().describe("recette | task | adr | sprint."),
+    entityId: z.string().optional().describe("Identifiant de l'entité porteuse."),
+    status: z.string().optional().describe("open | resolved."),
+    limit: z.number().optional().describe("Nombre max (défaut 500)."),
+  },
+}, async ({ projectId, entityType, entityId, status, limit }) => {
+  try {
+    const signals = await listCardinalitySignals({ projectId, entityType, entityId, status, limit });
+    return text(JSON.stringify({ count: signals.length, signals }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("cardinality_signal_resolve", {
+  description: "CLÔT un signal de cardinalité (open → resolved). `resolution` (raison TRACÉE) est OBLIGATOIRE : jamais de clôture silencieuse. Le flag `emergent` de l'entité n'est PAS effacé (trace historique).",
+  inputSchema: {
+    signalId: z.string().describe("Identifiant du signal (card-<ts>-<rand>)."),
+    resolution: z.string().describe("Raison tracée de la clôture (obligatoire)."),
+    resolvedBy: z.string().optional().describe("Acteur (défaut human)."),
+  },
+}, async ({ signalId, resolution, resolvedBy }) => {
+  try {
+    const signal = await resolveCardinalitySignal({ signalId, resolution, resolvedBy });
+    return text(JSON.stringify({ ok: true, signal }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
 server.registerTool("project_repo_link", {
   description: "Rattache un repo à un projet (produit) — N:N (ADR 09). Un repo peut servir plusieurs produits (ex. le repo oniria est lié à mada-talk ET oniria). gitTokenId : token git de l'ORGANISATION du projet à utiliser pour ce repo (clone/pull/push) — choisi parmi les gitTokens de l'organisation (org_git_token_add). Absent = inchangé (fallback token par défaut de l'org).",
   inputSchema: {
@@ -1401,7 +1474,7 @@ server.registerTool("project_repo_unlink", {
 
 // === task_get ===
 server.registerTool("task_get", {
-  description: "Renvoie le détail d'une tâche (contexte + exécutions + participants + exécutions des plans).",
+  description: "Renvoie le détail d'une tâche (contexte + exécutions + participants + exécutions des plans). Expose aussi `adrs` (liens ADR proposés/validés) et `cardinalite` (manques heuristiques : sprint / fonctionnalité / ADR effectif) — T6, non bloquant.",
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
@@ -1415,7 +1488,10 @@ server.registerTool("task_get", {
     const linkedTasks = await listTaskLinks(taskId);
     const emergentFrom = await listTaskEmergentFrom(taskId);
     const recette = await getRecette(taskId).catch(() => null);
-    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks, emergentFrom, recette }, null, 2));
+    // CARDINALITÉ (T6, lecture seule, NON bloquante) + liens ADR de la tâche.
+    const adrs = await listTaskAdrs({ taskId }).catch(() => []);
+    const cardinalite = await checkCardinality({ entityType: "task", entityId: taskId }).catch(() => null);
+    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks, emergentFrom, recette, adrs, cardinalite }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -1461,19 +1537,25 @@ server.registerTool("task_link_remove", {
      title: z.string().optional().describe("Titre court compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
      description: z.string().optional().describe("Description longue (détail du périmètre vérifié)."),
      taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N — doivent appartenir au projet de la recette)."),
+     sprintId: z.string().optional().describe("Sprint de la recette (optionnel, T6) ; sinon sprint par défaut SI le projet n'a aucun sprint."),
+     featureIds: z.array(z.string()).optional().describe("Fonctionnalités de la recette (optionnel, T6)."),
+     adrIds: z.array(z.string()).optional().describe("ADR de la recette (optionnel, T6)."),
      status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
      sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
      createdBy: z.string().optional().describe("Utilisateur (username) qui crée la recette."),
      organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
    },
-  }, async ({ project, title, description, taskIds, status, sessionId, createdBy, organizationId }) => {
-   try {
-     const recette = await startRecette({ project, title, description, taskIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
-     return text(JSON.stringify({ ok: true, recette }, null, 2));
-   } catch (e) {
-     return err(e.message);
-   }
- });
+ }, async ({ project, title, description, taskIds, sprintId, featureIds, adrIds, status, sessionId, createdBy, organizationId }) => {
+  try {
+    const recette = await startRecette({ project, title, description, taskIds, sprintId, featureIds, adrIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
+    // CARDINALITÉ (T6, lecture seule, NON bloquante) : recette → ≥1 ADR +
+    // ≥1 fonctionnalité + 1 sprint.
+    const cardinalite = await checkCardinality({ entityType: "recette", entityId: recette.recetteId }).catch(() => null);
+    return text(JSON.stringify({ ok: true, recette, cardinalite }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
 
 // === recette_list ===
 server.registerTool("recette_list", {
@@ -1490,12 +1572,14 @@ server.registerTool("recette_list", {
 
 // === recette_get ===
 server.registerTool("recette_get", {
-  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit) et `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison).",
+  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
   inputSchema: { recetteId: z.string() },
 }, async ({ recetteId }) => {
   try {
     const recette = await getRecetteById(recetteId);
     if (!recette) return err(`recette inconnue : ${recetteId}`);
+    // CARDINALITÉ (T6, lecture seule, NON bloquante) — à côté de `adrVigilances`.
+    recette.cardinalite = await checkCardinality({ entityType: "recette", entityId: recetteId }).catch(() => null);
     return text(JSON.stringify({ recette }, null, 2));
   } catch (e) {
     return err(e.message);

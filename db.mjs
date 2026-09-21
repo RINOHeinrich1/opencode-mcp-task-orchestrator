@@ -626,6 +626,36 @@ $$ LANGUAGE plpgsql`);
     PRIMARY KEY (recette_id, adr_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id)");
+  // =========================================================================
+  // CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques
+  // de cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
+  // bloquant. AUCUN BACKFILL : la table naît vide (l'émergence n'est jamais
+  // rétroactive). L'index partiel unique garantit UN SEUL signal OPEN par
+  // entité ; un nouveau passage RAFRAÎCHIT `missing`/`detail` (décision §2.5).
+  // DDL posée ici (migrate(), exécuté après schema.sql) — miroir `schema.sql`
+  // à prévoir en tâche de suivi (dérive DDL assumée, précédent T5).
+  // =========================================================================
+  await pool().query(`CREATE TABLE IF NOT EXISTS cardinality_signals (
+    signal_id    TEXT PRIMARY KEY,
+    project      TEXT NOT NULL,
+    entity_type  TEXT NOT NULL,
+    entity_id    TEXT NOT NULL,
+    missing      TEXT NOT NULL,
+    detail       TEXT,
+    status       TEXT NOT NULL DEFAULT 'open',
+    origin       TEXT,
+    created_at   TEXT NOT NULL,
+    created_by   TEXT,
+    updated_at   TEXT,
+    resolved_at  TEXT,
+    resolved_by  TEXT,
+    resolution   TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cardinality_signals_project ON cardinality_signals(project)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cardinality_signals_entity ON cardinality_signals(entity_type, entity_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cardinality_signals_status ON cardinality_signals(status)");
+  // UN SEUL signal OPEN par entité (les signaux résolus restent en historique).
+  await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_cardinality_signals_open_entity ON cardinality_signals(entity_type, entity_id) WHERE status = 'open'");
 }
 
 // Détecte l'état de sprint d'un PROJET (table `sprints`, livrée par
@@ -893,9 +923,22 @@ export async function attachPiecesToSprint(sprintId, { pieceIds, atInit = false,
 //                    apres_cloture si close) ; aucun sprint → non émergent.
 //   kind='element' : (fonctionnalité / règle / tâche) aucun sprint → émergent
 //                    `hors_sprint` ; dernier sprint close → `apres_cloture` ;
-//                    sprint open → non émergent (appartient au sprint courant).
+//                    sprint open → non émergent (appartient au sprint courant),
+//                    SAUF si `fromRecette=true` (→ `recette`) ou si
+//                    `hasFeature === false` (→ `sans_fonctionnalite`).
+//
+// PRIORITÉ des origines d'émergence (T6) — la plus haute l'emporte :
+//   1. `hors_sprint`        (aucun sprint du projet)
+//   2. `apres_cloture`      (dernier sprint clôturé)
+//   3. `recette`            (élément apparu en recette : règle/tâche/fonctionnalité)
+//   4. `sans_fonctionnalite`(élément du sprint courant sans fonctionnalité)
+// `apres_init_sprint` (pièces, T2/T4) reste INCHANGÉ et hors de cette échelle.
+//
+// RÉTROCOMPATIBILITÉ : `hasFeature` / `fromRecette` sont OPTIONNELS ; les
+// appels legacy `{kind:'element'}` / `{kind:'piece'}` produisent EXACTEMENT
+// le même résultat qu'avant T6.
 // Balaye d'abord la clôture auto (l'état lu est à jour).
-export async function classifyEmergence(projectId, { kind = "element" } = {}) {
+export async function classifyEmergence(projectId, { kind = "element", hasFeature, fromRecette } = {}) {
   await ensureSchema();
   const pid = projectId ? String(projectId).trim() : "";
   if (!pid) return { sprintId: null, sprintStatus: null, emergent: false, emergentOrigin: null };
@@ -908,12 +951,18 @@ export async function classifyEmergence(projectId, { kind = "element" } = {}) {
       : { sprintId: null, sprintStatus: null, emergent: true, emergentOrigin: "hors_sprint" };
   }
   if (sprint.status === "open") {
-    return {
-      sprintId: sprint.sprintId,
-      sprintStatus: "open",
-      emergent: isPiece,
-      emergentOrigin: isPiece ? "apres_init_sprint" : null,
-    };
+    if (isPiece) {
+      return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: true, emergentOrigin: "apres_init_sprint" };
+    }
+    // Élément dans le sprint courant : origine `recette` (3) puis
+    // `sans_fonctionnalite` (4) ; sinon non émergent.
+    if (fromRecette === true) {
+      return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: true, emergentOrigin: "recette" };
+    }
+    if (hasFeature === false) {
+      return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: true, emergentOrigin: "sans_fonctionnalite" };
+    }
+    return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: false, emergentOrigin: null };
   }
   return { sprintId: sprint.sprintId, sprintStatus: "close", emergent: true, emergentOrigin: "apres_cloture" };
 }
@@ -1007,6 +1056,9 @@ export async function createSprint({ projectId, title, startDate, endDate, autoC
   if (Array.isArray(pieces) && pieces.length > 0) {
     await attachPiecesToSprint(id, { pieceIds: pieces, atInit: true, by: createdBy });
   }
+  // SIGNAL de cardinalité (T6, NON bloquant) : un sprint neuf n'a ni
+  // fonctionnalité ni règle — le manque est signalé + tracé, jamais bloquant.
+  try { await recordCardinalitySignal({ entityType: "sprint", entityId: id, projectId: pid, by: createdBy }); } catch {}
   return getSprintDetail(id);
 }
 
@@ -1285,9 +1337,10 @@ async function assertPieceOwnedByProject(pieceId, projectId) {
 // (garde nature T2 `assertAttachablePiece` + appartenance au projet).
 // ÉMERGENCE (`classifyEmergence`, kind='element') : hors sprint → `hors_sprint`,
 // dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et
-// rattachée au sprint courant (`sprint_fonctionnalites`). `organization_id`
+// rattachée au sprint courant (`sprint_fonctionnalites`). `recetteId` optionnel
+// (T6) → origine `recette` (élément apparu en recette). `organization_id`
 // héritée du projet. `ref` déjà utilisée pour le projet → erreur explicite.
-export async function registerFeature({ projectId, ref, role, userStory, sourcedPieceId, createdBy } = {}) {
+export async function registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, createdBy } = {}) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
   const pid = String(projectId).trim();
@@ -1309,7 +1362,7 @@ export async function registerFeature({ projectId, ref, role, userStory, sourced
   )).rows[0];
   if (dup) throw new Error(`référence déjà utilisée pour le projet ${pid} : ${rf} (${dup.id})`);
 
-  const em = await classifyEmergence(pid, { kind: "element" });
+  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!recetteId });
   const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
   const id = `FEAT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();
@@ -1446,8 +1499,9 @@ export async function listFeatures({ projectId, emergent, search, limit } = {}) 
 
 // CRÉATION d'une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3). Mêmes gardes que
 // `registerFeature` (projet, pièce source, émergence). Non émergente ⇒ lien
-// `sprint_regles` au sprint ouvert.
-export async function registerRule({ projectId, ref, content, sourcedPieceId, createdBy } = {}) {
+// `sprint_regles` au sprint ouvert. `recetteId` optionnel (T6) → origine
+// `recette` (règle métier apparue en recette).
+export async function registerRule({ projectId, ref, content, sourcedPieceId, recetteId, createdBy } = {}) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
   const pid = String(projectId).trim();
@@ -1469,7 +1523,7 @@ export async function registerRule({ projectId, ref, content, sourcedPieceId, cr
   )).rows[0];
   if (dup) throw new Error(`référence déjà utilisée pour le projet ${pid} : ${rf} (${dup.id})`);
 
-  const em = await classifyEmergence(pid, { kind: "element" });
+  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!recetteId });
   const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
   const id = `RMET-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();
@@ -1859,6 +1913,467 @@ export async function listTaskAdrs({ taskId, status } = {}) {
   }));
 }
 
+// ===========================================================================
+// CARDINALITÉS HEURISTIQUES + GOUVERNANCE DE L'ÉMERGENCE (T6, ADR-001 §5).
+// SIGNALEMENT + TRAÇAGE, JAMAIS BLOQUANT : ces gardes ne refusent aucune
+// création ; elles calculent les manques (`checkCardinality`), les TRACENT
+// (`cardinality_signals`, append-only) et exposent des VUES de suivi.
+// L'ÉMERGENCE n'est JAMAIS RÉTROACTIVE : aucune fonction de ce bloc ne marque
+// les éléments EXISTANTS (aucun backfill ; le marquage n'a lieu qu'à la
+// création, cf. `createTask`/`startRecette`/`registerFeature`/`registerRule`).
+// ===========================================================================
+
+// Origines d'émergence connues (flag `emergent_origin`). `sans_piece` est
+// conservée pour compatibilité ascendante (héritage T1) mais n'est produite
+// par aucune étape T6.
+export const EMERGENT_ORIGINS = [
+  "hors_sprint",
+  "apres_cloture",
+  "apres_init_sprint",
+  "recette",
+  "sans_fonctionnalite",
+  "sans_piece",
+];
+
+// Cardinalités attendues par type d'entité (heuristiques, non bloquantes).
+//   recette : 1 sprint + 1..N fonctionnalités + 1..N ADR
+//   task    : 1 sprint + 1 fonctionnalité + 1..N ADR EFFECTIF (lien validé)
+//   adr     : 1..N fonctionnalités
+//   sprint  : 1..N fonctionnalités + 1..N règles métier
+export const CARDINALITY_RULES = {
+  recette: { sprint: 1, fonctionnalite: 1, adr: 1 },
+  task: { sprint: 1, fonctionnalite: 1, adr: 1 },
+  adr: { fonctionnalite: 1 },
+  sprint: { fonctionnalite: 1, regle: 1 },
+};
+export const CARDINALITY_ENTITY_TYPES = ["recette", "task", "adr", "sprint"];
+export const CARDINALITY_VIEWS = [
+  "tache_sans_adr",
+  "tache_sans_fonctionnalite",
+  "tache_sans_sprint",
+  "recette_sans_adr",
+  "recette_sans_fonctionnalite",
+  "recette_sans_sprint",
+  "adr_sans_fonctionnalite",
+  "sprint_sans_fonctionnalite",
+  "sprint_sans_regle",
+  "emergents",
+];
+
+// Parse tolérant d'une colonne JSON TEXT (legacy) ou déjà objet.
+function parseJsonSafe(raw, fallback) {
+  if (raw === null || raw === undefined) return fallback;
+  if (typeof raw === "object") return raw;
+  try { return JSON.parse(raw); } catch { return fallback; }
+}
+
+function rowToCardinalitySignal(r) {
+  if (!r) return null;
+  return {
+    signalId: r.signal_id,
+    project: r.project,
+    entityType: r.entity_type,
+    entityId: r.entity_id,
+    missing: parseJsonSafe(r.missing, []),
+    detail: parseJsonSafe(r.detail, {}),
+    status: r.status,
+    origin: r.origin ?? null,
+    createdAt: r.created_at,
+    createdBy: r.created_by ?? null,
+    updatedAt: r.updated_at ?? null,
+    resolvedAt: r.resolved_at ?? null,
+    resolvedBy: r.resolved_by ?? null,
+    resolution: r.resolution ?? null,
+  };
+}
+
+async function getCardinalitySignalById(signalId) {
+  if (!signalId) return null;
+  const r = (await pool().query("SELECT * FROM cardinality_signals WHERE signal_id = $1", [String(signalId)])).rows[0];
+  return rowToCardinalitySignal(r);
+}
+
+// CALCUL LIVE des manques de cardinalité d'une entité. NE THROW JAMAIS sur un
+// manque : retourne `{ ok, found, entityType, entityId, projectId, missing[], detail }`
+// où `ok = (missing.length === 0)` et `found` distingue une entité inconnue.
+export async function checkCardinality({ entityType, entityId, projectId } = {}) {
+  await ensureSchema();
+  const type = entityType ? String(entityType).trim() : "";
+  const id = entityId ? String(entityId).trim() : "";
+  const out = {
+    ok: true,
+    found: true,
+    entityType: type,
+    entityId: id,
+    projectId: projectId ? String(projectId).trim() : null,
+    missing: [],
+    detail: {},
+  };
+  if (!type || !id) {
+    out.ok = false; out.found = false;
+    out.detail = { error: "entityType et entityId requis" };
+    return out;
+  }
+  if (!CARDINALITY_ENTITY_TYPES.includes(type)) {
+    out.ok = false; out.found = false;
+    out.detail = { error: `entityType inconnu : ${type} (attendu : ${CARDINALITY_ENTITY_TYPES.join(" | ")})` };
+    return out;
+  }
+  try {
+    if (type === "task") {
+      const t = await getTask(id);
+      if (!t) { out.ok = false; out.found = false; out.detail = { error: `tâche inconnue : ${id}` }; return out; }
+      out.projectId = out.projectId || t.project || null;
+      const [sp, fe, adr, adrProp] = await Promise.all([
+        pool().query("SELECT COUNT(*) AS n FROM task_sprints WHERE task_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM task_fonctionnalites WHERE task_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM task_adr WHERE task_id = $1 AND status = 'valide'", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM task_adr WHERE task_id = $1 AND status = 'propose'", [id]),
+      ]);
+      const nSp = Number(sp.rows[0].n) || 0;
+      const nFe = Number(fe.rows[0].n) || 0;
+      const nAdr = Number(adr.rows[0].n) || 0;
+      out.detail = { sprint: nSp, fonctionnalite: nFe, adr: nAdr, adrPropose: Number(adrProp.rows[0].n) || 0 };
+      if (nSp < 1) out.missing.push("sprint");
+      if (nFe < 1) out.missing.push("fonctionnalite");
+      if (nAdr < 1) out.missing.push("adr");
+    } else if (type === "recette") {
+      const r = await getRecetteById(id);
+      if (!r) { out.ok = false; out.found = false; out.detail = { error: `recette inconnue : ${id}` }; return out; }
+      out.projectId = out.projectId || r.project || null;
+      const [sp, fe, adr] = await Promise.all([
+        pool().query("SELECT COUNT(*) AS n FROM recette_sprints WHERE recette_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM recette_fonctionnalites WHERE recette_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM recette_adr WHERE recette_id = $1", [id]),
+      ]);
+      const nSp = Number(sp.rows[0].n) || 0;
+      const nFe = Number(fe.rows[0].n) || 0;
+      const nAdr = Number(adr.rows[0].n) || 0;
+      out.detail = { sprint: nSp, fonctionnalite: nFe, adr: nAdr };
+      if (nSp < 1) out.missing.push("sprint");
+      if (nFe < 1) out.missing.push("fonctionnalite");
+      if (nAdr < 1) out.missing.push("adr");
+    } else if (type === "adr") {
+      const a = await getAdr(id);
+      if (!a) { out.ok = false; out.found = false; out.detail = { error: `ADR inconnue (kind='adr-tech' attendu) : ${id}` }; return out; }
+      if (!out.projectId && Array.isArray(a.projects) && a.projects.length) out.projectId = a.projects[0];
+      const fe = await pool().query("SELECT COUNT(*) AS n FROM fonctionnalite_adr WHERE adr_id = $1", [id]);
+      const nFe = Number(fe.rows[0].n) || 0;
+      out.detail = { fonctionnalite: nFe };
+      if (nFe < 1) out.missing.push("fonctionnalite");
+    } else if (type === "sprint") {
+      const s = await getSprint(id);
+      if (!s) { out.ok = false; out.found = false; out.detail = { error: `sprint inconnu : ${id}` }; return out; }
+      out.projectId = out.projectId || s.project || null;
+      const [fe, re] = await Promise.all([
+        pool().query("SELECT COUNT(*) AS n FROM sprint_fonctionnalites WHERE sprint_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM sprint_regles WHERE sprint_id = $1", [id]),
+      ]);
+      const nFe = Number(fe.rows[0].n) || 0;
+      const nRe = Number(re.rows[0].n) || 0;
+      out.detail = { fonctionnalite: nFe, regle: nRe };
+      if (nFe < 1) out.missing.push("fonctionnalite");
+      if (nRe < 1) out.missing.push("regle");
+    }
+  } catch (e) {
+    out.ok = false;
+    out.detail = { error: e.message };
+    return out;
+  }
+  out.ok = out.missing.length === 0;
+  return out;
+}
+
+// PERSISTE le signal de cardinalité OPEN d'une entité (upsert par entité :
+// l'index partiel unique garantit 1 seul OPEN ; un nouveau passage RAFRAÎCHIT
+// `missing`/`detail`). NE THROW JAMAIS (try/catch intégral) : le flot de
+// création (panneau) reste intact même si la garde échoue. `by` est tracé.
+export async function recordCardinalitySignal({ entityType, entityId, projectId, by } = {}) {
+  try {
+    await ensureSchema();
+    const check = await checkCardinality({ entityType, entityId, projectId });
+    if (!check.found) return { ok: false, error: (check.detail && check.detail.error) || "entité inconnue", check };
+    const pid = check.projectId || (projectId ? String(projectId).trim() : null);
+    if (!pid) return { ok: false, error: "projectId introuvable pour le signal", check };
+    const type = check.entityType;
+    const id = check.entityId;
+    const ts = nowIso();
+    const existing = (await pool().query(
+      "SELECT * FROM cardinality_signals WHERE entity_type = $1 AND entity_id = $2 AND status = 'open' ORDER BY created_at DESC LIMIT 1",
+      [type, id],
+    )).rows[0];
+    if (check.missing.length === 0) {
+      // Aucun manque : on rafraîchit un éventuel OPEN (il devient « stale » côté
+      // lecture) sans en créer ; sinon rien (pas de signal inutile).
+      if (existing) {
+        await pool().query(
+          "UPDATE cardinality_signals SET missing = $2, detail = $3, updated_at = $4 WHERE signal_id = $1",
+          [existing.signal_id, JSON.stringify([]), JSON.stringify(check.detail), ts],
+        );
+        return { ok: true, signal: await getCardinalitySignalById(existing.signal_id), created: false, refreshed: true, missing: [] };
+      }
+      return { ok: true, signal: null, created: false, missing: [] };
+    }
+    if (existing) {
+      await pool().query(
+        "UPDATE cardinality_signals SET missing = $2, detail = $3, updated_at = $4 WHERE signal_id = $1",
+        [existing.signal_id, JSON.stringify(check.missing), JSON.stringify(check.detail), ts],
+      );
+      return { ok: true, signal: await getCardinalitySignalById(existing.signal_id), created: false, refreshed: true, missing: check.missing };
+    }
+    const signalId = `card-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    await pool().query(
+      `INSERT INTO cardinality_signals
+         (signal_id, project, entity_type, entity_id, missing, detail, status, origin, created_at, created_by, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'open',$7,$8,$9,$8)`,
+      [signalId, pid, type, id, JSON.stringify(check.missing), JSON.stringify(check.detail), null, ts, by ?? null],
+    );
+    // Événement de tâche (traçage) — uniquement quand l'entité est une tâche.
+    if (type === "task") {
+      try {
+        await appendEvent({
+          eventId: `${id}-CARD-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          taskId: id,
+          type: "CARDINALITY_SIGNAL",
+          by: by || "build-notify",
+          detail: { signalId, missing: check.missing, detail: check.detail },
+        });
+      } catch {}
+    }
+    return { ok: true, signal: await getCardinalitySignalById(signalId), created: true, missing: check.missing };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+// HISTORIQUE filtrable des signaux (append-only, lecture seule). Chaque signal
+// est enrichi du calcul LIVE `currentGaps`/`currentOk` et du drapeau `stale`
+// (signal OPEN dont les manques sont désormais COMBLÉS).
+export async function listCardinalitySignals({ projectId, entityType, entityId, status, limit } = {}) {
+  await ensureSchema();
+  const conds = [];
+  const params = [];
+  if (projectId) { params.push(String(projectId)); conds.push(`project = $${params.length}`); }
+  if (entityType) { params.push(String(entityType)); conds.push(`entity_type = $${params.length}`); }
+  if (entityId) { params.push(String(entityId)); conds.push(`entity_id = $${params.length}`); }
+  if (status) { params.push(String(status)); conds.push(`status = $${params.length}`); }
+  const lim = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.min(Number(limit), 5000) : 500;
+  params.push(lim);
+  const rows = (await pool().query(
+    `SELECT * FROM cardinality_signals ${conds.length ? `WHERE ${conds.join(" AND ")}` : ""} ORDER BY created_at DESC, signal_id DESC LIMIT $${params.length}`,
+    params,
+  )).rows;
+  const out = [];
+  for (const r of rows) {
+    const signal = rowToCardinalitySignal(r);
+    try {
+      const check = await checkCardinality({ entityType: signal.entityType, entityId: signal.entityId, projectId: signal.project });
+      signal.currentGaps = check.missing;
+      signal.currentOk = check.ok;
+      signal.stale = signal.status === "open" && check.missing.length === 0;
+    } catch {
+      signal.currentGaps = null;
+      signal.currentOk = null;
+      signal.stale = false;
+    }
+    out.push(signal);
+  }
+  return out;
+}
+
+// CLÔTURE TRACÉE d'un signal (open → resolved). `resolution` (raison) est
+// OBLIGATOIRE : jamais de clôture silencieuse. Style `resolveAdrVigilance`.
+export async function resolveCardinalitySignal({ signalId, resolution, resolvedBy } = {}) {
+  await ensureSchema();
+  if (!signalId) throw new Error("signalId requis");
+  const res = resolution === undefined || resolution === null ? "" : String(resolution).trim();
+  if (!res) throw new Error("resolution requise (raison tracée de la clôture)");
+  const row = (await pool().query("SELECT * FROM cardinality_signals WHERE signal_id = $1", [String(signalId)])).rows[0];
+  if (!row) throw new Error(`signal de cardinalité inconnu : ${signalId}`);
+  if (row.status !== "open") throw new Error(`signal déjà résolu : ${signalId}`);
+  const ts = nowIso();
+  await pool().query(
+    `UPDATE cardinality_signals
+        SET status = 'resolved', resolved_at = $2, resolved_by = $3, resolution = $4, updated_at = $2
+      WHERE signal_id = $1`,
+    [String(signalId), ts, resolvedBy ?? "human", res],
+  );
+  return getCardinalitySignalById(signalId);
+}
+
+// RATTACHEMENT NON BLOQUANT au sprint PAR DÉFAUT du projet (décision T6 §2.3) :
+// uniquement si l'entité (task | recette) n'a AUCUN lien sprint ET que le projet
+// n'a AUCUN sprint. Idempotent, jamais bloquant (try/catch intégral).
+export async function ensureDefaultSprintLink({ entityType, entityId, projectId, by } = {}) {
+  try {
+    await ensureSchema();
+    const type = entityType ? String(entityType).trim() : "";
+    const id = entityId ? String(entityId).trim() : "";
+    if (!["task", "recette"].includes(type) || !id) {
+      return { ok: false, linked: false, error: "entityType (task|recette) et entityId requis" };
+    }
+    let pid = projectId ? String(projectId).trim() : "";
+    if (!pid) {
+      if (type === "task") { const t = await getTask(id); pid = t ? (t.project || "") : ""; }
+      else { const r = await getRecetteById(id); pid = r ? (r.project || "") : ""; }
+    }
+    if (!pid) return { ok: false, linked: false, error: "projectId introuvable" };
+    const linkTable = type === "task" ? "task_sprints" : "recette_sprints";
+    const col = type === "task" ? "task_id" : "recette_id";
+    const existing = (await pool().query(`SELECT sprint_id FROM ${linkTable} WHERE ${col} = $1 LIMIT 1`, [id])).rows[0];
+    if (existing) return { ok: true, linked: false, reason: "deja_lie", sprintId: existing.sprint_id };
+    const anySprint = (await pool().query("SELECT id FROM sprints WHERE project = $1 LIMIT 1", [pid])).rows[0];
+    if (anySprint) return { ok: true, linked: false, reason: "projet_a_un_sprint", sprintId: anySprint.id };
+    const sprint = await ensureDefaultSprint(pid, { createdBy: by });
+    if (!sprint) return { ok: false, linked: false, error: "sprint par défaut non créé" };
+    if (type === "task") await linkTaskSprint({ taskId: id, sprintId: sprint.id });
+    else await linkRecetteSprint({ recetteId: id, sprintId: sprint.id });
+    return { ok: true, linked: true, sprintId: sprint.id, sprint };
+  } catch (e) {
+    return { ok: false, linked: false, error: e.message };
+  }
+}
+
+// VUE DE TRAÇAGE live (10 vues). Retourne `{ view, count, items }`. Lève
+// uniquement si `projectId` ou `view` sont invalides (paramètres d'appel).
+export async function cardinalityView({ projectId, view } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  const v = view ? String(view).trim() : "";
+  if (!CARDINALITY_VIEWS.includes(v)) {
+    throw new Error(`vue inconnue : ${view} (attendu : ${CARDINALITY_VIEWS.join(" | ")})`);
+  }
+  let items = [];
+  if (v === "tache_sans_adr") {
+    items = (await pool().query(
+      `SELECT t.id, t.title, t.request, t.emergent, t.emergent_origin, t.created_at
+         FROM tasks t
+        WHERE t.project = $1
+          AND NOT EXISTS (SELECT 1 FROM task_adr ta WHERE ta.task_id = t.id AND ta.status = 'valide')
+        ORDER BY t.created_at ASC, t.id ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "task", id: r.id, title: r.title ?? null, request: r.request ?? null, emergent: !!r.emergent, emergentOrigin: r.emergent_origin ?? null, createdAt: r.created_at }));
+  } else if (v === "tache_sans_fonctionnalite") {
+    items = (await pool().query(
+      `SELECT t.id, t.title, t.request, t.emergent, t.emergent_origin, t.created_at
+         FROM tasks t
+        WHERE t.project = $1
+          AND NOT EXISTS (SELECT 1 FROM task_fonctionnalites tf WHERE tf.task_id = t.id)
+        ORDER BY t.created_at ASC, t.id ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "task", id: r.id, title: r.title ?? null, request: r.request ?? null, emergent: !!r.emergent, emergentOrigin: r.emergent_origin ?? null, createdAt: r.created_at }));
+  } else if (v === "tache_sans_sprint") {
+    items = (await pool().query(
+      `SELECT t.id, t.title, t.request, t.emergent, t.emergent_origin, t.created_at
+         FROM tasks t
+        WHERE t.project = $1
+          AND NOT EXISTS (SELECT 1 FROM task_sprints ts WHERE ts.task_id = t.id)
+        ORDER BY t.created_at ASC, t.id ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "task", id: r.id, title: r.title ?? null, request: r.request ?? null, emergent: !!r.emergent, emergentOrigin: r.emergent_origin ?? null, createdAt: r.created_at }));
+  } else if (v === "recette_sans_adr") {
+    items = (await pool().query(
+      `SELECT r.recette_id, r.title, r.status, r.created_at
+         FROM recettes r
+        WHERE r.project = $1
+          AND NOT EXISTS (SELECT 1 FROM recette_adr ra WHERE ra.recette_id = r.recette_id)
+        ORDER BY r.created_at ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "recette", id: r.recette_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
+  } else if (v === "recette_sans_fonctionnalite") {
+    items = (await pool().query(
+      `SELECT r.recette_id, r.title, r.status, r.created_at
+         FROM recettes r
+        WHERE r.project = $1
+          AND NOT EXISTS (SELECT 1 FROM recette_fonctionnalites rf WHERE rf.recette_id = r.recette_id)
+        ORDER BY r.created_at ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "recette", id: r.recette_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
+  } else if (v === "recette_sans_sprint") {
+    items = (await pool().query(
+      `SELECT r.recette_id, r.title, r.status, r.created_at
+         FROM recettes r
+        WHERE r.project = $1
+          AND NOT EXISTS (SELECT 1 FROM recette_sprints rs WHERE rs.recette_id = r.recette_id)
+        ORDER BY r.created_at ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "recette", id: r.recette_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
+  } else if (v === "adr_sans_fonctionnalite") {
+    items = (await pool().query(
+      `SELECT a.artifact_id, a.title, a.path, a.status, a.created_at
+         FROM artifacts a
+         JOIN artifact_projects ap ON ap.artifact_id = a.artifact_id
+        WHERE a.doc_type = 'adr' AND ap.project_id = $1
+          AND NOT EXISTS (SELECT 1 FROM fonctionnalite_adr fa WHERE fa.adr_id = a.artifact_id)
+        ORDER BY a.created_at ASC, a.artifact_id ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "adr", id: r.artifact_id, title: r.title ?? null, path: r.path ?? null, status: r.status ?? null, createdAt: r.created_at }));
+  } else if (v === "sprint_sans_fonctionnalite") {
+    items = (await pool().query(
+      `SELECT s.id, s.title, s.status, s.is_default, s.created_at
+         FROM sprints s
+        WHERE s.project = $1
+          AND NOT EXISTS (SELECT 1 FROM sprint_fonctionnalites sf WHERE sf.sprint_id = s.id)
+        ORDER BY s.created_at ASC, s.id ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "sprint", id: r.id, title: r.title ?? null, status: r.status ?? null, isDefault: !!r.is_default, createdAt: r.created_at }));
+  } else if (v === "sprint_sans_regle") {
+    items = (await pool().query(
+      `SELECT s.id, s.title, s.status, s.is_default, s.created_at
+         FROM sprints s
+        WHERE s.project = $1
+          AND NOT EXISTS (SELECT 1 FROM sprint_regles sr WHERE sr.sprint_id = s.id)
+        ORDER BY s.created_at ASC, s.id ASC`, [pid],
+    )).rows.map((r) => ({ entityType: "sprint", id: r.id, title: r.title ?? null, status: r.status ?? null, isDefault: !!r.is_default, createdAt: r.created_at }));
+  } else if (v === "emergents") {
+    const [tasks, feats, regles, pieces] = await Promise.all([
+      pool().query(
+        `SELECT id, title, request, emergent_origin, created_at FROM tasks
+          WHERE project = $1 AND emergent = 1 ORDER BY created_at ASC, id ASC`, [pid]),
+      pool().query(
+        `SELECT id, ref, user_story, emergent_origin, created_at FROM fonctionnalites
+          WHERE project = $1 AND emergent = 1 ORDER BY ref ASC`, [pid]),
+      pool().query(
+        `SELECT id, ref, content, emergent_origin, created_at FROM regles_metier
+          WHERE project = $1 AND emergent = 1 ORDER BY ref ASC`, [pid]),
+      pool().query(
+        `SELECT artifact_id, title, meta, created_at FROM artifacts
+          WHERE doc_type = 'piece' AND content_id = $1
+            AND COALESCE(meta, '{}'::jsonb)->>'emergent' = 'true'
+          ORDER BY created_at ASC, artifact_id ASC`, [pid]),
+    ]);
+    items = [
+      ...tasks.rows.map((r) => ({ entityType: "task", id: r.id, title: r.title ?? null, request: r.request ?? null, emergentOrigin: r.emergent_origin ?? null, createdAt: r.created_at })),
+      ...feats.rows.map((r) => ({ entityType: "fonctionnalite", id: r.id, ref: r.ref, title: r.user_story ?? null, emergentOrigin: r.emergent_origin ?? null, createdAt: r.created_at })),
+      ...regles.rows.map((r) => ({ entityType: "regle", id: r.id, ref: r.ref, title: r.content ?? null, emergentOrigin: r.emergent_origin ?? null, createdAt: r.created_at })),
+      ...pieces.rows.map((r) => ({ entityType: "piece", id: r.artifact_id, title: r.title ?? null, emergentOrigin: parseJsonSafe(r.meta, {}).emergent_origin ?? null, createdAt: r.created_at })),
+    ];
+  }
+  return { view: v, count: items.length, items };
+}
+
+// AGRÉGAT de traçage d'un projet : compteurs par vue + vues complètes +
+// synthèse des signaux (total/open/resolved/stale). Lecture seule.
+export async function cardinalityReport({ projectId } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  const views = {};
+  const counts = {};
+  for (const v of CARDINALITY_VIEWS) {
+    views[v] = await cardinalityView({ projectId: pid, view: v });
+    counts[v] = views[v].count;
+  }
+  const signals = await listCardinalitySignals({ projectId: pid });
+  const open = signals.filter((s) => s.status === "open");
+  return {
+    projectId: pid,
+    generatedAt: nowIso(),
+    counts,
+    views,
+    signals: {
+      total: signals.length,
+      open: open.length,
+      resolved: signals.length - open.length,
+      stale: open.filter((s) => s.stale).length,
+      items: signals,
+    },
+  };
+}
+
 // --- Liaisons RECETTE ↔ sprint / fonctionnalité(s) / ADR(s) -----------------
 
 export async function linkRecetteSprint({ recetteId, sprintId } = {}) {
@@ -1994,17 +2509,39 @@ export async function createTask(task) {
      VALUES ($1,$2,1,0,'queued',$3,$3)`,
     [task.executionId, task.id, nowIso()],
   );
+  // LIENS OPTIONNELS (T6) — NON BLOQUANTS : sprint explicite OU sprint par
+  // défaut (si le projet n'a AUCUN sprint), fonctionnalités, ADR PROPOSÉES
+  // (l'humain valide en recette). Chaque garde est en try/catch : la création
+  // ne peut JAMAIS échouer à cause d'un lien.
+  try {
+    if (task.sprintId) await linkTaskSprint({ taskId: task.id, sprintId: task.sprintId });
+    else await ensureDefaultSprintLink({ entityType: "task", entityId: task.id, projectId: task.project, by: createdBy });
+  } catch {}
+  for (const fid of Array.isArray(task.featureIds) ? task.featureIds : []) {
+    if (!fid) continue;
+    try { await linkTaskFeature({ taskId: task.id, featureId: fid }); } catch {}
+  }
+  for (const aid of Array.isArray(task.adrIds) ? task.adrIds : []) {
+    if (!aid) continue;
+    try { await proposeTaskAdr({ taskId: task.id, adrId: aid, by: createdBy, reason: "lien ADR proposé à la création (T6)" }); } catch {}
+  }
   // ÉMERGENCE de la TÂCHE (ADR-001 §5) via la garde partagée : créée hors sprint
-  // (`hors_sprint`) ou après clôture (`apres_cloture`) → marquée émergente,
-  // TRACÉE et NON BLOQUANTE. Jamais rétroactif (les tâches existantes ne sont
-  // pas re-marquées — migration T9).
-  const emergence = await classifyEmergence(task.project, { kind: "element" });
+  // (`hors_sprint`), après clôture (`apres_cloture`), issue d'une recette
+  // (`recette`) ou sans fonctionnalité dans le sprint courant
+  // (`sans_fonctionnalite`) → marquée émergente, TRACÉE et NON BLOQUANTE.
+  // Jamais rétroactif (les tâches existantes ne sont pas re-marquées — T9).
+  const hasFeature = Array.isArray(task.featureIds) && task.featureIds.length > 0;
+  const fromRecette = !!task.recetteId;
+  const emergence = await classifyEmergence(task.project, { kind: "element", hasFeature, fromRecette });
   if (emergence.emergent) {
     await pool().query(
       "UPDATE tasks SET emergent = 1, emergent_origin = $2 WHERE id = $1",
       [task.id, emergence.emergentOrigin],
     );
   }
+  // SIGNAL de cardinalité (traçage, NON bloquant) : la tâche manque-t-elle
+  // encore sprint / fonctionnalité / ADR EFFECTIF ?
+  try { await recordCardinalitySignal({ entityType: "task", entityId: task.id, projectId: task.project, by: createdBy }); } catch {}
   // Tâches liées éventuelles (nature de liaison).
   for (const l of task.linkedTasks || []) {
     if (l && l.taskId) {
@@ -3869,6 +4406,8 @@ export async function registerAdr({
       }
     }
   }
+  // SIGNAL de cardinalité (T6, NON bloquant) : ADR → 1..N fonctionnalités.
+  try { await recordCardinalitySignal({ entityType: "adr", entityId: adrId, projectId, by: createdBy }); } catch {}
   return getAdr(adrId);
 }
 
@@ -4358,7 +4897,11 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
 // ===========================================================================
 
 // Crée une recette de PROJET (titre + 0..N tâches couvertes) et la passe en cours.
-export async function startRecette({ project, projects, title, description, taskIds, status = "pending", sessionId = null, organizationId, createdBy }) {
+// `sprintId`/`featureIds`/`adrIds` (T6, OPTIONNELS) : liens posés à la création
+// (NON bloquants). Sans `sprintId`, rattachement au SPRINT PAR DÉFAUT si le projet
+// n'a aucun sprint. Un signal de cardinalité est tracé (recette → ≥1 ADR + ≥1
+// fonctionnalité + 1 sprint).
+export async function startRecette({ project, projects, title, description, taskIds, sprintId, featureIds, adrIds, status = "pending", sessionId = null, organizationId, createdBy }) {
   await ensureSchema();
   // 1 recette = 1 PROJET unique. Les repos transverses du projet (project_repos)
   // sont la portée de la recette — pas d'ajout de projets supplémentaires.
@@ -4376,6 +4919,22 @@ export async function startRecette({ project, projects, title, description, task
   for (const t of taskIds || []) {
     if (t) await linkRecetteTask(recetteId, t);
   }
+  // LIENS OPTIONNELS (T6) — NON BLOQUANTS : sprint explicite OU sprint par
+  // défaut (si le projet n'a aucun sprint), fonctionnalités, ADR.
+  try {
+    if (sprintId) await linkRecetteSprint({ recetteId, sprintId });
+    else await ensureDefaultSprintLink({ entityType: "recette", entityId: recetteId, projectId: p, by: createdBy });
+  } catch {}
+  for (const fid of Array.isArray(featureIds) ? featureIds : []) {
+    if (!fid) continue;
+    try { await linkRecetteFeature({ recetteId, featureId: fid }); } catch {}
+  }
+  for (const aid of Array.isArray(adrIds) ? adrIds : []) {
+    if (!aid) continue;
+    try { await linkRecetteAdr({ recetteId, adrId: aid }); } catch {}
+  }
+  // SIGNAL de cardinalité (traçage, NON bloquant).
+  try { await recordCardinalitySignal({ entityType: "recette", entityId: recetteId, projectId: p, by: createdBy }); } catch {}
   return getRecetteById(recetteId);
 }
 
