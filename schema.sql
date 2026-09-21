@@ -3,6 +3,17 @@
 -- Types : TEXT (chaînes/ISO 8601/JSON sérialisé), INTEGER, et IDENTITY pour les
 -- séquences (remplace rowid/AUTOINCREMENT de SQLite).
 
+-- Marqueur de VERSION du schéma : `ensureSchema()` (db.mjs) lit la ligne
+-- `schema_version` et SAUTE le rejeu de ce fichier + `migrate()` si la version
+-- correspond. `SCHEMA_VERSION` est une constante de code, À INCRÉMENTER à
+-- chaque évolution de `schema.sql`/`migrate()` : toute version différente
+-- déclenche un apply complet (idempotent, sous verrou advisory).
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 -- Contexte immuable d'une tâche (le "quoi").
 CREATE TABLE IF NOT EXISTS tasks (
   id             TEXT PRIMARY KEY,                 -- ex: T-20260827-001

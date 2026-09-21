@@ -25,17 +25,70 @@ function pool() {
   return _pool;
 }
 
-// Applique le schéma (idempotent CREATE TABLE IF NOT EXISTS) une fois par process.
+// Version LOGIQUE du schéma. À INCRÉMENTER à chaque évolution de `schema.sql`
+// OU de `migrate()` : `ensureSchema()` saute l'apply complet quand le marqueur
+// `schema_meta.schema_version` en base est à jour. L'idempotence reste
+// préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
+// `IF NOT EXISTS`), sous verrou advisory.
+const SCHEMA_VERSION = "2026-09-21-perf-fr-nplus1";
+// Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
+// entre process concurrents (session-level, libéré dans le `finally`).
+const SCHEMA_LOCK_KEY = 918273645;
+
+// Lit la version de schéma marquée en base. `null` si la table n'existe pas
+// encore (base neuve) ou si la clé est absente ⇒ apply complet.
+async function readSchemaVersion() {
+  try {
+    const r = await pool().query("SELECT value FROM schema_meta WHERE key = 'schema_version'");
+    return r.rows[0] ? String(r.rows[0].value) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Écrit (upsert) le marqueur de version — UNIQUEMENT après un apply réussi.
+async function writeSchemaVersion(version) {
+  await pool().query(
+    `INSERT INTO schema_meta (key, value, updated_at) VALUES ('schema_version', $1, $2)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [version, new Date().toISOString()],
+  );
+}
+
+// Applique le schéma une fois par process. Chemin rapide : marqueur à jour ⇒
+// AUCUN DDL (~2 ms) au lieu du rejeu de `schema.sql` + `migrate()` (~240 ms).
+// Sinon apply complet sous `pg_advisory_lock` + re-vérification du marqueur
+// après acquisition (deux process ne rejouent pas les DDL en parallèle) ;
+// `_schemaPromise` est réinitialisé en cas d'échec (retentative au prochain appel).
 let _schemaReady = false;
 let _schemaPromise = null;
 async function ensureSchema() {
   if (_schemaReady) return;
   if (!_schemaPromise) {
     _schemaPromise = (async () => {
-      await pool().query(readFileSync(join(__dirname, "schema.sql"), "utf8"));
-      await migrate();
-      _schemaReady = true;
+      // 1) Chemin rapide : la base porte déjà la version courante.
+      if ((await readSchemaVersion()) === SCHEMA_VERSION) {
+        _schemaReady = true;
+        return;
+      }
+      // 2) Apply complet sérialisé par un verrou advisory.
+      const client = await pool().connect();
+      try {
+        await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_LOCK_KEY]);
+        // Re-check après acquisition : un autre process a pu appliquer entre-temps.
+        if ((await readSchemaVersion()) !== SCHEMA_VERSION) {
+          await client.query(readFileSync(join(__dirname, "schema.sql"), "utf8"));
+          await migrate();
+          await writeSchemaVersion(SCHEMA_VERSION);
+        }
+        _schemaReady = true;
+      } finally {
+        try { await client.query("SELECT pg_advisory_unlock($1)", [SCHEMA_LOCK_KEY]); } catch {}
+        client.release();
+      }
     })();
+    // Échec ⇒ on oublie la promesse pour permettre une retentative propre.
+    _schemaPromise.catch(() => { _schemaPromise = null; });
   }
   await _schemaPromise;
 }
@@ -1953,6 +2006,57 @@ export async function getFeature(featureId) {
   };
 }
 
+// Compteurs de LIENS des fonctionnalités — UNE requête bulk (pas de N+1 SQL).
+// `unnest($1::text[])` produit une ligne par id et 6 sous-requêtes `count(*)`
+// comptent les liens de chaque nature. Retourne
+// `{ [id]: { rules, gherkin, adrs, sprints, tasks, recettes } }` (zéros inclus).
+async function featureLinkCounts(ids) {
+  const out = {};
+  const list = (ids || []).map((x) => String(x)).filter(Boolean);
+  if (!list.length) return out;
+  const rows = (await pool().query(
+    `SELECT i.id AS id,
+            (SELECT count(*) FROM fonctionnalite_regles   x WHERE x.fonctionnalite_id = i.id) AS rules,
+            (SELECT count(*) FROM fonctionnalite_gherkin  x WHERE x.fonctionnalite_id = i.id) AS gherkin,
+            (SELECT count(*) FROM fonctionnalite_adr      x WHERE x.fonctionnalite_id = i.id) AS adrs,
+            (SELECT count(*) FROM sprint_fonctionnalites  x WHERE x.fonctionnalite_id = i.id) AS sprints,
+            (SELECT count(*) FROM task_fonctionnalites    x WHERE x.fonctionnalite_id = i.id) AS tasks,
+            (SELECT count(*) FROM recette_fonctionnalites x WHERE x.fonctionnalite_id = i.id) AS recettes
+       FROM unnest($1::text[]) AS i(id)`,
+    [list],
+  )).rows;
+  for (const r of rows) {
+    out[r.id] = {
+      rules: Number(r.rules) || 0,
+      gherkin: Number(r.gherkin) || 0,
+      adrs: Number(r.adrs) || 0,
+      sprints: Number(r.sprints) || 0,
+      tasks: Number(r.tasks) || 0,
+      recettes: Number(r.recettes) || 0,
+    };
+  }
+  return out;
+}
+
+// Compteurs de LIENS des règles métier — UNE requête bulk (pas de N+1 SQL).
+// Retourne `{ [id]: { features, sprints } }` (zéros inclus).
+async function ruleLinkCounts(ids) {
+  const out = {};
+  const list = (ids || []).map((x) => String(x)).filter(Boolean);
+  if (!list.length) return out;
+  const rows = (await pool().query(
+    `SELECT i.id AS id,
+            (SELECT count(*) FROM fonctionnalite_regles x WHERE x.regle_id = i.id) AS features,
+            (SELECT count(*) FROM sprint_regles         x WHERE x.regle_id = i.id) AS sprints
+       FROM unnest($1::text[]) AS i(id)`,
+    [list],
+  )).rows;
+  for (const r of rows) {
+    out[r.id] = { features: Number(r.features) || 0, sprints: Number(r.sprints) || 0 };
+  }
+  return out;
+}
+
 // LISTE des fonctionnalités d'un projet. Filtres : `emergent`, recherche
 // (`ref`/`user_story`), `limit` (défaut 500). Tri stable (`ref`, `created_at`).
 export async function listFeatures({ projectId, emergent, search, limit } = {}) {
@@ -1973,7 +2077,15 @@ export async function listFeatures({ projectId, emergent, search, limit } = {}) 
   const rows = (await pool().query(
     `SELECT * FROM fonctionnalites WHERE ${where} ORDER BY ref ASC, created_at ASC LIMIT $${params.length}`, params,
   )).rows;
-  return rows.map(rowToFonctionnalite);
+  const features = rows.map(rowToFonctionnalite);
+  // Compteurs de liens portés par la liste (⇒ 0 appel réseau côté panneau) :
+  // UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel (pas de cache
+  // périmable — compatible avec le polling `refreshActive()`).
+  const counts = await featureLinkCounts(features.map((f) => f.id));
+  return features.map((f) => ({
+    ...f,
+    links: counts[f.id] || { rules: 0, gherkin: 0, adrs: 0, sprints: 0, tasks: 0, recettes: 0 },
+  }));
 }
 
 // CRÉATION d'une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3). Mêmes gardes que
@@ -2133,7 +2245,14 @@ export async function listRules({ projectId, emergent, search, limit } = {}) {
   const rows = (await pool().query(
     `SELECT * FROM regles_metier WHERE ${where} ORDER BY ref ASC, created_at ASC LIMIT $${params.length}`, params,
   )).rows;
-  return rows.map(rowToRegle);
+  const rules = rows.map(rowToRegle);
+  // Compteurs de liens portés par la liste (⇒ 0 appel réseau côté panneau) :
+  // UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel.
+  const counts = await ruleLinkCounts(rules.map((r) => r.id));
+  return rules.map((r) => ({
+    ...r,
+    links: counts[r.id] || { features: 0, sprints: 0 },
+  }));
 }
 
 // --- Liaisons N:N (T1) ------------------------------------------------------

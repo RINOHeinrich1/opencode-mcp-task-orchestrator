@@ -974,7 +974,7 @@ server.registerTool("feature_get", {
 });
 
 server.registerTool("feature_list", {
-  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. Retourne `{ count, features }`.",
+  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote` ET le champ additif `links` (compteurs de liens `{rules,gherkin,adrs,sprints,tasks,recettes}`, calculés en UNE requête bulk — plus de N+1 côté panneau). Retourne `{ count, features }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les fonctionnalités."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
@@ -1051,7 +1051,7 @@ server.registerTool("rule_get", {
 });
 
 server.registerTool("rule_list", {
-  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. Retourne `{ count, rules }`.",
+  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote` ET le champ additif `links` (compteurs de liens `{features,sprints}`, calculés en UNE requête bulk — plus de N+1 côté panneau). Retourne `{ count, rules }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les règles."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
