@@ -111,6 +111,16 @@ import {
   addDocAttachment,
   removeDocAttachment,
   listDocAttachments,
+  listAdrs,
+  getAdr,
+  searchAdrs,
+  buildAdrContext,
+  registerAdr,
+  setAdrStatus,
+  attachAdr,
+  reportAdrConflict,
+  listAdrConflicts,
+  ADR_TRANSITIONS,
   DOC_KINDS,
   ADR_STATUS,
   DOC_ATTACHMENT_SOURCES,
@@ -491,6 +501,167 @@ server.registerTool("doc_attachment_list", {
   try {
     const attachments = await listDocAttachments({ docId });
     return text(JSON.stringify({ count: attachments.length, attachments }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// ===========================================================================
+// Famille ADR `adr_*` (item 125) — sur-ensemble STRUCTURÉ du module `doc_*`.
+// Lecture/contexte (productivité), cycle de vie (écriture tracée), signalement.
+// Les tools `doc_*` restent inchangés (rétrocompat) ; une ADR reste un doc
+// `kind='adr-tech'`.
+// ===========================================================================
+
+server.registerTool("adr_list", {
+  description: "Vue CONDENSÉE des ADR (adr-tech) d'un projet — point d'entrée de tout agent. Filtres : projectId, repoIds (intersection des repos rattachés ; une ADR globale correspond toujours), status (Proposé|Accepté|Déprécié|Remplacé), search (titre/contexte/décision/conséquences/chemin, insensible casse/accents), includeRepoDocs. Le statut est filtré côté registre (ne dépend pas du SQL includeRepoDocs). Retourne { count, adrs }.",
+  inputSchema: {
+    projectId: z.string().optional().describe("Projet dont on liste les ADR."),
+    repoIds: z.array(z.string()).optional().describe("Repos à considérer (une ADR globale correspond toujours)."),
+    status: z.enum(ADR_STATUS).optional().describe("Filtre par statut ADR."),
+    search: z.string().optional().describe("Recherche texte (titre/contexte/décision/conséquences/chemin)."),
+    includeRepoDocs: z.boolean().optional().describe("Avec projectId : inclure les ADR portées par les repos du projet (défaut true)."),
+  },
+}, async ({ projectId, repoIds, status, search, includeRepoDocs }) => {
+  try {
+    const adrs = await listAdrs({ projectId, repoIds, status, search, includeRepoDocs: includeRepoDocs !== false });
+    return text(JSON.stringify({ count: adrs.length, adrs }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_get", {
+  description: "Contenu COMPLET structuré d'une ADR : titre, statut, contexte, décision, conséquences, replacedBy, repos, pièces jointes, chemin, + conflits ouverts. `err` si inconnue ou si le doc n'est pas une ADR.",
+  inputSchema: { adrId: z.string().describe("docId de l'ADR (kind='adr-tech').") },
+}, async ({ adrId }) => {
+  try {
+    const adr = await getAdr(adrId);
+    if (!adr) return err(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+    return text(JSON.stringify({ ok: true, adr }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_search", {
+  description: "Recherche texte dans les ADR (titre/contexte/décision/conséquences/chemin) — retrouver la règle pertinente. Retourne { count, results } avec un extrait.",
+  inputSchema: {
+    query: z.string().describe("Texte recherché (insensible casse/accents)."),
+    projectId: z.string().optional().describe("Restreindre à un projet."),
+  },
+}, async ({ query, projectId }) => {
+  try {
+    const results = await searchAdrs({ query, projectId });
+    return text(JSON.stringify({ count: results.length, results }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_context", {
+  description: "Construit le bloc de contexte ADR prêt à injecter dans un prompt agent ('## ADR de référence' : titre, statut, repos, décision, conséquence, chemin). ADR = `adrIds` (sélection explicite) sinon les ADR ACTIVES (Proposé/Accepté) du projet ; filtrage par `scope` (ADR globale ou segment de chemin). `taskId` résout projectId/scope. Retourne { projectId, count, adrs, context }.",
+  inputSchema: {
+    projectId: z.string().optional(),
+    scope: z.array(z.string()).optional().describe("Périmètres (chemins) — une ADR globale correspond toujours."),
+    adrIds: z.array(z.string()).optional().describe("ADR sélectionnées (prioritaire sur la liste automatique)."),
+    taskId: z.string().optional().describe("Résout projectId/scope depuis la tâche."),
+  },
+}, async ({ projectId, scope, adrIds, taskId }) => {
+  try {
+    const r = await buildAdrContext({ projectId, scope, adrIds, taskId });
+    return text(JSON.stringify(r, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_register", {
+  description: "Crée une ADR structurée (kind='adr-tech') — statut initial 'Proposé' par défaut (l'acceptation est une DÉCISION HUMAINE, pas une écriture d'agent). repoIds (1..N), global=true pour tous les repos du projet, attachments[] optionnels ({repoId?, docId?, path?, title?, kind?, nature?}). `path` requis (l'ADR pointe un fichier que l'agent lit).",
+  inputSchema: {
+    projectId: z.string(),
+    repoIds: z.array(z.string()).optional().describe("Repos rattachés (1..N)."),
+    title: z.string(),
+    path: z.string().describe("Chemin du fichier de l'ADR."),
+    description: z.string().optional(),
+    status: z.enum(ADR_STATUS).optional().describe("Statut initial (défaut Proposé)."),
+    context: z.string().optional().describe("ADR : contexte."),
+    decision: z.string().optional().describe("ADR : décision."),
+    consequences: z.string().optional().describe("ADR : conséquences."),
+    global: z.boolean().optional().describe("true : ADR globale (tous les repos du projet)."),
+    attachments: z.array(z.object({
+      repoId: z.string().optional(),
+      docId: z.string().optional().describe("Pièce jointe = document du registre."),
+      path: z.string().optional().describe("Pièce jointe = fichier (import/ref)."),
+      title: z.string().optional(),
+      kind: z.string().optional(),
+      nature: z.string().optional(),
+    })).optional().describe("Rattachements optionnels (repos et/ou pièces jointes)."),
+  },
+}, async (input) => {
+  try {
+    const adr = await registerAdr(input);
+    return text(JSON.stringify({ ok: true, adr }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_set_status", {
+  description: "Fait transiter une ADR : Proposé→{Accepté,Déprécié}, Accepté→{Déprécié,Remplacé}, Déprécié→{Remplacé}, Remplacé terminal. 'Remplacé' exige `replacedBy` (docId de l'ADR qui remplace). Toute transition non permise est refusée.",
+  inputSchema: {
+    adrId: z.string(),
+    status: z.enum(ADR_STATUS),
+    replacedBy: z.string().optional().describe("docId de l'ADR qui remplace (requis si status='Remplacé')."),
+  },
+}, async ({ adrId, status, replacedBy }) => {
+  try {
+    const adr = await setAdrStatus({ adrId, status, replacedBy });
+    return text(JSON.stringify({ ok: true, adr }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_update", {
+  description: "Met à jour les champs STRUCTURÉS d'une ADR (title/path/description/context/decision/consequences/replacedBy) et ses rattachements repos (addRepoIds) / global (setGlobal). `err` si l'ADR est inconnue.",
+  inputSchema: {
+    adrId: z.string(),
+    title: z.string().optional(),
+    path: z.string().optional(),
+    description: z.string().optional(),
+    context: z.string().optional(),
+    decision: z.string().optional(),
+    consequences: z.string().optional(),
+    replacedBy: z.string().optional(),
+    addRepoIds: z.array(z.string()).optional().describe("Repos à rattacher (1..N)."),
+    setGlobal: z.boolean().optional().describe("true : rattacher tous les repos du projet ; false : is_global=0."),
+  },
+}, async ({ adrId, title, path, description, context, decision, consequences, replacedBy, addRepoIds, setGlobal }) => {
+  try {
+    if (!(await getAdr(adrId))) return err(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+    await updateDoc({ docId: adrId, title, path, description, context, decision, consequences, replacedBy, addRepoIds, setGlobal });
+    return text(JSON.stringify({ ok: true, adr: await getAdr(adrId) }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_attach", {
+  description: "Rattache à une ADR : un repo (repoId, cumulable 1..N) et/ou une pièce jointe (docId = document du registre, ou path = fichier import/ref). Au moins un des trois (repoId/docId/path) requis. Retourne l'ADR à jour.",
+  inputSchema: {
+    adrId: z.string(),
+    repoId: z.string().optional().describe("Repo à rattacher."),
+    docId: z.string().optional().describe("Pièce jointe = document du registre (source registry)."),
+    path: z.string().optional().describe("Pièce jointe = fichier (source import/ref)."),
+    title: z.string().optional(),
+    kind: z.string().optional().describe("Libellé libre (annexe, spec, capture…)."),
+    nature: z.string().optional().describe("document | fichier | lien."),
+    source: z.enum(DOC_ATTACHMENT_SOURCES).optional().describe("registry | import | ref (défaut selon docId/path)."),
+    meta: z.record(z.string(), z.any()).optional().describe("Métadonnées libres (JSON)."),
+  },
+}, async ({ adrId, repoId, docId, path, title, kind, nature, source, meta }) => {
+  try {
+    const adr = await attachAdr({ adrId, repoId, docId, path, title, kind, nature, source, meta });
+    return text(JSON.stringify({ ok: true, adr }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_report_conflict", {
+  description: "Signale qu'une implémentation CONTREDIT une ADR → conflit persisté (adr_conflicts, status='open') MÊME SANS taskId ; si `taskId` fourni, une décision HUMAINE trackée (kind='conflict') est créée et référencée — sa résolution clôt le conflit. Aucune violation silencieuse. Retourne { ok, conflict, decision }.",
+  inputSchema: {
+    adrId: z.string().describe("ADR contredite."),
+    taskId: z.string().optional().describe("Tâche concernée (→ décision humaine trackée)."),
+    description: z.string().describe("Description de la contradiction code ↔ ADR."),
+  },
+}, async ({ adrId, taskId, description }) => {
+  try {
+    const r = await reportAdrConflict({ adrId, taskId, description, by: "agent" });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

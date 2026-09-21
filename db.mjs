@@ -274,6 +274,20 @@ async function migrate() {
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_attachments_doc ON doc_attachments(doc_id)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_attachments_target ON doc_attachments(target_doc_id)");
+  // Conflits code ↔ ADR (item 125) : DDL identique à schema.sql (source logique)
+  // pour créer la table sur une base PostgreSQL déjà migrée, de façon idempotente.
+  await pool().query(`CREATE TABLE IF NOT EXISTS adr_conflicts (
+    conflict_id TEXT PRIMARY KEY,
+    adr_id      TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+    task_id     TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    description TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'open',
+    decision_id TEXT,
+    created_at  TEXT NOT NULL,
+    created_by  TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conflicts_adr ON adr_conflicts(adr_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conflicts_status ON adr_conflicts(status)");
   // --- Backfill idempotent depuis projects (ne supprime rien) ---------------
   // Chaque projet existant avec des données repo physiques (workspace ou
   // git_path non nul) génère un repo homonyme + l'association au produit.
@@ -1892,6 +1906,310 @@ export async function docsForProjectContext(projectId) {
   return enrichDocs(rows);
 }
 
+// ===========================================================================
+// Famille ADR (item 125) — sur-ensemble STRUCTURÉ du module `doc_*` (ADR-12).
+// Une ADR reste un doc (`kind='adr-tech'`) : ces fonctions RÉUTILISENT les
+// primitives docs/doc_projects/doc_repos/doc_attachments — aucun second modèle.
+// ⚠️ INC-011 : `listDocs` a un bug de précédence SQL dans sa branche
+// `includeRepoDocs` + `status`. `listAdrs`/`searchAdrs`/`buildAdrContext` ne
+// passent JAMAIS `status` à `listDocs` et filtrent le statut côté JS.
+// ===========================================================================
+
+// Transitions autorisées entre statuts d'ADR (aucun saut incohérent).
+export const ADR_TRANSITIONS = {
+  "Proposé": ["Accepté", "Déprécié"],
+  "Accepté": ["Déprécié", "Remplacé"],
+  "Déprécié": ["Remplacé"],
+  "Remplacé": [],
+};
+
+// Normalisation pour recherche insensible à la casse ET aux accents.
+function normalizeText(s) {
+  return String(s ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+// Chaîne de recherche d'une ADR : titre/contexte/décision/conséquences/description/chemin.
+function adrHaystack(d) {
+  return normalizeText(
+    [d.title, d.context, d.decision, d.consequences, d.description, d.path].filter(Boolean).join(" \n "),
+  );
+}
+
+// Condensé sur une ligne (pour le bloc de contexte).
+function oneLine(s, max = 400) {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  return t.length > max ? `${t.slice(0, max)}…` : t;
+}
+
+// Une ADR correspond-elle à un scope (chemin) ? Une ADR globale correspond
+// toujours ; sinon correspondance d'un segment du scope (ou du chemin complet)
+// avec titre/décision/contexte/conséquences/chemin.
+function adrMatchesScope(adr, scope) {
+  if (adr.isGlobal) return true;
+  const hay = adrHaystack(adr);
+  for (const s of scope) {
+    const norm = normalizeText(s);
+    if (!norm) continue;
+    if (hay.includes(norm)) return true;
+    for (const seg of norm.split(/[/\\]+/)) {
+      if (seg.length >= 4 && hay.includes(seg)) return true;
+    }
+  }
+  return false;
+}
+
+// Bloc markdown prêt à injecter dans un prompt agent (une section par ADR).
+function renderAdrContextBlock(adrs, projectId) {
+  if (!adrs.length) return "";
+  const lines = ["## ADR de référence", ""];
+  if (projectId) lines.push(`Projet : ${projectId}`, "");
+  for (const a of adrs) {
+    lines.push(`### ${a.title || a.docId || a.adrId} — ${a.status || "sans statut"}`);
+    const repos = Array.isArray(a.repos) ? a.repos : [];
+    if (a.isGlobal) lines.push(`- Repos : ${repos.length ? repos.join(", ") : "(tous les repos du projet)"} — ADR globale`);
+    else if (repos.length) lines.push(`- Repos : ${repos.join(", ")}`);
+    if (a.decision) lines.push(`- Décision : ${oneLine(a.decision)}`);
+    if (a.consequences) lines.push(`- Conséquence : ${oneLine(a.consequences)}`);
+    if (a.path) lines.push(`- Chemin : ${a.path}`);
+    lines.push("");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function rowToAdrConflict(r) {
+  if (!r) return null;
+  return {
+    conflictId: r.conflict_id,
+    adrId: r.adr_id,
+    taskId: r.task_id ?? null,
+    description: r.description,
+    status: r.status,
+    decisionId: r.decision_id ?? null,
+    createdAt: r.created_at,
+    createdBy: r.created_by ?? null,
+  };
+}
+
+// Vue CONDENSÉE des ADR d'un projet — point d'entrée de tout agent.
+// Le statut est filtré en JS (jamais passé à `listDocs` → ne dépend pas d'INC-011).
+export async function listAdrs({ projectId, repoIds, status, search, includeRepoDocs = true, limit = 500 } = {}) {
+  await ensureSchema();
+  const docs = await listDocs({ kind: "adr-tech", projectId, includeRepoDocs, limit });
+  const wantedRepos = Array.isArray(repoIds) ? repoIds.map(String) : null;
+  const wantedStatus = status ? assertAdrStatus(status) : null;
+  const q = search ? normalizeText(search) : null;
+  return docs
+    .filter((d) => !wantedStatus || d.status === wantedStatus)
+    .filter((d) => {
+      if (!wantedRepos || wantedRepos.length === 0) return true;
+      if (d.isGlobal) return true;
+      return (d.repos || []).some((r) => wantedRepos.includes(String(r)));
+    })
+    .filter((d) => !q || adrHaystack(d).includes(q))
+    .map((d) => ({
+      adrId: d.docId,
+      title: d.title ?? null,
+      status: d.status ?? null,
+      repos: d.repos || [],
+      isGlobal: !!d.isGlobal,
+      decision: d.decision ?? null,
+      path: d.path,
+      updatedAt: d.updatedAt ?? null,
+    }));
+}
+
+// Contenu complet structuré d'une ADR (+ conflits ouverts). `null` si inconnue
+// ou si le doc n'est pas une ADR (`kind !== 'adr-tech'`).
+export async function getAdr(adrId) {
+  await ensureSchema();
+  if (!adrId) return null;
+  const doc = await getDoc(adrId);
+  if (!doc || doc.kind !== "adr-tech") return null;
+  const conflicts = await listAdrConflicts({ adrId, status: "open" });
+  return { ...doc, adrId: doc.docId, conflicts };
+}
+
+// Recherche texte dans les ADR → retrouver la règle pertinente (avec extrait).
+export async function searchAdrs({ query, projectId } = {}) {
+  await ensureSchema();
+  const q = normalizeText(query);
+  if (!q) throw new Error("query requis");
+  const docs = await listDocs({ kind: "adr-tech", projectId, includeRepoDocs: true });
+  const results = [];
+  for (const d of docs) {
+    const fields = [d.title, d.context, d.decision, d.consequences, d.description, d.path].filter(Boolean).map(String);
+    const hit = fields.find((f) => normalizeText(f).includes(q));
+    if (!hit) continue;
+    const idx = normalizeText(hit).indexOf(q);
+    const excerpt = idx >= 0 ? hit.slice(Math.max(0, idx - 60), idx + 140).trim() : oneLine(hit, 200);
+    results.push({
+      adrId: d.docId,
+      title: d.title ?? null,
+      status: d.status ?? null,
+      path: d.path,
+      decision: d.decision ?? null,
+      excerpt,
+    });
+  }
+  return results;
+}
+
+// Bloc de contexte ADR prêt à injecter dans un prompt agent.
+// ADR = `adrIds` (sélection explicite) sinon les ADR ACTIVES (Proposé/Accepté)
+// du projet ; si `scope` est fourni, garde les ADR globales ou en correspondance.
+// `taskId` résout `projectId`/`scope` depuis la tâche.
+export async function buildAdrContext({ projectId, scope, adrIds, taskId } = {}) {
+  await ensureSchema();
+  let pid = projectId || null;
+  let sc = Array.isArray(scope) ? scope.map(String).filter(Boolean) : [];
+  if (taskId) {
+    const task = await getTask(taskId);
+    if (task) {
+      if (!pid) pid = task.project || null;
+      if (sc.length === 0) sc = Array.isArray(task.scope) ? task.scope.map(String).filter(Boolean) : [];
+    }
+  }
+  let adrs;
+  if (Array.isArray(adrIds) && adrIds.length) {
+    const fetched = await Promise.all(adrIds.map((id) => getAdr(id)));
+    adrs = fetched.filter(Boolean);
+  } else {
+    const docs = await listDocs({ kind: "adr-tech", projectId: pid, includeRepoDocs: true });
+    adrs = docs
+      .filter((d) => d.status === "Proposé" || d.status === "Accepté")
+      .map((d) => ({ ...d, adrId: d.docId }));
+  }
+  if (sc.length) adrs = adrs.filter((a) => adrMatchesScope(a, sc));
+  const context = renderAdrContextBlock(adrs, pid);
+  return { projectId: pid, count: adrs.length, adrs, context };
+}
+
+// Crée une ADR structurée — statut initial 'Proposé' par défaut (l'acceptation
+// est une décision humaine, pas une écriture d'agent). `attachments[]` :
+// { repoId?, docId?, path?, title?, kind?, nature?, source?, meta? }.
+export async function registerAdr({
+  projectId, repoIds, title, path, description, status, context, decision, consequences,
+  global: isGlobal, attachments, organizationId, createdBy,
+} = {}) {
+  await ensureSchema();
+  if (!projectId) throw new Error("projectId requis");
+  const st = assertAdrStatus(status) || "Proposé";
+  const doc = await registerDoc({
+    kind: "adr-tech", title, path, description, projectId, repoIds, status: st,
+    context, decision, consequences, global: isGlobal, organizationId, createdBy,
+  });
+  const adrId = doc.docId;
+  if (Array.isArray(attachments)) {
+    for (const att of attachments) {
+      if (!att) continue;
+      if (att.repoId) await updateDoc({ docId: adrId, addRepoId: att.repoId });
+      if (att.docId || att.path) {
+        await addDocAttachment({
+          docId: adrId, targetDocId: att.docId, path: att.path, title: att.title,
+          kind: att.kind, nature: att.nature,
+          source: att.source || (att.docId ? "registry" : "ref"),
+          meta: att.meta, createdBy,
+        });
+      }
+    }
+  }
+  return getAdr(adrId);
+}
+
+// Fait transiter une ADR selon ADR_TRANSITIONS. `Remplacé` exige `replacedBy`
+// (docId existant, ≠ adrId). Un doc legacy SANS statut accepte une initialisation.
+export async function setAdrStatus({ adrId, status, replacedBy } = {}) {
+  await ensureSchema();
+  const adr = await getAdr(adrId);
+  if (!adr) throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+  const target = assertAdrStatus(status);
+  if (!target) throw new Error("status requis");
+  const current = adr.status || null;
+  // Doc legacy sans statut : initialisation libre (aucun état antérieur à contredire).
+  const allowed = current ? (ADR_TRANSITIONS[current] || []) : ADR_STATUS.slice();
+  if (!allowed.includes(target)) {
+    throw new Error(
+      `transition ADR invalide : ${current || "(sans statut)"} → ${target} (permis : ${allowed.length ? allowed.join(" | ") : "aucune — statut terminal"})`,
+    );
+  }
+  let rep = null;
+  if (target === "Remplacé") {
+    rep = replacedBy ? String(replacedBy).trim() : "";
+    if (!rep) throw new Error("status 'Remplacé' exige replacedBy (docId de l'ADR qui remplace)");
+    if (rep === String(adrId)) throw new Error("replacedBy ne peut pas être l'ADR elle-même");
+    if (!(await getDoc(rep))) throw new Error(`ADR de remplacement inconnue : ${rep}`);
+  }
+  await updateDoc({ docId: adrId, status: target, ...(rep ? { replacedBy: rep } : {}) });
+  return getAdr(adrId);
+}
+
+// Rattache à une ADR : un repo (1..N cumulable) et/ou une pièce jointe
+// (docId du registre, ou path import/ref). Au moins un des trois requis.
+export async function attachAdr({ adrId, repoId, docId, path, title, kind, nature, source, meta, createdBy } = {}) {
+  await ensureSchema();
+  const adr = await getAdr(adrId);
+  if (!adr) throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+  if (!repoId && !docId && !path) throw new Error("attachAdr exige au moins repoId, docId ou path");
+  if (repoId) await updateDoc({ docId: adrId, addRepoId: repoId });
+  if (docId || path) {
+    await addDocAttachment({
+      docId: adrId, targetDocId: docId, path, title, kind, nature,
+      source: source || (docId ? "registry" : "ref"), meta, createdBy,
+    });
+  }
+  return getAdr(adrId);
+}
+
+// Signale un conflit code ↔ ADR. Le conflit est TOUJOURS persisté ; si `taskId`
+// est fourni, une décision humaine `kind='conflict'` est créée en plus (résolue
+// ⇒ conflit clôturé par resolveDecisionAndTransition). Aucune violation silencieuse.
+export async function reportAdrConflict({ adrId, taskId, description, by } = {}) {
+  await ensureSchema();
+  if (!adrId) throw new Error("adrId requis");
+  const desc = description === undefined || description === null ? "" : String(description).trim();
+  if (!desc) throw new Error("description requise");
+  const adr = await getDoc(adrId);
+  if (!adr || adr.kind !== "adr-tech") throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+  let decision = null;
+  let decisionId = null;
+  if (taskId) {
+    decision = await requestDecision({
+      taskId,
+      kind: "conflict",
+      detail: `Conflit ADR ${adrId} : ${desc}`,
+      requestedBy: by ?? null,
+    });
+    decisionId = decision?.decisionId || null;
+  }
+  const conflictId = `adr-conf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO adr_conflicts (conflict_id, adr_id, task_id, description, status, decision_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,'open',$5,$6,$7)`,
+    [conflictId, String(adrId), taskId ? String(taskId) : null, desc, decisionId, nowIso(), by ?? null],
+  );
+  const conflict = rowToAdrConflict(
+    (await pool().query("SELECT * FROM adr_conflicts WHERE conflict_id = $1", [conflictId])).rows[0],
+  );
+  return { conflict, decision };
+}
+
+// Historique des conflits d'ADR (filtrable par ADR et/ou statut) — append-only.
+export async function listAdrConflicts({ adrId, status } = {}) {
+  await ensureSchema();
+  const conds = [];
+  const params = [];
+  if (adrId) { params.push(String(adrId)); conds.push(`adr_id = $${params.length}`); }
+  if (status) { params.push(String(status)); conds.push(`status = $${params.length}`); }
+  const rows = (await pool().query(
+    `SELECT * FROM adr_conflicts ${conds.length ? `WHERE ${conds.join(" AND ")}` : ""} ORDER BY created_at DESC`,
+    params,
+  )).rows;
+  return rows.map(rowToAdrConflict);
+}
+
 // --- Suppression physique d'une tâche et de tout son rattaché ---------------
 export async function deleteTask(taskId) {
   await ensureSchema();
@@ -2123,6 +2441,15 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
       "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'CLOSED',$4,$5)",
       [`${decision.taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, decision.taskId, ts, by_, JSON.stringify({ kind: decision.kind, decisionId, status, remarks: resolution ?? null, at: ts })],
     );
+
+    // Conflit d'ADR (kind='conflict') : la décision résolue CLÔT le conflit
+    // correspondant. Aucune transition de tâche (le kind n'est pas `validation`).
+    if (decision.kind === "conflict") {
+      await client.query(
+        "UPDATE adr_conflicts SET status = 'resolved' WHERE decision_id = $1",
+        [decisionId],
+      );
+    }
   });
 
   // Validation : agrégation au niveau TÂCHE → planned (toutes acceptées) / aborted (au moins un rejet).
