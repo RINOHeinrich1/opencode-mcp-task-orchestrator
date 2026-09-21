@@ -184,6 +184,25 @@ CREATE TABLE IF NOT EXISTS doc_attachments (
 CREATE INDEX IF NOT EXISTS idx_doc_attachments_doc ON doc_attachments(doc_id);
 CREATE INDEX IF NOT EXISTS idx_doc_attachments_target ON doc_attachments(target_doc_id);
 
+-- Conflits code ↔ ADR (item 125) : un agent signale qu'une implémentation
+-- contredit une ADR. Le conflit est PERSISTÉ même sans `task_id` (« pas de
+-- violation silencieuse ») ; si `task_id` est fourni, une décision humaine
+-- (`decisions.kind='conflict'`) est créée et référencée par `decision_id` —
+-- sa résolution clôt le conflit (`status='resolved'`, cf. db.mjs).
+--   status : open | resolved
+CREATE TABLE IF NOT EXISTS adr_conflicts (
+  conflict_id TEXT PRIMARY KEY,                             -- adr-conf-<ts>-<rand>
+  adr_id      TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+  task_id     TEXT REFERENCES tasks(id) ON DELETE SET NULL,  -- nullable (hors tâche)
+  description TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'open',                 -- open | resolved
+  decision_id TEXT,                                         -- décision humaine (kind='conflict')
+  created_at  TEXT NOT NULL,
+  created_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_adr_conflicts_adr ON adr_conflicts(adr_id);
+CREATE INDEX IF NOT EXISTS idx_adr_conflicts_status ON adr_conflicts(status);
+
 -- État opérationnel d'une exécution (le "comment", mutable par l'orchestrateur seul).
 CREATE TABLE IF NOT EXISTS executions (
   execution_id  TEXT PRIMARY KEY,
