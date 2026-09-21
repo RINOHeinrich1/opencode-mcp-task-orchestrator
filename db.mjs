@@ -257,6 +257,9 @@ async function migrate() {
     "SELECT 1 FROM information_schema.columns WHERE table_name = 'artifacts' AND column_name = 'task_id'",
   )).rows.length > 0;
   if (hasArtifactsTaskId) {
+    // Levée de contrainte (PAS un DROP de colonne) : les familles non-task
+    // (recette/docs/attachments) n'ont pas de `task_id`.
+    await pool().query("ALTER TABLE artifacts ALTER COLUMN task_id DROP NOT NULL");
     await pool().query("UPDATE artifacts SET content_id = task_id WHERE content_id IS NULL");
   }
   await pool().query(

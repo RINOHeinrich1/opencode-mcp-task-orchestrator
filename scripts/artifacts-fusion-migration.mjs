@@ -46,7 +46,7 @@ const LEGACY_TABLES = ["docs", "recette_documents", "doc_attachments", "doc_proj
 
 const pool = new Pool({ connectionString: DATABASE_URL, max: 4 });
 const q = async (sql, p = []) => (await pool.query(sql, p)).rows;
-const ts = () => new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15);
+const ts = () => new Date().toISOString().replace(/[-:T.]/g, "").slice(0, 14);
 const out = (o) => process.stdout.write(JSON.stringify(o, null, 2) + "\n");
 
 function arg(name) {
@@ -97,6 +97,11 @@ async function ensureTargetSchema() {
     ["updated_at", "TEXT"], ["created_by", "TEXT"],
   ]) {
     await pool.query(`ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS ${col} ${def}`);
+  }
+  // La colonne `task_id` (ancien silo) doit accepter NULL pour les familles non-task
+  // (recette/docs/attachments). C'est une levée de contrainte, PAS un DROP de colonne.
+  if (await columnExists("artifacts", "task_id")) {
+    await pool.query("ALTER TABLE artifacts ALTER COLUMN task_id DROP NOT NULL");
   }
   await pool.query("CREATE INDEX IF NOT EXISTS idx_artifacts_doc_type ON artifacts(doc_type)");
   await pool.query("CREATE INDEX IF NOT EXISTS idx_artifacts_content ON artifacts(content_id)");
