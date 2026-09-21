@@ -41,6 +41,21 @@ CREATE TABLE IF NOT EXISTS organizations (
   created_by  TEXT
 );
 
+-- Tokens git MULTIPLES par organisation (v0.10) : une organisation peut avoir
+-- plusieurs PAT (ex. un par compte/hôte git). Le choix du token utilisé par un
+-- repo associé à un projet se fait au niveau de la liaison (project_repos.
+-- git_token_id). `organizations.git_token_enc` reste le token PAR DÉFAUT
+-- (rétrocompat + fallback). Chaque token est chiffré ; jamais renvoyé en clair.
+CREATE TABLE IF NOT EXISTS org_git_tokens (
+  id          TEXT PRIMARY KEY,      -- gt_<org>_<slug court>
+  org         TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,          -- libellé lisible (ex. 'PAT GitHub Rino', 'compte dev')
+  token_enc   TEXT NOT NULL,          -- chiffré (encryptSecret)
+  created_at  TEXT NOT NULL,
+  created_by  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_org_git_tokens_org ON org_git_tokens(org);
+
 -- Projets : entité de première classe (enregistrement explicite).
 CREATE TABLE IF NOT EXISTS projects (
   id            TEXT PRIMARY KEY,
@@ -87,6 +102,15 @@ CREATE TABLE IF NOT EXISTS project_repos (
   PRIMARY KEY (project_id, repo_id)
 );
 CREATE INDEX IF NOT EXISTS idx_project_repos_repo ON project_repos(repo_id);
+
+-- Tâches ⇄ Repos (ADR 09) : une tâche travaille sur 1..N repos du projet
+-- (défaut = tous les repos du projet au moment de la création).
+CREATE TABLE IF NOT EXISTS task_repos (
+  task_id  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  repo_id  TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  PRIMARY KEY (task_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_repos_repo ON task_repos(repo_id);
 
 -- Documents de référence (ADR-12) + ADR STRUCTURÉES (item 120). Le registre
 -- porte Titre/Statut/Contexte/Décision/Conséquences ; `path` pointe le fichier
@@ -492,6 +516,16 @@ CREATE TABLE IF NOT EXISTS e2e_test_projects (
   PRIMARY KEY (e2e_test_id, project)
 );
 CREATE INDEX IF NOT EXISTS idx_e2e_test_projects_project ON e2e_test_projects(project);
+
+-- Repos traversés par le comportement (N:N, ADR 11) : le spec vit dans l'un
+-- d'eux ; l'exécution/sync le déduisent en cherchant spec_file. `repo_id` est un
+-- TEXT NOT NULL SANS FK (DDL identique à migrate() — ne pas ajouter REFERENCES).
+CREATE TABLE IF NOT EXISTS e2e_test_repos (
+  e2e_test_id TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+  repo_id     TEXT NOT NULL,
+  PRIMARY KEY (e2e_test_id, repo_id)
+);
+CREATE INDEX IF NOT EXISTS idx_e2e_test_repos_repo ON e2e_test_repos(repo_id);
 
 -- Paramètres variables d'un test (défaut non sensible ; refs secrets hors registre).
 CREATE TABLE IF NOT EXISTS e2e_test_params (
