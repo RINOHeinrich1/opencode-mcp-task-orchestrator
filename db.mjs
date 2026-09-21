@@ -722,6 +722,92 @@ export async function getSprint(sprintId) {
   return rowToSprint(r);
 }
 
+// DÉTAIL COMPLET d'un sprint (T4, tool `sprint_get`) : sprint + pièces client
+// (`sprint_pieces` JOIN `artifacts` → `rowToPiece`) + fonctionnalités
+// (`sprint_fonctionnalites`) + règles métier (`sprint_regles`) + tâches
+// (`task_sprints`) + recettes (`recette_sprints`) + compteurs. `null` si le
+// sprint est inconnu.
+export async function getSprintDetail(sprintId) {
+  await ensureSchema();
+  const sprint = await getSprint(sprintId);
+  if (!sprint) return null;
+  const sid = sprint.id;
+  const [pieceRows, featRows, regleRows, taskRows, recetteRows] = await Promise.all([
+    pool().query(
+      `SELECT a.* FROM artifacts a
+         JOIN sprint_pieces sp ON sp.piece_id = a.artifact_id
+        WHERE sp.sprint_id = $1 ORDER BY a.created_at ASC, a.id ASC`, [sid]),
+    pool().query(
+      `SELECT f.* FROM fonctionnalites f
+         JOIN sprint_fonctionnalites sf ON sf.fonctionnalite_id = f.id
+        WHERE sf.sprint_id = $1 ORDER BY f.ref ASC`, [sid]),
+    pool().query(
+      `SELECT r.* FROM regles_metier r
+         JOIN sprint_regles sr ON sr.regle_id = r.id
+        WHERE sr.sprint_id = $1 ORDER BY r.ref ASC`, [sid]),
+    pool().query(
+      `SELECT t.id, t.title, t.request, t.project, t.emergent, t.emergent_origin, t.created_at,
+              (SELECT e.status FROM executions e WHERE e.task_id = t.id ORDER BY e.attempt DESC LIMIT 1) AS status
+         FROM tasks t JOIN task_sprints ts ON ts.task_id = t.id
+        WHERE ts.sprint_id = $1 ORDER BY t.created_at ASC, t.id ASC`, [sid]),
+    pool().query(
+      `SELECT r.recette_id, r.title, r.status, r.project FROM recettes r
+         JOIN recette_sprints rs ON rs.recette_id = r.recette_id
+        WHERE rs.sprint_id = $1 ORDER BY r.created_at ASC`, [sid]),
+  ]);
+  const pieces = pieceRows.rows.map(rowToPiece);
+  const fonctionnalites = featRows.rows.map((r) => ({
+    id: r.id,
+    ref: r.ref,
+    role: r.role ?? null,
+    userStory: r.user_story,
+    sourcedPieceId: r.sourced_piece_id ?? null,
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+    createdAt: r.created_at,
+  }));
+  const regles = regleRows.rows.map((r) => ({
+    id: r.id,
+    ref: r.ref,
+    content: r.content,
+    sourcedPieceId: r.sourced_piece_id ?? null,
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+    createdAt: r.created_at,
+  }));
+  const tasks = taskRows.rows.map((r) => ({
+    id: r.id,
+    title: r.title ?? null,
+    request: r.request ?? null,
+    project: r.project ?? null,
+    status: r.status ?? "queued",
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+    createdAt: r.created_at,
+  }));
+  const recettes = recetteRows.rows.map((r) => ({
+    recetteId: r.recette_id,
+    title: r.title ?? null,
+    status: r.status ?? null,
+    project: r.project ?? null,
+  }));
+  return {
+    sprint,
+    pieces,
+    fonctionnalites,
+    regles,
+    tasks,
+    recettes,
+    counts: {
+      pieces: pieces.length,
+      fonctionnalites: fonctionnalites.length,
+      regles: regles.length,
+      tasks: tasks.length,
+      recettes: recettes.length,
+    },
+  };
+}
+
 // Liste des sprints d'un projet (du plus récent au plus ancien). Filtre `status`.
 export async function listProjectSprints(projectId, { status } = {}) {
   await ensureSchema();
@@ -737,6 +823,56 @@ export async function listProjectSprints(projectId, { status } = {}) {
     `SELECT * FROM sprints WHERE ${where} ORDER BY created_at DESC, id DESC`, params,
   )).rows;
   return rows.map(rowToSprint);
+}
+
+// RATTACHEMENT de pièces client à un sprint (T4). Garde NATURE (A001
+// `assertAttachablePiece`) + lien `sprint_pieces`. ÉMERGENCE (ADR-001 §5) :
+//   - `atInit=true` : pièces rattachées à la CRÉATION du sprint → NON émergentes
+//                     (elles constituent le sprint) ;
+//   - sinon         : pièce reçue APRÈS l'init → émergente, origine
+//                     `apres_cloture` (sprint `close`) ou `apres_init_sprint`
+//                     (sprint `open`), selon l'état du sprint cible.
+// Idempotent sur le lien (`ON CONFLICT DO NOTHING`). Retourne
+// `{ sprintId, attached, pieces }` (`attached` = liens réellement créés).
+export async function attachPiecesToSprint(sprintId, { pieceIds, atInit = false, by } = {}) {
+  await ensureSchema();
+  if (!sprintId) throw new Error("sprintId requis");
+  const id = String(sprintId);
+  const sprint = await getSprint(id);
+  if (!sprint) throw new Error(`sprint inconnu : ${id}`);
+  const ids = Array.isArray(pieceIds)
+    ? pieceIds
+        .filter((p) => p !== undefined && p !== null && String(p).trim())
+        .map((p) => String(p).trim())
+    : [];
+  const emergent = atInit ? false : true;
+  const origin = atInit ? null : sprint.status === "close" ? "apres_cloture" : "apres_init_sprint";
+  const ts = nowIso();
+  const pieces = [];
+  let attached = 0;
+  for (const pid of ids) {
+    const piece = await assertAttachablePiece(pid); // garde nature (A001)
+    const ins = await pool().query(
+      "INSERT INTO sprint_pieces (sprint_id, piece_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+      [id, pid],
+    );
+    if (ins.rowCount > 0) attached++;
+    // Marquage d'émergence dans `meta` (jamais doc_type / content_id / liens).
+    const marker = {
+      emergent,
+      emergent_origin: origin,
+      sprint_id: id,
+      piece_nature: piece.nature,
+      attached_at: ts,
+      attached_by: by ?? null,
+    };
+    await pool().query(
+      "UPDATE artifacts SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb, updated_at = $3 WHERE artifact_id = $1",
+      [pid, JSON.stringify(marker), ts],
+    );
+    pieces.push({ ...piece, emergent, emergentOrigin: origin, meta: { ...(piece.meta && typeof piece.meta === "object" ? piece.meta : {}), ...marker } });
+  }
+  return { sprintId: id, attached, pieces };
 }
 
 // GARDE UNIQUE d'ÉMERGENCE (ADR-001 §5). JAMAIS bloquante, JAMAIS rétroactive :
@@ -815,6 +951,51 @@ export async function ensureDefaultSprint(projectId, { title, startDate, endDate
     return rowToSprint(again);
   }
   return getSprint(inserted.id);
+}
+
+// CRÉATION d'un sprint NOMINAL à DURÉE PARAMÉTRABLE (T4, tool `sprint_start`).
+// `startDate`/`endDate` ISO 8601 ; `autoClose` (défaut true) = clôture
+// AUTOMATIQUE à l'échéance. Statut initial : `open`, ou `close` +
+// `close_reason='auto_echeance'` si l'échéance est DÉJÀ passée (même logique que
+// `ensureDefaultSprint`). `is_default=0` : un sprint nominal n'est PAS le sprint
+// par défaut (« anciens sprints »). `pieces` (0..N) est rattaché à la CRÉATION
+// via A002 (`atInit=true`, pièces NON émergentes). `endDate >= startDate` exigé.
+// Retourne le détail du sprint (`getSprintDetail`).
+export async function createSprint({ projectId, title, startDate, endDate, autoClose = true, sessionId, createdBy, pieces } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  await assertProjectExists(pid);
+  const t = title ? String(title).trim() : "";
+  if (!t) throw new Error("title requis (titre du sprint)");
+  const start = startDate ? String(startDate) : null;
+  const end = endDate ? String(endDate) : null;
+  if (start && end && end < start) {
+    throw new Error(`durée invalide : endDate (${end}) antérieure à startDate (${start})`);
+  }
+  const ts = nowIso();
+  const expired = end ? end < ts : false;
+  const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
+  const id = `SPRINT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO sprints
+       (id, project, title, start_date, end_date, status, is_default, auto_close,
+        closed_at, close_reason, session_id, organization_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,0,$7,$8,$9,$10,$11,$12,$13)`,
+    [
+      id, pid, t, start, end,
+      expired ? "close" : "open",
+      autoClose ? 1 : 0,
+      expired ? ts : null,
+      expired ? "auto_echeance" : null,
+      sessionId ? String(sessionId) : null,
+      org, ts, createdBy ?? null,
+    ],
+  );
+  if (Array.isArray(pieces) && pieces.length > 0) {
+    await attachPiecesToSprint(id, { pieceIds: pieces, atInit: true, by: createdBy });
+  }
+  return getSprintDetail(id);
 }
 
 // MIGRATION des éléments EXISTANTS vers le sprint par défaut du projet :
@@ -4982,6 +5163,38 @@ function rowToPiece(r) {
     createdAt: r.created_at,
     createdBy: r.created_by ?? null,
   };
+}
+
+// GARDE NATURE du RATTACHEMENT d'une pièce à un sprint (T4). Une pièce
+// rattachable est une pièce CLIENT (`doc_type='piece'`) OU un document ADR-12
+// REQUALIFIÉ (`meta.piece_client=true`) ; sa nature est RE-VÉRIFIÉE via la garde
+// autoritative `assertPieceAllowed` (refus photo/vidéo, nature ∈ PIECE_NATURES).
+// Retourne la pièce (forme `rowToPiece`, nature résolue) ; lève une erreur
+// explicite si l'artefact est inconnu, non-pièce, ou de nature refusée.
+export async function assertAttachablePiece(pieceId) {
+  await ensureSchema();
+  if (!pieceId) throw new Error("pieceId requis");
+  const id = String(pieceId);
+  const row = (await pool().query("SELECT * FROM artifacts WHERE artifact_id = $1", [id])).rows[0];
+  if (!row) throw new Error(`pièce inconnue : ${id}`);
+  const meta = parseDocMeta(row.meta);
+  const m = meta && typeof meta === "object" ? meta : {};
+  const isPiece = row.doc_type === "piece";
+  const isRequalified = m.piece_client === true || m.piece_client === "true";
+  if (!isPiece && !isRequalified) {
+    throw new Error(
+      `artefact non rattachable : ${id} (doc_type='${row.doc_type}' ; attendu : pièce 'piece' ou doc ADR-12 requalifié meta.piece_client=true)`,
+    );
+  }
+  const piece = rowToPiece(row);
+  // Re-vérifie la NATURE (refus photo/vidéo) — garde autoritative partagée.
+  const resolved = assertPieceAllowed({
+    nature: piece.nature,
+    path: piece.path ?? null,
+    url: piece.url ?? null,
+    filename: piece.filename ?? null,
+  });
+  return { ...piece, nature: resolved, attachable: true };
 }
 
 // Ajoute une PIÈCE CLIENT à un projet. Garde `assertPieceAllowed` incluse.

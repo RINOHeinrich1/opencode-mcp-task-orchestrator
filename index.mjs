@@ -136,6 +136,15 @@ import {
   requalifyDocsAsPieces,
   removePiece,
   buildSprintReport,
+  createSprint,
+  getSprintDetail,
+  attachPiecesToSprint,
+  getSprint,
+  listProjectSprints,
+  closeSprint,
+  autoCloseExpiredSprints,
+  reopenSprint,
+  classifyEmergence,
   ARTIFACT_SOURCES,
   ARTIFACT_KINDS,
   resolveDecisionAndTransition,
@@ -585,9 +594,14 @@ server.registerTool("piece_delete", {
 });
 
 // ===========================================================================
-// Famille « SPRINT » — rapport (ADR-001, item 4). Le CRUD `sprint_*` complet
-// appartient à T4 ; ici SEUL le rapport de sprint (lecture seule) est exposé
-// pour le téléchargement depuis le panneau.
+// Famille « SPRINT » — CRUD complet `sprint_*` (ADR-001). T3 a livré le cycle
+// de vie produit (`closeSprint`/`autoCloseExpiredSprints`/`reopenSprint`/
+// `getSprint`/`listProjectSprints`/`buildSprintReport`) + le tool `sprint_report`
+// (lecture seule, conservé ici SANS doublon) ; T4 expose la couche CRUD
+// `sprint_start` / `sprint_list` / `sprint_get` / `sprint_close` /
+// `sprint_reopen` / `sprint_attach_pieces` AU-DESSUS de ces primitives
+// (aucune réimplémentation). La clôture DÉCLENCHE la règle d'émergence ; la
+// reprise la SUSPEND (état renvoyé par `classifyEmergence`).
 // ===========================================================================
 
 server.registerTool("sprint_report", {
@@ -601,6 +615,113 @@ server.registerTool("sprint_report", {
     const report = await buildSprintReport(sprintId, { format: format || "markdown" });
     if ((format || "markdown") === "json") return text(JSON.stringify(report, null, 2));
     return text(report.markdown);
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_start", {
+  description: "CRÉE un sprint NOMINAL à DURÉE PARAMÉTRABLE (ADR-001). `projectId` + `title` requis ; `startDate`/`endDate` ISO 8601 (`endDate >= startDate`) ; `autoClose` (défaut true) = clôture AUTOMATIQUE à l'échéance ; `pieces` (0..N pieceId) rattachées à la création (NON émergentes). Statut initial `open`, ou `close`/`auto_echeance` si l'échéance est déjà passée. Retourne le détail du sprint créé (`{ sprint, pieces, fonctionnalites, regles, tasks, recettes, counts }`).",
+  inputSchema: {
+    projectId: z.string().describe("Projet du sprint."),
+    title: z.string().describe("Titre du sprint."),
+    startDate: z.string().optional().describe("Début ISO 8601."),
+    endDate: z.string().optional().describe("Échéance ISO 8601 (clôture auto si autoClose)."),
+    autoClose: z.boolean().optional().describe("Clôture automatique à l'échéance (défaut true)."),
+    sessionId: z.string().optional().describe("Session IA dédiée au sprint."),
+    createdBy: z.string().optional().describe("Acteur créateur."),
+    pieces: z.array(z.string()).optional().describe("pieceId des pièces client rattachées à la création (NON émergentes)."),
+  },
+}, async ({ projectId, title, startDate, endDate, autoClose, sessionId, createdBy, pieces }) => {
+  try {
+    const detail = await createSprint({ projectId, title, startDate, endDate, autoClose: autoClose !== false, sessionId, createdBy, pieces });
+    return text(JSON.stringify({ ok: true, ...detail }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_list", {
+  description: "LISTE les sprints d'un projet (du plus récent au plus ancien) avec statut + dates. La clôture AUTOMATIQUE à l'échéance est appliquée AVANT lecture (`autoCloseExpiredSprints`) : un sprint échu apparaît `close`/`auto_echeance`. Filtre `status`. Retourne `{ count, sprints, autoClosed }`.",
+  inputSchema: {
+    projectId: z.string().describe("Projet dont on liste les sprints."),
+    status: z.enum(["open", "close"]).optional().describe("Filtre par statut."),
+  },
+}, async ({ projectId, status }) => {
+  try {
+    const auto = await autoCloseExpiredSprints({ projectId });
+    const sprints = await listProjectSprints(projectId, { status });
+    return text(JSON.stringify({ count: sprints.length, sprints, autoClosed: auto.closed }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_get", {
+  description: "DÉTAIL COMPLET d'un sprint : statut, dates, cycle de vie + pièces client, fonctionnalités, règles métier, tâches et recettes rattachées + compteurs. `err` si le sprint est inconnu.",
+  inputSchema: {
+    sprintId: z.string().describe("Identifiant du sprint (SPRINT-<ts>-<rand>)."),
+  },
+}, async ({ sprintId }) => {
+  try {
+    const detail = await getSprintDetail(sprintId);
+    if (!detail) return err(`sprint inconnu : ${sprintId}`);
+    return text(JSON.stringify({ ok: true, ...detail }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_close", {
+  description: "CLÔTURE d'un sprint (DISTINCTE de la clôture d'exécution des tâches — n'écrit jamais sur tasks/executions). MANUELLE via `sprintId` (`closeSprint`, reason `manuel`), ou AUTOMATIQUE à l'échéance via `projectId` (ou sans argument = balayage global) (`autoCloseExpiredSprints`). La clôture DÉCLENCHE la règle d'émergence (les éléments suivants sont émergents) — l'état est renvoyé par `classifyEmergence`. Retourne `{ ok, sprints, emergence }`.",
+  inputSchema: {
+    sprintId: z.string().optional().describe("Sprint à clôturer MANUELLEMENT."),
+    projectId: z.string().optional().describe("Projet à balayer pour la clôture AUTO à l'échéance."),
+    reason: z.string().optional().describe("Raison de la clôture manuelle (défaut : manuel)."),
+  },
+}, async ({ sprintId, projectId, reason }) => {
+  try {
+    if (sprintId) {
+      const sprint = await closeSprint(sprintId, { reason: reason || "manuel" });
+      const emergence = await classifyEmergence(sprint.project, { kind: "element" });
+      return text(JSON.stringify({ ok: true, sprints: [sprint], emergence }, null, 2));
+    }
+    const auto = await autoCloseExpiredSprints({ projectId });
+    const sprints = [];
+    for (const id of auto.closed) { const s = await getSprint(id); if (s) sprints.push(s); }
+    let emergence = null;
+    if (projectId) {
+      emergence = await classifyEmergence(projectId, { kind: "element" });
+    } else {
+      const projects = [...new Set(sprints.map((s) => s.project))];
+      emergence = projects.length === 1
+        ? await classifyEmergence(projects[0], { kind: "element" })
+        : await Promise.all(projects.map((p) => classifyEmergence(p, { kind: "element" })));
+    }
+    return text(JSON.stringify({ ok: true, sprints, emergence }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_reopen", {
+  description: "REPRISE / RÉOUVERTURE d'un sprint clôturé (le cycle n'est PAS définitif) : repasse `open`, efface `closed_at`/`close_reason`, pose `reopened_at`. `endDate` prolonge l'échéance ; si l'échéance résultante est passée sans `autoClose` explicite, `auto_close=0` (anti re-clôture immédiate). La reprise SUSPEND la règle d'émergence (sprint `open` → éléments non émergents) — état renvoyé par `classifyEmergence`. Retourne `{ ok, sprint, emergence }`.",
+  inputSchema: {
+    sprintId: z.string().describe("Sprint clôturé à rouvrir."),
+    endDate: z.string().optional().describe("Nouvelle échéance ISO 8601 (prolongation)."),
+    autoClose: z.boolean().optional().describe("Force la clôture auto (sinon règle anti re-clôture)."),
+    by: z.string().optional().describe("Acteur de la reprise."),
+  },
+}, async ({ sprintId, endDate, autoClose, by }) => {
+  try {
+    const sprint = await reopenSprint(sprintId, { endDate, autoClose, by });
+    const emergence = await classifyEmergence(sprint.project, { kind: "element" });
+    return text(JSON.stringify({ ok: true, sprint, emergence }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_attach_pieces", {
+  description: "RATTACHE des pièces client à un sprint (garde NATURE : pièce `piece` ou doc ADR-12 requalifié ; photos/vidéos refusées). ÉMERGENCE (ADR-001 §5) : `atInit=true` → pièces du sprint à sa création (NON émergentes) ; sinon pièce reçue APRÈS l'init → émergente `apres_init_sprint` (sprint open) ou `apres_cloture` (sprint close). Idempotent. Retourne `{ ok, sprintId, attached, pieces }`.",
+  inputSchema: {
+    sprintId: z.string().describe("Sprint cible."),
+    pieceIds: z.array(z.string()).describe("pieceId des pièces à rattacher."),
+    atInit: z.boolean().optional().describe("true = rattachement à la création (NON émergent)."),
+    by: z.string().optional().describe("Acteur du rattachement."),
+  },
+}, async ({ sprintId, pieceIds, atInit, by }) => {
+  try {
+    const r = await attachPiecesToSprint(sprintId, { pieceIds, atInit: atInit === true, by });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
