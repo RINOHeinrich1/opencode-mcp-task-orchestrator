@@ -144,6 +144,7 @@ import {
   closeSprint,
   autoCloseExpiredSprints,
   reopenSprint,
+  setSprintSession,
   classifyEmergence,
   // CARDINALITÉS HEURISTIQUES + GOUVERNANCE DE L'ÉMERGENCE (T6, ADR-001 §5).
   EMERGENT_ORIGINS,
@@ -772,6 +773,19 @@ server.registerTool("sprint_attach_pieces", {
   try {
     const r = await attachPiecesToSprint(sprintId, { pieceIds, atInit: atInit === true, by });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_session_set", {
+  description: "ASSOCIE la session IA dédiée (agent-sprint) à un sprint EXISTANT (`sprints.session_id`). Miroir de `recette_session_set` MAIS NE TOUCHE PAS au statut du sprint : `open`/`close` (et donc la garde d'émergence) restent pilotés par `sprint_close`/`sprint_reopen`. `sessionId` null détache la session. Retourne `{ ok, sprint }`.",
+  inputSchema: {
+    sprintId: z.string().describe("Sprint cible (SPRINT-<ts>-<rand>)."),
+    sessionId: z.string().nullable().describe("Session opencode (ses_…) à rattacher, ou null pour détacher."),
+  },
+}, async ({ sprintId, sessionId }) => {
+  try {
+    const sprint = await setSprintSession({ sprintId, sessionId });
+    return text(JSON.stringify({ ok: true, sprint }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

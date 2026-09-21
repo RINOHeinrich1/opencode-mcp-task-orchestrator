@@ -1062,6 +1062,24 @@ export async function createSprint({ projectId, title, startDate, endDate, autoC
   return getSprintDetail(id);
 }
 
+// ASSOCIE une session IA DÉDIÉE à un sprint EXISTANT (T8, tool
+// `sprint_session_set`). Miroir de `setRecetteSession` MAIS sans toucher au
+// statut du sprint : `open`/`close` (et donc la garde d'émergence) restent
+// pilotés par `sprint_close`/`sprint_reopen` — rattacher une session ne clôt ni
+// ne rouvre rien. `sessionId` null détache la session. Retourne le sprint.
+export async function setSprintSession({ sprintId, sessionId }) {
+  await ensureSchema();
+  if (!sprintId) throw new Error("sprintId requis");
+  const id = String(sprintId);
+  const row = (await pool().query("SELECT id FROM sprints WHERE id = $1", [id])).rows[0];
+  if (!row) throw new Error(`sprint inconnu : ${id}`);
+  await pool().query(
+    "UPDATE sprints SET session_id = $1, updated_at = $2 WHERE id = $3",
+    [sessionId != null ? String(sessionId) : null, nowIso(), id],
+  );
+  return getSprint(id);
+}
+
 // MIGRATION des éléments EXISTANTS vers le sprint par défaut du projet :
 // rattache `recette_sprints` / `task_sprints` pour les recettes/tâches SANS lien
 // sprint. AUCUN marquage émergent (émergence NON rétroactive — ADR-001 §2).
