@@ -120,9 +120,14 @@ import {
   attachAdr,
   reportAdrConflict,
   listAdrConflicts,
+  reportAdrMissing,
+  listAdrVigilances,
+  resolveAdrVigilance,
   ADR_TRANSITIONS,
   DOC_KINDS,
   ADR_STATUS,
+  ADR_VIGILANCE_TYPES,
+  ADR_VIGILANCE_STATUS,
   DOC_ATTACHMENT_SOURCES,
   resolveDecisionAndTransition,
   resolveRecette,
@@ -652,16 +657,71 @@ server.registerTool("adr_attach", {
 });
 
 server.registerTool("adr_report_conflict", {
-  description: "Signale qu'une implémentation CONTREDIT une ADR → conflit persisté (adr_conflicts, status='open') MÊME SANS taskId ; si `taskId` fourni, une décision HUMAINE trackée (kind='conflict') est créée et référencée — sa résolution clôt le conflit. Aucune violation silencieuse. Retourne { ok, conflict, decision }.",
+  description: "Signale qu'une implémentation CONTREDIT une ADR → conflit persisté (adr_conflicts, status='open') MÊME SANS taskId ; si `taskId` fourni, une décision HUMAINE trackée (kind='conflict') est créée et référencée — sa résolution clôt le conflit. Aucune violation silencieuse. `recetteId` OPTIONNEL : signaler un conflit PENDANT une recette crée EN PLUS un POINT DE VIGILANCE GLOBAL de la recette (type='conflict'), qui BLOQUE sa terminaison jusqu'à levée. Retourne { ok, conflict, decision, vigilance }.",
   inputSchema: {
     adrId: z.string().describe("ADR contredite."),
     taskId: z.string().optional().describe("Tâche concernée (→ décision humaine trackée)."),
+    recetteId: z.string().optional().describe("Recette en cours → point de vigilance global (bloquant)."),
     description: z.string().describe("Description de la contradiction code ↔ ADR."),
+    entity: z.string().optional().describe("Entité discutée (contexte du conflit)."),
+    relatedAdrId: z.string().optional().describe("Nouvelle ADR en conflit avec `adrId` (chaînage)."),
   },
-}, async ({ adrId, taskId, description }) => {
+}, async ({ adrId, taskId, recetteId, description, entity, relatedAdrId }) => {
   try {
-    const r = await reportAdrConflict({ adrId, taskId, description, by: "agent" });
+    const r = await reportAdrConflict({ adrId, taskId, recetteId, description, entity, relatedAdrId, by: "agent" });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_report_missing", {
+  description: "Signale une ADR MANQUANTE pour une entité réellement discutée en session de RECETTE ou de TEST (aucune ADR ne la couvre : adr_list/adr_search négatifs). Exige `entity` ET `description` (évite les fausses alertes). Contexte requis : `recetteId` (recette) OU `taskId` (test) OU `projectId` — le projet est résolu (recettes.project / tasks.project). Si `recetteId`, le point devient un POINT DE VIGILANCE GLOBAL de la recette qui BLOQUE sa terminaison. `proposedAdrId` référence l'ADR Proposé créée depuis la session (adr_register). Retourne { ok, vigilance }.",
+  inputSchema: {
+    recetteId: z.string().optional().describe("Recette en cours (→ point de vigilance global bloquant)."),
+    taskId: z.string().optional().describe("Tâche/test concerné (résout le projet)."),
+    projectId: z.string().optional().describe("Projet (si ni recetteId ni taskId)."),
+    entity: z.string().describe("Entité/constat réellement discuté, sans ADR couvrante."),
+    description: z.string().describe("Description du constat et de l'ADR manquante."),
+    proposedAdrId: z.string().optional().describe("ADR Proposé créée depuis la session (adr_register)."),
+    sessionId: z.string().optional().describe("Session recette/test d'origine (traçage)."),
+  },
+}, async ({ recetteId, taskId, projectId, entity, description, proposedAdrId, sessionId }) => {
+  try {
+    const vigilance = await reportAdrMissing({ recetteId, taskId, projectId, entity, description, proposedAdrId, sessionId, by: "agent" });
+    return text(JSON.stringify({ ok: true, vigilance }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_vigilance_list", {
+  description: "HISTORIQUE FILTRABLE (append-only, lecture seule) des points de vigilance ADR remontés par les recettes/tests : ADR manquante (type='missing') ou conflit d'ADR (type='conflict'). Filtres : projectId, recetteId, type, status (open|resolved), from/to (dates), limit. Chaque point porte sa `reason` explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] »). Retourne { count, vigilancess }.",
+  inputSchema: {
+    projectId: z.string().optional().describe("Filtre projet."),
+    recetteId: z.string().optional().describe("Filtre recette liée."),
+    type: z.enum(ADR_VIGILANCE_TYPES).optional().describe("missing (ADR manquante) | conflict (conflit)."),
+    status: z.enum(ADR_VIGILANCE_STATUS).optional().describe("open | resolved."),
+    from: z.string().optional().describe("Date de détection ≥ (ISO/texte)."),
+    to: z.string().optional().describe("Date de détection ≤ (ISO/texte)."),
+    limit: z.number().int().optional().describe("Max (défaut 500)."),
+  },
+}, async ({ projectId, recetteId, type, status, from, to, limit }) => {
+  try {
+    const vigilancess = await listAdrVigilances({ projectId, recetteId, type, status, from, to, limit });
+    return text(JSON.stringify({ count: vigilancess.length, vigilancess }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_vigilance_resolve", {
+  description: "LÈVE un point de vigilance ADR (ADR créée / dépréciation actée / décision explicite / levée manuelle). `resolution` (raison TRACÉE) est OBLIGATOIRE : le blocage de terminaison n'est jamais infini mais jamais silencieux. resolutionKind : adr_created | adr_deprecated | manual | decision (défaut manual). `adrId` (optionnel) = ADR liée à la levée. Retourne { ok, vigilance }.",
+  inputSchema: {
+    vigilanceId: z.string(),
+    resolution: z.string().describe("Raison tracée de la levée (obligatoire)."),
+    resolutionKind: z.enum(["adr_created", "adr_deprecated", "manual", "decision"]).optional().describe("Nature de la levée (défaut manual)."),
+    adrId: z.string().optional().describe("ADR liée à la levée (créée/dépréciée)."),
+    resolvedBy: z.string().optional().describe("Acteur (défaut human)."),
+  },
+}, async ({ vigilanceId, resolution, resolutionKind, adrId, resolvedBy }) => {
+  try {
+    const vigilance = await resolveAdrVigilance({ vigilanceId, resolution, resolutionKind, adrId, resolvedBy });
+    return text(JSON.stringify({ ok: true, vigilance }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
@@ -781,7 +841,7 @@ server.registerTool("recette_list", {
 
 // === recette_get ===
 server.registerTool("recette_get", {
-  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments).",
+  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit) et `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison).",
   inputSchema: { recetteId: z.string() },
 }, async ({ recetteId }) => {
   try {
@@ -967,7 +1027,7 @@ server.registerTool("recette_item_delete", {
 
 // === recette_confirm ===
 server.registerTool("recette_confirm", {
-  description: "Clôt la recette (statut 'done' = faite) après confirmation de la liste consolidée. La tâche initiale reste done et close ; les travaux issus sont de nouvelles tâches.",
+  description: "Clôt la recette (statut 'done' = faite) après confirmation de la liste consolidée. La tâche initiale reste done et close ; les travaux issus sont de nouvelles tâches. GARDE ADR : REFUSÉ avec raison explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] ») tant qu'un point de vigilance ADR (ADR manquante / conflit) est OUVERT sur la recette — levez-le via `adr_vigilance_resolve` (raison tracée).",
   inputSchema: {
     recetteId: z.string(),
     confirmedBy: z.string().optional(),

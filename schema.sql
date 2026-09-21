@@ -397,6 +397,41 @@ CREATE TABLE IF NOT EXISTS recette_documents (
 );
 CREATE INDEX IF NOT EXISTS idx_recette_documents_recette ON recette_documents(recette_id);
 
+-- Points de vigilance ADR remontés par les sessions de RECETTE / TEST (item 126) :
+-- une ADR MANQUANTE pour une entité réellement discutée, ou un CONFLIT d'ADR
+-- signalé pendant la recette. HISTORIQUE APPEND-ONLY : aucune suppression ; seul
+-- `status` transite `open → resolved` (resolved_at/resolution/resolved_by sont
+-- AJOUTÉS, jamais effacés). Un point OUVERT rattaché à une recette BLOQUE sa
+-- terminaison (`confirmRecette`) avec une raison explicite.
+--   type            : missing (ADR manquante) | conflict (conflit d'ADR)
+--   status          : open | resolved
+--   resolution_kind : adr_created | adr_deprecated | manual | decision
+-- NB : placée APRÈS `recettes` (FK) — ordre requis par PostgreSQL.
+CREATE TABLE IF NOT EXISTS adr_vigilances (
+  vigilance_id    TEXT PRIMARY KEY,                 -- adr-vig-<ts>-<rand>
+  project         TEXT NOT NULL,                    -- projet de la recette (filtre historique)
+  recette_id      TEXT REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  task_id         TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+  session_id      TEXT,                             -- session recette/test d'origine (traçage)
+  type            TEXT NOT NULL,                    -- missing | conflict
+  status          TEXT NOT NULL DEFAULT 'open',     -- open | resolved
+  entity          TEXT,                             -- entité/constat (type='missing')
+  description     TEXT NOT NULL,
+  adr_id          TEXT,                             -- ADR concernée (conflit) / ADR proposée (manquant)
+  related_adr_id  TEXT,                             -- ADR liée (nouvelle ADR en conflit / ADR levée)
+  conflict_id     TEXT,                             -- adr_conflicts.conflict_id (type='conflict')
+  resolution      TEXT,                             -- raison TRACÉE de la levée (obligatoire pour résoudre)
+  resolution_kind TEXT,                             -- adr_created | adr_deprecated | manual | decision
+  created_at      TEXT NOT NULL,
+  created_by      TEXT,
+  resolved_at     TEXT,
+  resolved_by     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_adr_vigilances_project ON adr_vigilances(project);
+CREATE INDEX IF NOT EXISTS idx_adr_vigilances_recette ON adr_vigilances(recette_id);
+CREATE INDEX IF NOT EXISTS idx_adr_vigilances_status ON adr_vigilances(status);
+CREATE INDEX IF NOT EXISTS idx_adr_vigilances_type ON adr_vigilances(type);
+
 -- ===========================================================================
 -- Plans d'action (granularité atomique) — persistance des plans gérés par
 -- l'agent `atomic-plan` et le MCP `plan-manager`.

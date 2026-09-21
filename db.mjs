@@ -288,6 +288,35 @@ async function migrate() {
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conflicts_adr ON adr_conflicts(adr_id)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conflicts_status ON adr_conflicts(status)");
+  // Points de vigilance ADR en recette/test (item 126) : DDL identique à
+  // schema.sql (source logique) pour créer la table sur une base PostgreSQL
+  // déjà migrée, de façon idempotente. APPEND-ONLY (aucun DELETE) ; seul
+  // `status` transite open → resolved. `recettes` existe (schema.sql appliqué
+  // en amont par ensureSchema) → FK valide.
+  await pool().query(`CREATE TABLE IF NOT EXISTS adr_vigilances (
+    vigilance_id    TEXT PRIMARY KEY,
+    project         TEXT NOT NULL,
+    recette_id      TEXT REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    task_id         TEXT REFERENCES tasks(id) ON DELETE SET NULL,
+    session_id      TEXT,
+    type            TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open',
+    entity          TEXT,
+    description     TEXT NOT NULL,
+    adr_id          TEXT,
+    related_adr_id  TEXT,
+    conflict_id     TEXT,
+    resolution      TEXT,
+    resolution_kind TEXT,
+    created_at      TEXT NOT NULL,
+    created_by      TEXT,
+    resolved_at     TEXT,
+    resolved_by     TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_project ON adr_vigilances(project)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_recette ON adr_vigilances(recette_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_status ON adr_vigilances(status)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_type ON adr_vigilances(type)");
   // --- Backfill idempotent depuis projects (ne supprime rien) ---------------
   // Chaque projet existant avec des données repo physiques (workspace ou
   // git_path non nul) génère un repo homonyme + l'association au produit.
@@ -1993,6 +2022,101 @@ function rowToAdrConflict(r) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Vigilances ADR (item 126) — points de vigilance ADR remontés par une session
+// de RECETTE / TEST : ADR manquante (type='missing') ou conflit d'ADR
+// (type='conflict'). HISTORIQUE APPEND-ONLY (aucun DELETE) ; seul `status`
+// transite `open → resolved` avec une raison TRACÉE (`resolution`).
+// Un point ouvert rattaché à une recette BLOQUE sa terminaison (confirmRecette).
+// ---------------------------------------------------------------------------
+export const ADR_VIGILANCE_TYPES = ["missing", "conflict"];
+export const ADR_VIGILANCE_STATUS = ["open", "resolved"];
+export const ADR_VIGILANCE_RESOLUTION_KINDS = ["adr_created", "adr_deprecated", "manual", "decision"];
+
+function rowToAdrVigilance(r) {
+  if (!r) return null;
+  return {
+    vigilanceId: r.vigilance_id,
+    project: r.project,
+    recetteId: r.recette_id ?? null,
+    taskId: r.task_id ?? null,
+    sessionId: r.session_id ?? null,
+    type: r.type,
+    status: r.status,
+    entity: r.entity ?? null,
+    description: r.description,
+    adrId: r.adr_id ?? null,
+    relatedAdrId: r.related_adr_id ?? null,
+    conflictId: r.conflict_id ?? null,
+    resolution: r.resolution ?? null,
+    resolutionKind: r.resolution_kind ?? null,
+    createdAt: r.created_at,
+    createdBy: r.created_by ?? null,
+    resolvedAt: r.resolved_at ?? null,
+    resolvedBy: r.resolved_by ?? null,
+  };
+}
+
+// Raison EXPLICITE et normalisée d'un point de vigilance — réutilisée par la
+// garde de terminaison (`confirmRecette`) et par l'UI (« Terminer la recette »
+// bloqué avec la raison). Ex : « ADR manquant pour [entité] » /
+// « Conflit d'ADR : [ancienne] vs [nouvelle] ».
+export function adrVigilanceReason(v) {
+  if (!v) return "";
+  if (v.type === "conflict") {
+    const a = v.adrId || "?";
+    const b = v.relatedAdrId || "?";
+    return `Conflit d'ADR : ${a} vs ${b}`;
+  }
+  return `ADR manquant pour ${v.entity || "?"}`;
+}
+
+// Helper interne d'INSERT (réutilisé par reportAdrMissing / reportAdrConflict).
+async function insertAdrVigilance(fields = {}) {
+  const vigilanceId = fields.vigilanceId || `adr-vig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO adr_vigilances
+       (vigilance_id, project, recette_id, task_id, session_id, type, status, entity,
+        description, adr_id, related_adr_id, conflict_id, resolution, resolution_kind,
+        created_at, created_by, resolved_at, resolved_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+    [
+      vigilanceId,
+      String(fields.project),
+      fields.recetteId ? String(fields.recetteId) : null,
+      fields.taskId ? String(fields.taskId) : null,
+      fields.sessionId ? String(fields.sessionId) : null,
+      fields.type,
+      fields.status || "open",
+      fields.entity ?? null,
+      String(fields.description),
+      fields.adrId ? String(fields.adrId) : null,
+      fields.relatedAdrId ? String(fields.relatedAdrId) : null,
+      fields.conflictId ? String(fields.conflictId) : null,
+      fields.resolution ?? null,
+      fields.resolutionKind ?? null,
+      nowIso(),
+      fields.by ?? fields.createdBy ?? null,
+      fields.resolvedAt ?? null,
+      fields.resolvedBy ?? null,
+    ],
+  );
+  return vigilanceId;
+}
+
+// Détail d'un point de vigilance (avec sa raison explicite).
+export async function getAdrVigilance(vigilanceId) {
+  await ensureSchema();
+  if (!vigilanceId) return null;
+  const row = (await pool().query(
+    "SELECT * FROM adr_vigilances WHERE vigilance_id = $1",
+    [String(vigilanceId)],
+  )).rows[0];
+  if (!row) return null;
+  const v = rowToAdrVigilance(row);
+  return { ...v, reason: adrVigilanceReason(v) };
+}
+
 // Vue CONDENSÉE des ADR d'un projet — point d'entrée de tout agent.
 // Le statut est filtré en JS (jamais passé à `listDocs` → ne dépend pas d'INC-011).
 export async function listAdrs({ projectId, repoIds, status, search, includeRepoDocs = true, limit = 500 } = {}) {
@@ -2169,7 +2293,10 @@ export async function attachAdr({ adrId, repoId, docId, path, title, kind, natur
 // Signale un conflit code ↔ ADR. Le conflit est TOUJOURS persisté ; si `taskId`
 // est fourni, une décision humaine `kind='conflict'` est créée en plus (résolue
 // ⇒ conflit clôturé par resolveDecisionAndTransition). Aucune violation silencieuse.
-export async function reportAdrConflict({ adrId, taskId, description, by } = {}) {
+// `recetteId` (OPTIONNEL, rétrocompat) : un conflit signalé PENDANT une recette
+// devient aussi un POINT DE VIGILANCE GLOBALE de la recette (bloquant sa
+// terminaison) — en plus de la ligne `adr_conflicts`.
+export async function reportAdrConflict({ adrId, taskId, recetteId, description, by, entity, relatedAdrId } = {}) {
   await ensureSchema();
   if (!adrId) throw new Error("adrId requis");
   const desc = description === undefined || description === null ? "" : String(description).trim();
@@ -2196,7 +2323,22 @@ export async function reportAdrConflict({ adrId, taskId, description, by } = {})
   const conflict = rowToAdrConflict(
     (await pool().query("SELECT * FROM adr_conflicts WHERE conflict_id = $1", [conflictId])).rows[0],
   );
-  return { conflict, decision };
+  // Point de vigilance GLOBAL de recette (uniquement si `recetteId` — comportement
+  // inchangé sans lui). Le projet est celui de la recette.
+  let vigilance = null;
+  if (recetteId) {
+    const r = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [String(recetteId)])).rows[0];
+    if (!r) throw new Error(`recette inconnue : ${recetteId}`);
+    const vigilanceId = await insertAdrVigilance({
+      project: r.project, recetteId, taskId,
+      type: "conflict", status: "open",
+      entity: entity ?? null, description: desc,
+      adrId, relatedAdrId: relatedAdrId || null, conflictId,
+      by,
+    });
+    vigilance = await getAdrVigilance(vigilanceId);
+  }
+  return { conflict, decision, vigilance };
 }
 
 // Historique des conflits d'ADR (filtrable par ADR et/ou statut) — append-only.
@@ -2211,6 +2353,93 @@ export async function listAdrConflicts({ adrId, status } = {}) {
     params,
   )).rows;
   return rows.map(rowToAdrConflict);
+}
+
+// Signale une ADR MANQUANTE pour une entité réellement discutée (recette/test).
+// Exige `entity` ET `description` (évite les fausses alertes). Résout le projet :
+// recette → `recettes.project`, sinon tâche → `tasks.project`, sinon `projectId`.
+// `proposedAdrId` (optionnel) référence l'ADR Proposé créée depuis la session.
+// Retourne le point de vigilance (avec `reason` explicite).
+export async function reportAdrMissing({ recetteId, taskId, projectId, entity, description, proposedAdrId, sessionId, by } = {}) {
+  await ensureSchema();
+  const ent = entity === undefined || entity === null ? "" : String(entity).trim();
+  if (!ent) throw new Error("entity requis (entité réellement discutée)");
+  const desc = description === undefined || description === null ? "" : String(description).trim();
+  if (!desc) throw new Error("description requise");
+  let project = projectId ? String(projectId) : null;
+  if (!project && recetteId) {
+    const r = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [String(recetteId)])).rows[0];
+    if (!r) throw new Error(`recette inconnue : ${recetteId}`);
+    project = r.project;
+  }
+  if (!project && taskId) {
+    const t = (await pool().query("SELECT project FROM tasks WHERE id = $1", [String(taskId)])).rows[0];
+    if (!t) throw new Error(`tâche inconnue : ${taskId}`);
+    project = t.project;
+  }
+  if (!project) throw new Error("projectId requis (ou recetteId/taskId permettant de le résoudre)");
+  if (proposedAdrId && !(await getAdr(proposedAdrId))) {
+    throw new Error(`ADR proposée inconnue (kind='adr-tech' attendu) : ${proposedAdrId}`);
+  }
+  const vigilanceId = await insertAdrVigilance({
+    project, recetteId, taskId, sessionId,
+    type: "missing", status: "open", entity: ent, description: desc,
+    adrId: proposedAdrId || null, by,
+  });
+  return getAdrVigilance(vigilanceId);
+}
+
+// HISTORIQUE des points de vigilance ADR — filtrable (projet, recette, type,
+// statut, plage de dates) et APPEND-ONLY (lecture seule). Chaque point porte sa
+// `reason` explicite (réutilisée par la garde de terminaison et l'UI).
+export async function listAdrVigilances({ projectId, recetteId, type, status, from, to, limit = 500 } = {}) {
+  await ensureSchema();
+  const conds = [];
+  const params = [];
+  if (projectId) { params.push(String(projectId)); conds.push(`project = $${params.length}`); }
+  if (recetteId) { params.push(String(recetteId)); conds.push(`recette_id = $${params.length}`); }
+  if (type) { params.push(String(type)); conds.push(`type = $${params.length}`); }
+  if (status) { params.push(String(status)); conds.push(`status = $${params.length}`); }
+  if (from) { params.push(String(from)); conds.push(`created_at >= $${params.length}`); }
+  if (to) { params.push(String(to)); conds.push(`created_at <= $${params.length}`); }
+  const lim = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.min(Number(limit), 5000) : 500;
+  params.push(lim);
+  const rows = (await pool().query(
+    `SELECT * FROM adr_vigilances ${conds.length ? `WHERE ${conds.join(" AND ")}` : ""} ORDER BY created_at DESC LIMIT $${params.length}`,
+    params,
+  )).rows;
+  return rows.map((r) => {
+    const v = rowToAdrVigilance(r);
+    return { ...v, reason: adrVigilanceReason(v) };
+  });
+}
+
+// LÈVE un point de vigilance (ADR créée / dépréciation actée / décision explicite
+// / levée manuelle). `resolution` (raison TRACÉE) est OBLIGATOIRE : le blocage
+// de terminaison n'est jamais infini mais jamais silencieux non plus. Seul
+// `status` transite (open → resolved) ; les colonnes de résolution sont AJOUTÉES.
+export async function resolveAdrVigilance({ vigilanceId, resolution, resolvedBy, adrId, resolutionKind } = {}) {
+  await ensureSchema();
+  if (!vigilanceId) throw new Error("vigilanceId requis");
+  const res = resolution === undefined || resolution === null ? "" : String(resolution).trim();
+  if (!res) throw new Error("resolution requise (raison tracée de la levée)");
+  const row = (await pool().query("SELECT * FROM adr_vigilances WHERE vigilance_id = $1", [String(vigilanceId)])).rows[0];
+  if (!row) throw new Error(`point de vigilance ADR inconnu : ${vigilanceId}`);
+  if (row.status !== "open") throw new Error(`point de vigilance déjà résolu : ${vigilanceId}`);
+  if (resolutionKind && !ADR_VIGILANCE_RESOLUTION_KINDS.includes(String(resolutionKind))) {
+    throw new Error(`resolutionKind invalide : ${resolutionKind} (attendu : ${ADR_VIGILANCE_RESOLUTION_KINDS.join(" | ")})`);
+  }
+  if (adrId && !(await getAdr(adrId))) {
+    throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+  }
+  await pool().query(
+    `UPDATE adr_vigilances
+       SET status = 'resolved', resolved_at = $1, resolved_by = $2, resolution = $3,
+           resolution_kind = COALESCE($4, 'manual'), related_adr_id = COALESCE($5, related_adr_id)
+     WHERE vigilance_id = $6`,
+    [nowIso(), resolvedBy ?? "human", res, resolutionKind ? String(resolutionKind) : null, adrId ? String(adrId) : null, String(vigilanceId)],
+  );
+  return getAdrVigilance(vigilanceId);
 }
 
 // --- Suppression physique d'une tâche et de tout son rattaché ---------------
@@ -2452,6 +2681,16 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
         "UPDATE adr_conflicts SET status = 'resolved' WHERE decision_id = $1",
         [decisionId],
       );
+      // Lève AUSSI le point de vigilance ADR de recette lié (item 126) : trancher
+      // le conflit (décision humaine) ne doit pas laisser de blocage orphelin.
+      await client.query(
+        `UPDATE adr_vigilances
+           SET status = 'resolved', resolved_at = $1, resolved_by = $2,
+               resolution_kind = 'decision', resolution = $3
+         WHERE status = 'open'
+           AND conflict_id IN (SELECT conflict_id FROM adr_conflicts WHERE decision_id = $4)`,
+        [ts, by_, "Conflit d'ADR résolu par décision humaine", decisionId],
+      );
     }
   });
 
@@ -2636,6 +2875,9 @@ export async function getRecetteById(recetteId) {
   }));
   const documents = await listRecetteDocuments(recetteId);
   const repos = await reposOfProject(r.project);
+  // Points de vigilance ADR (item 126) — historique append-only de la recette
+  // (+ sous-ensemble OUVERT qui BLOQUE la terminaison).
+  const adrVigilances = await listAdrVigilances({ recetteId });
   return {
     recetteId: r.recette_id,
     project: r.project,
@@ -2650,6 +2892,8 @@ export async function getRecetteById(recetteId) {
     tasks,
     items,
     documents,
+    adrVigilances,
+    adrVigilancesOpen: adrVigilances.filter((v) => v.status === "open"),
   };
 }
 
@@ -2857,8 +3101,18 @@ export async function setRecetteSession({ recetteId, sessionId }) {
 }
 
 // Marque la recette TERMINÉE (faite) + toutes les tâches couvertes recette_status='done'.
+// GARDE ADR (item 126) : refuse tant qu'un point de vigilance ADR (ADR manquante /
+// conflit) est OUVERT sur la recette, avec la RAISON EXPLICITE de chaque point.
+// La levée se fait par résolution (adr_vigilance_resolve : ADR créée / dépréciation
+// actée / décision) ou par décision explicite de l'utilisateur (raison tracée).
 export async function confirmRecette({ recetteId, confirmedBy }) {
   await ensureSchema();
+  const open = await listAdrVigilances({ recetteId, status: "open" });
+  if (open.length) {
+    throw new Error(
+      `terminaison bloquée : ${open.map(adrVigilanceReason).join(" ; ")} — résolvez chaque point (adr_vigilance_resolve) ou levez-le explicitement avec une raison tracée`,
+    );
+  }
   const r = (await pool().query(
     "UPDATE recettes SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE recette_id = $3 RETURNING recette_id",
     [nowIso(), confirmedBy ?? "human", recetteId],
