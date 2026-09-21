@@ -1659,6 +1659,28 @@ function assertAdrStatus(status) {
 // importé (storage/ref-docs) ; ref = fichier référencé par chemin.
 export const DOC_ATTACHMENT_SOURCES = ["registry", "import", "ref"];
 
+// Taxonomie `doc_type` (fusion polymorphe — table unique `artifacts`).
+// Référentiel central partagé : voir `docs/nomenclature-doc-type.md`
+// (panneau orchestrator-panel) et la tâche T-20260920-162801-jxtr.
+// Une SEULE table `artifacts` porte tous les artefacts, identifiés par le
+// couple (doc_type, content_id). `kind` est la NATURE, distincte de `doc_type`.
+export const DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file", "plan", "task_synthese", "task_report", "audit_report", "recette_report", "recette_doc", "e2e_report", "e2e_video", "autre"];
+// Famille « docs » (ADR-12) : documents du registre + leurs pièces jointes.
+export const DOCS_DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file"];
+// Famille « task » : artefacts rattachés à une tâche (content_id = taskId).
+export const TASK_DOC_TYPES = ["plan", "task_synthese", "task_report", "audit_report", "autre"];
+// Famille « recette » : documents d'appui et rapports de recette.
+export const RECETTE_DOC_TYPES = ["recette_report", "recette_doc"];
+// Nature d'un artefact (`kind`) — distincte de `doc_type`.
+export const ARTIFACT_KINDS = ["plan", "audit", "report", "autre"];
+// Domaine d'origine d'un artefact (`source`).
+export const ARTIFACT_SOURCES = ["import", "artifact", "registry", "ref"];
+// Mapping `docs.kind` (ADR-12) ↔ `doc_type` (table polymorphe).
+export const DOC_TYPE_BY_DOC_KIND = { "adr-tech": "adr", "specs-fonctionnelles": "specs", "scenarios-gherkin": "gherkin" };
+export const DOC_KIND_BY_DOC_TYPE = { "adr": "adr-tech", "specs": "specs-fonctionnelles", "gherkin": "scenarios-gherkin" };
+// Mapping `artifacts.kind` (legacy) → `doc_type` cible (migration).
+export const DOC_TYPE_BY_ARTIFACT_KIND = { "plan": "plan", "audit": "audit_report", "report": "task_report", "autre": "autre" };
+
 // Valide une source de pièce jointe. `undefined`/`null`/"" → 'registry'.
 function assertAttachmentSource(source) {
   const s = source === undefined || source === null || String(source).trim() === "" ? "registry" : String(source).trim();
