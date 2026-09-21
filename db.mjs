@@ -453,6 +453,155 @@ async function migrate() {
   for (const tbl of ["projects", "repos", "recettes", "tasks", "e2e_tests", "artifacts"]) {
     await pool().query(`UPDATE ${tbl} SET created_by = 'Rino' WHERE created_by IS NULL`);
   }
+  // =========================================================================
+  // MODÈLE STRUCTURÉ — Fonctionnalités (US-xxx), Règles métier (RM-xxxx),
+  // Sprints + liens N:N (ADR-001, item 128). DDL IDENTIQUE à schema.sql (source
+  // logique) pour créer les tables sur une base PostgreSQL déjà migrée, de
+  // façon idempotente. Les documents ADR-12 (specs/gherkin) deviennent des
+  // PIÈCES CLIENT ; les valeurs de référence vivent ici. NE TOUCHE PAS la
+  // famille ADR (artifacts doc_type='adr', adr_*).
+  // =========================================================================
+  await pool().query(`CREATE TABLE IF NOT EXISTS fonctionnalites (
+    id               TEXT PRIMARY KEY,
+    project          TEXT NOT NULL,
+    ref              TEXT NOT NULL,
+    role             TEXT,
+    user_story       TEXT NOT NULL,
+    sourced_piece_id TEXT,
+    emergent         INTEGER NOT NULL DEFAULT 0,
+    emergent_origin  TEXT,
+    organization_id  TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT,
+    created_by       TEXT
+  )`);
+  await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_fonctionnalites_project_ref ON fonctionnalites(project, ref)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_fonctionnalites_project ON fonctionnalites(project)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS regles_metier (
+    id               TEXT PRIMARY KEY,
+    project          TEXT NOT NULL,
+    ref              TEXT NOT NULL,
+    content          TEXT NOT NULL,
+    sourced_piece_id TEXT,
+    emergent         INTEGER NOT NULL DEFAULT 0,
+    emergent_origin  TEXT,
+    organization_id  TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT,
+    created_by       TEXT
+  )`);
+  await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_regles_metier_project_ref ON regles_metier(project, ref)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_regles_metier_project ON regles_metier(project)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS sprints (
+    id              TEXT PRIMARY KEY,
+    project         TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    start_date      TEXT,
+    end_date        TEXT,
+    status          TEXT NOT NULL DEFAULT 'open',
+    session_id      TEXT,
+    organization_id TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT,
+    created_by      TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_sprints_project ON sprints(project)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_sprints_status ON sprints(status)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS fonctionnalite_regles (
+    fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+    regle_id          TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
+    PRIMARY KEY (fonctionnalite_id, regle_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_fonctionnalite_regles_regle ON fonctionnalite_regles(regle_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS fonctionnalite_gherkin (
+    fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+    e2e_test_id       TEXT NOT NULL REFERENCES e2e_tests(id) ON DELETE CASCADE,
+    PRIMARY KEY (fonctionnalite_id, e2e_test_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_fonctionnalite_gherkin_test ON fonctionnalite_gherkin(e2e_test_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS fonctionnalite_adr (
+    fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+    adr_id            TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    PRIMARY KEY (fonctionnalite_id, adr_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_fonctionnalite_adr_adr ON fonctionnalite_adr(adr_id)");
+  // Contrainte : une ADR (existante) ne peut perdre sa dernière fonctionnalité.
+  await pool().query(`CREATE OR REPLACE FUNCTION fn_fonctionnalite_adr_min() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF EXISTS (SELECT 1 FROM artifacts WHERE artifact_id = OLD.adr_id)
+       AND NOT EXISTS (SELECT 1 FROM fonctionnalite_adr WHERE adr_id = OLD.adr_id) THEN
+      RAISE EXCEPTION 'ADR % doit être rattachée à au moins 1 fonctionnalité', OLD.adr_id;
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF TG_OP = 'UPDATE' AND OLD.adr_id IS DISTINCT FROM NEW.adr_id
+     AND EXISTS (SELECT 1 FROM artifacts WHERE artifact_id = OLD.adr_id)
+     AND NOT EXISTS (SELECT 1 FROM fonctionnalite_adr WHERE adr_id = OLD.adr_id) THEN
+    RAISE EXCEPTION 'ADR % doit être rattachée à au moins 1 fonctionnalité', OLD.adr_id;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql`);
+  await pool().query("DROP TRIGGER IF EXISTS trg_fonctionnalite_adr_min ON fonctionnalite_adr");
+  await pool().query(`CREATE CONSTRAINT TRIGGER trg_fonctionnalite_adr_min
+    AFTER INSERT OR UPDATE OR DELETE ON fonctionnalite_adr
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION fn_fonctionnalite_adr_min()`);
+  await pool().query(`CREATE TABLE IF NOT EXISTS sprint_fonctionnalites (
+    sprint_id         TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+    fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+    PRIMARY KEY (sprint_id, fonctionnalite_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_sprint_fonctionnalites_feat ON sprint_fonctionnalites(fonctionnalite_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS sprint_regles (
+    sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+    regle_id  TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
+    PRIMARY KEY (sprint_id, regle_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_sprint_regles_regle ON sprint_regles(regle_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS sprint_pieces (
+    sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+    piece_id  TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    PRIMARY KEY (sprint_id, piece_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_sprint_pieces_piece ON sprint_pieces(piece_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS task_sprints (
+    task_id   TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    sprint_id TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, sprint_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_task_sprints_sprint ON task_sprints(sprint_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS task_fonctionnalites (
+    task_id           TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, fonctionnalite_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_task_fonctionnalites_feat ON task_fonctionnalites(fonctionnalite_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS task_adr (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    adr_id  TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, adr_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_task_adr_adr ON task_adr(adr_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_sprints (
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    sprint_id  TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+    PRIMARY KEY (recette_id, sprint_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_sprints_sprint ON recette_sprints(sprint_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_fonctionnalites (
+    recette_id        TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+    PRIMARY KEY (recette_id, fonctionnalite_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_fonctionnalites_feat ON recette_fonctionnalites(fonctionnalite_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_adr (
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    adr_id     TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    PRIMARY KEY (recette_id, adr_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id)");
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
