@@ -129,6 +129,9 @@ import {
   ADR_VIGILANCE_TYPES,
   ADR_VIGILANCE_STATUS,
   DOC_ATTACHMENT_SOURCES,
+  DOC_TYPES,
+  ARTIFACT_SOURCES,
+  ARTIFACT_KINDS,
   resolveDecisionAndTransition,
   resolveRecette,
   resetRecette,
@@ -370,7 +373,7 @@ server.registerTool("repo_delete", {
 // patterns, structure de dossiers) | specs-fonctionnelles (User stories + règles
 // métier) | scenarios-gherkin (scénarios Gherkin).
 server.registerTool("doc_register", {
-  description: "Enregistre un DOCUMENT de référence (ADR-12) — registre générique N:N rattaché à un projet et/ou 1..N repos. kind : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin. ADR structurée : status (Proposé | Accepté | Déprécié | Remplacé), context, decision, consequences, replacedBy. Rattachement repos : repoId (1) ou repoIds (1..N) ; global=true rattache TOUS les repos du projet (ADR globale). path = chemin du fichier que les agents liront en contexte — jamais de contenu en base.",
+  description: "Enregistre un DOCUMENT de référence (ADR-12) — registre générique N:N rattaché à un projet et/ou 1..N repos. kind : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin. ADR structurée : status (Proposé | Accepté | Déprécié | Remplacé), context, decision, consequences, replacedBy. Rattachement repos : repoId (1) ou repoIds (1..N) ; global=true rattache TOUS les repos du projet (ADR globale). path = chemin du fichier que les agents liront en contexte — jamais de contenu en base. Rebassé sur la table polymorphe `artifacts` (doc_type = adr | specs | gherkin ; content_id = docId).",
   inputSchema: {
     kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]),
     title: z.string().optional().describe("Titre lisible (ex. 'ADR — Architecture madatalk')."),
@@ -396,7 +399,7 @@ server.registerTool("doc_register", {
 });
 
 server.registerTool("doc_update", {
-  description: "Met à jour un document de référence (ADR-12) — titre/kind/path/description + champs ADR (status, context, decision, consequences, replacedBy) + rattachements (addProjectId/addRepoId/addRepoIds, setGlobal pour rattacher tous les repos du projet).",
+  description: "Met à jour un document de référence (ADR-12) — titre/kind/path/description + champs ADR (status, context, decision, consequences, replacedBy) + rattachements (addProjectId/addRepoId/addRepoIds, setGlobal pour rattacher tous les repos du projet). Rebassé sur `artifacts` (doc_type adr/specs/gherkin/project_doc).",
   inputSchema: {
     docId: z.string(),
     kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
@@ -433,7 +436,7 @@ server.registerTool("doc_delete", {
 });
 
 server.registerTool("doc_get", {
-  description: "Détail d'un document de référence (ADR-12).",
+  description: "Détail d'un document de référence (ADR-12). Rebassé sur `artifacts` (doc_type adr/specs/gherkin/project_doc).",
   inputSchema: { docId: z.string() },
 }, async ({ docId }) => {
   try {
@@ -444,7 +447,7 @@ server.registerTool("doc_get", {
 });
 
 server.registerTool("doc_list", {
-  description: "Liste les documents de référence (ADR-12). Filtres : kind, statut ADR (status), projet (projectId), repo (repoId), includeRepoDocs (docs des repos du projet inclus — contexte projet, rétrocompat). Chaque doc expose projects[] et repos[] (cibles) + champs ADR (status/context/decision/consequences/replacedBy/isGlobal/meta/updatedAt).",
+  description: "Liste les documents de référence (ADR-12). Filtres : kind, statut ADR (status), projet (projectId), repo (repoId), includeRepoDocs (docs des repos du projet inclus — contexte projet, rétrocompat). Chaque doc expose projects[] et repos[] (cibles) + champs ADR (status/context/decision/consequences/replacedBy/isGlobal/meta/updatedAt). Rebassé sur `artifacts` (doc_type adr/specs/gherkin/project_doc).",
   inputSchema: {
     kind: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
     status: z.enum(ADR_STATUS).optional().describe("Filtre ADR par statut : Proposé | Accepté | Déprécié | Remplacé."),
@@ -465,7 +468,7 @@ server.registerTool("doc_list", {
 // source='import' (fichier importé, path) ou source='ref' (fichier référencé
 // par chemin, path). Retourne le doc porteur enrichi (champ attachments).
 server.registerTool("doc_attachment_add", {
-  description: "Rattache une pièce jointe à un document de référence (ADR-12). 3 sources : 'registry' (document du registre via targetDocId), 'import' (fichier importé via path, stocké sous storage/ref-docs) ou 'ref' (fichier référencé par chemin via path, workspace/checkout). kind/nature/title libres. Retourne le doc porteur avec ses pièces jointes (0..N).",
+  description: "Rattache une pièce jointe à un document de référence (ADR-12). 3 sources : 'registry' (document du registre via targetDocId), 'import' (fichier importé via path, stocké sous storage/ref-docs) ou 'ref' (fichier référencé par chemin via path, workspace/checkout). kind/nature/title libres. Retourne le doc porteur avec ses pièces jointes (0..N). Rebassé sur `artifacts` (doc_type = adr_file ; content_id = docId).",
   inputSchema: {
     docId: z.string().describe("docId de l'ADR (document porteur) à laquelle rattacher la pièce jointe."),
     targetDocId: z.string().optional().describe("source='registry' : docId du document du registre à rattacher."),
@@ -484,7 +487,7 @@ server.registerTool("doc_attachment_add", {
 });
 
 server.registerTool("doc_attachment_remove", {
-  description: "Retire une pièce jointe d'une ADR (ADR-12) par son attachmentId stable. docId optionnel (vérifie l'appartenance). Ne touche ni au fichier ni aux rattachements projet/repo.",
+  description: "Retire une pièce jointe d'une ADR (ADR-12) par son attachmentId stable. docId optionnel (vérifie l'appartenance). Ne touche ni au fichier ni aux rattachements projet/repo. Rebassé sur `artifacts` (doc_type = adr_file).",
   inputSchema: {
     attachmentId: z.string().describe("attachmentId de la pièce jointe à retirer."),
     docId: z.string().optional().describe("docId de l'ADR porteuse (vérification d'appartenance)."),
@@ -498,7 +501,7 @@ server.registerTool("doc_attachment_remove", {
 });
 
 server.registerTool("doc_attachment_list", {
-  description: "Liste les pièces jointes d'un document de référence (ADR-12). Retourne { count, attachments }.",
+  description: "Liste les pièces jointes d'un document de référence (ADR-12). Retourne { count, attachments }. Rebassé sur `artifacts` (doc_type = adr_file).",
   inputSchema: {
     docId: z.string().describe("docId de l'ADR porteuse."),
   },
@@ -517,7 +520,7 @@ server.registerTool("doc_attachment_list", {
 // ===========================================================================
 
 server.registerTool("adr_list", {
-  description: "Vue CONDENSÉE des ADR (adr-tech) d'un projet — point d'entrée de tout agent. Filtres : projectId, repoIds (intersection des repos rattachés ; une ADR globale correspond toujours), status (Proposé|Accepté|Déprécié|Remplacé), search (titre/contexte/décision/conséquences/chemin, insensible casse/accents), includeRepoDocs. Le statut est filtré côté registre (ne dépend pas du SQL includeRepoDocs). Retourne { count, adrs }.",
+  description: "Vue CONDENSÉE des ADR (adr-tech) d'un projet — point d'entrée de tout agent. Filtres : projectId, repoIds (intersection des repos rattachés ; une ADR globale correspond toujours), status (Proposé|Accepté|Déprécié|Remplacé), search (titre/contexte/décision/conséquences/chemin, insensible casse/accents), includeRepoDocs. Le statut est filtré côté registre (ne dépend pas du SQL includeRepoDocs). Retourne { count, adrs }. Rebassé sur `artifacts` (doc_type = 'adr').",
   inputSchema: {
     projectId: z.string().optional().describe("Projet dont on liste les ADR."),
     repoIds: z.array(z.string()).optional().describe("Repos à considérer (une ADR globale correspond toujours)."),
@@ -533,7 +536,7 @@ server.registerTool("adr_list", {
 });
 
 server.registerTool("adr_get", {
-  description: "Contenu COMPLET structuré d'une ADR : titre, statut, contexte, décision, conséquences, replacedBy, repos, pièces jointes, chemin, + conflits ouverts. `err` si inconnue ou si le doc n'est pas une ADR.",
+  description: "Contenu COMPLET structuré d'une ADR : titre, statut, contexte, décision, conséquences, replacedBy, repos, pièces jointes, chemin, + conflits ouverts. `err` si inconnue ou si le doc n'est pas une ADR. Rebassé sur `artifacts` (doc_type = 'adr').",
   inputSchema: { adrId: z.string().describe("docId de l'ADR (kind='adr-tech').") },
 }, async ({ adrId }) => {
   try {
@@ -544,7 +547,7 @@ server.registerTool("adr_get", {
 });
 
 server.registerTool("adr_search", {
-  description: "Recherche texte dans les ADR (titre/contexte/décision/conséquences/chemin) — retrouver la règle pertinente. Retourne { count, results } avec un extrait.",
+  description: "Recherche texte dans les ADR (titre/contexte/décision/conséquences/chemin) — retrouver la règle pertinente. Retourne { count, results } avec un extrait. Rebassé sur `artifacts` (doc_type = 'adr').",
   inputSchema: {
     query: z.string().describe("Texte recherché (insensible casse/accents)."),
     projectId: z.string().optional().describe("Restreindre à un projet."),
@@ -557,7 +560,7 @@ server.registerTool("adr_search", {
 });
 
 server.registerTool("adr_context", {
-  description: "Construit le bloc de contexte ADR prêt à injecter dans un prompt agent ('## ADR de référence' : titre, statut, repos, décision, conséquence, chemin). ADR = `adrIds` (sélection explicite) sinon les ADR ACTIVES (Proposé/Accepté) du projet ; filtrage par `scope` (ADR globale ou segment de chemin). `taskId` résout projectId/scope. Retourne { projectId, count, adrs, context }.",
+  description: "Construit le bloc de contexte ADR prêt à injecter dans un prompt agent ('## ADR de référence' : titre, statut, repos, décision, conséquence, chemin). ADR = `adrIds` (sélection explicite) sinon les ADR ACTIVES (Proposé/Accepté) du projet ; filtrage par `scope` (ADR globale ou segment de chemin). `taskId` résout projectId/scope. Retourne { projectId, count, adrs, context }. Rebassé sur `artifacts` (doc_type = 'adr').",
   inputSchema: {
     projectId: z.string().optional(),
     scope: z.array(z.string()).optional().describe("Périmètres (chemins) — une ADR globale correspond toujours."),
@@ -572,7 +575,7 @@ server.registerTool("adr_context", {
 });
 
 server.registerTool("adr_register", {
-  description: "Crée une ADR structurée (kind='adr-tech') — statut initial 'Proposé' par défaut (l'acceptation est une DÉCISION HUMAINE, pas une écriture d'agent). repoIds (1..N), global=true pour tous les repos du projet, attachments[] optionnels ({repoId?, docId?, path?, title?, kind?, nature?}). `path` requis (l'ADR pointe un fichier que l'agent lit).",
+  description: "Crée une ADR structurée (kind='adr-tech') — statut initial 'Proposé' par défaut (l'acceptation est une DÉCISION HUMAINE, pas une écriture d'agent). repoIds (1..N), global=true pour tous les repos du projet, attachments[] optionnels ({repoId?, docId?, path?, title?, kind?, nature?}). `path` requis (l'ADR pointe un fichier que l'agent lit). Rebassé sur `artifacts` (doc_type = 'adr').",
   inputSchema: {
     projectId: z.string(),
     repoIds: z.array(z.string()).optional().describe("Repos rattachés (1..N)."),
@@ -601,7 +604,7 @@ server.registerTool("adr_register", {
 });
 
 server.registerTool("adr_set_status", {
-  description: "Fait transiter une ADR : Proposé→{Accepté,Déprécié}, Accepté→{Déprécié,Remplacé}, Déprécié→{Remplacé}, Remplacé terminal. 'Remplacé' exige `replacedBy` (docId de l'ADR qui remplace). Toute transition non permise est refusée.",
+  description: "Fait transiter une ADR : Proposé→{Accepté,Déprécié}, Accepté→{Déprécié,Remplacé}, Déprécié→{Remplacé}, Remplacé terminal. 'Remplacé' exige `replacedBy` (docId de l'ADR qui remplace). Toute transition non permise est refusée. Rebassé sur `artifacts` (doc_type = 'adr').",
   inputSchema: {
     adrId: z.string(),
     status: z.enum(ADR_STATUS),
@@ -615,7 +618,7 @@ server.registerTool("adr_set_status", {
 });
 
 server.registerTool("adr_update", {
-  description: "Met à jour les champs STRUCTURÉS d'une ADR (title/path/description/context/decision/consequences/replacedBy) et ses rattachements repos (addRepoIds) / global (setGlobal). `err` si l'ADR est inconnue.",
+  description: "Met à jour les champs STRUCTURÉS d'une ADR (title/path/description/context/decision/consequences/replacedBy) et ses rattachements repos (addRepoIds) / global (setGlobal). `err` si l'ADR est inconnue. Rebassé sur `artifacts` (doc_type = 'adr').",
   inputSchema: {
     adrId: z.string(),
     title: z.string().optional(),
@@ -637,7 +640,7 @@ server.registerTool("adr_update", {
 });
 
 server.registerTool("adr_attach", {
-  description: "Rattache à une ADR : un repo (repoId, cumulable 1..N) et/ou une pièce jointe (docId = document du registre, ou path = fichier import/ref). Au moins un des trois (repoId/docId/path) requis. Retourne l'ADR à jour.",
+  description: "Rattache à une ADR : un repo (repoId, cumulable 1..N) et/ou une pièce jointe (docId = document du registre, ou path = fichier import/ref). Au moins un des trois (repoId/docId/path) requis. Retourne l'ADR à jour. Rebassé sur `artifacts` (doc_type = 'adr' / 'adr_file').",
   inputSchema: {
     adrId: z.string(),
     repoId: z.string().optional().describe("Repo à rattacher."),
@@ -657,7 +660,7 @@ server.registerTool("adr_attach", {
 });
 
 server.registerTool("adr_report_conflict", {
-  description: "Signale qu'une implémentation CONTREDIT une ADR → conflit persisté (adr_conflicts, status='open') MÊME SANS taskId ; si `taskId` fourni, une décision HUMAINE trackée (kind='conflict') est créée et référencée — sa résolution clôt le conflit. Aucune violation silencieuse. `recetteId` OPTIONNEL : signaler un conflit PENDANT une recette crée EN PLUS un POINT DE VIGILANCE GLOBAL de la recette (type='conflict'), qui BLOQUE sa terminaison jusqu'à levée. Retourne { ok, conflict, decision, vigilance }.",
+  description: "Signale qu'une implémentation CONTREDIT une ADR → conflit persisté (adr_conflicts, status='open') MÊME SANS taskId ; si `taskId` fourni, une décision HUMAINE trackée (kind='conflict') est créée et référencée — sa résolution clôt le conflit. Aucune violation silencieuse. `recetteId` OPTIONNEL : signaler un conflit PENDANT une recette crée EN PLUS un POINT DE VIGILANCE GLOBAL de la recette (type='conflict'), qui BLOQUE sa terminaison jusqu'à levée. Retourne { ok, conflict, decision, vigilance }. Rebassé sur `artifacts` (adr_conflicts.adr_id → artifacts.artifact_id).",
   inputSchema: {
     adrId: z.string().describe("ADR contredite."),
     taskId: z.string().optional().describe("Tâche concernée (→ décision humaine trackée)."),
@@ -1798,23 +1801,35 @@ server.registerTool("decision_expired", {
 });
 
 // === artifact_add ===
+// Gestionnaire central polymorphe (T-20260920-162801-jxtr) : `docType` + `contentId`
+// identifient l'entité porteuse (tâche/recette/projet/doc) ; `kind` = NATURE.
+// Rétrocompat : `artifact_add(taskId, kind, path)` reste fonctionnel (docType
+// dérivé de kind, contentId = taskId). Cf. `public/docs/nomenclature-doc-type.md`.
 server.registerTool("artifact_add", {
   description:
-    "Rattache un document/livrable (plan, audit, rapport...) à une tâche. Le chemin `path` doit être un chemin absolu hôte lisible (pour le téléchargement depuis le panneau).",
+    "Rattache un artefact (document/livrable) à une ENTITÉ porteuse via le couple (docType, contentId) — gestionnaire central polymorphe. docType : taxonomie (adr|specs|gherkin|project_doc|adr_file|plan|task_synthese|task_report|audit_report|recette_report|recette_doc|e2e_report|e2e_video|autre). kind = NATURE (plan|audit|report|autre). Rétrocompat : taskId seul + kind suffit (docType dérivé de kind, contentId = taskId). `path` = chemin absolu hôte lisible (téléchargement/visionneuse).",
   inputSchema: {
-    taskId: z.string(),
-    kind: z.string().describe("Type de document : plan | audit | report | autre."),
+    taskId: z.string().optional().describe("Entité porteuse (rétrocompat famille task) — requis si docType ∈ famille task."),
+    docType: z.enum(DOC_TYPES).optional().describe("Type d'artefact (défaut dérivé de kind : plan|audit_report|task_report|autre)."),
+    contentId: z.string().optional().describe("Identifiant de l'entité porteuse (défaut = taskId)."),
+    kind: z.enum(ARTIFACT_KINDS).describe("NATURE : plan | audit | report | autre."),
     title: z.string().optional().describe("Titre lisible (ex: Plan-echo-cancellation)."),
     path: z.string().describe("Chemin absolu (hôte) du fichier."),
+    nature: z.string().optional().describe("Liaison libre (à quoi sert le document)."),
+    source: z.enum(ARTIFACT_SOURCES).optional().describe("Origine : import | artifact | registry | ref (défaut import)."),
+    meta: z.record(z.string(), z.any()).optional().describe("Métadonnées propres à la famille (JSON)."),
   },
-}, async ({ taskId, kind, title, path }) => {
+}, async ({ taskId, docType, contentId, kind, title, path, nature, source, meta }) => {
   try {
-    const task = await getTask(taskId);
-    if (!task) return err(`tâche inconnue : ${taskId}`);
-    if (kind === "audit" && task.type !== "audit") {
-      return err(`artefact d'audit refusé : la tâche ${taskId} est de type "${task.type}" (un audit n'est rattaché qu'à une tâche type="audit").`);
+    // Rétrocompat : garde audit (une tâche non-audit ne porte pas d'audit).
+    if (taskId && kind === "audit") {
+      const task = await getTask(taskId);
+      if (!task) return err(`tâche inconnue : ${taskId}`);
+      if (task.type !== "audit") {
+        return err(`artefact d'audit refusé : la tâche ${taskId} est de type "${task.type}" (un audit n'est rattaché qu'à une tâche type="audit").`);
+      }
     }
-    const a = await addArtifact({ taskId, kind, title, path });
+    const a = await addArtifact({ taskId, docType, contentId, kind, title, path, nature, source, meta });
     return text(JSON.stringify({ ok: true, artifact: a }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -1823,11 +1838,19 @@ server.registerTool("artifact_add", {
 
 // === artifact_list ===
 server.registerTool("artifact_list", {
-  description: "Liste les documents/livrables rattachés à une tâche (ou tous).",
-  inputSchema: { taskId: z.string().optional() },
-}, async ({ taskId }) => {
+  description:
+    "Liste les artefacts. Rétrocompat : `artifact_list(taskId)` renvoie les artefacts de la famille task (content_id = taskId). Filtres centraux : docType, contentId, kind, q (recherche titre/path).",
+  inputSchema: {
+    taskId: z.string().optional().describe("Rétrocompat : artefacts rattachés à cette tâche (famille task)."),
+    docType: z.enum(DOC_TYPES).optional().describe("Filtre par type d'artefact."),
+    contentId: z.string().optional().describe("Filtre par entité porteuse."),
+    kind: z.enum(ARTIFACT_KINDS).optional().describe("Filtre par NATURE."),
+    q: z.string().optional().describe("Recherche texte (titre/path)."),
+    limit: z.number().int().optional().describe("Max (défaut 500)."),
+  },
+}, async ({ taskId, docType, contentId, kind, q, limit }) => {
   try {
-    const artifacts = await listArtifacts(taskId);
+    const artifacts = await listArtifacts({ taskId, docType, contentId, kind, q, limit });
     return text(JSON.stringify({ count: artifacts.length, artifacts }, null, 2));
   } catch (e) {
     return err(e.message);
