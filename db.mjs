@@ -656,6 +656,46 @@ $$ LANGUAGE plpgsql`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_cardinality_signals_status ON cardinality_signals(status)");
   // UN SEUL signal OPEN par entité (les signaux résolus restent en historique).
   await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_cardinality_signals_open_entity ON cardinality_signals(entity_type, entity_id) WHERE status = 'open'");
+  // =========================================================================
+  // SESSION DE MIGRATION DES ANCIENS SPRINTS (ADR-001 §6) — DDL ADDITIVE.
+  // A001 : `adr_conversions` conserve le LIEN HISTORIQUE ADR d'origine ↔ ADR
+  // converties (N converties pour 1 origine). L'ADR d'origine n'est JAMAIS
+  // modifiée (ni doc_type, ni content_id, ni path, ni meta) : la conversion est
+  // purement additive (une nouvelle ligne `artifacts` par ADR atomique).
+  // DDL identique à schema.sql (source logique), idempotente (base existante
+  // comme neuve). Aucune colonne existante n'est modifiée.
+  // =========================================================================
+  await pool().query(`CREATE TABLE IF NOT EXISTS adr_conversions (
+    conversion_id     TEXT PRIMARY KEY,
+    original_adr_id   TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    converted_adr_id  TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    created_at        TEXT NOT NULL,
+    created_by        TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conversions_original ON adr_conversions(original_adr_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conversions_converted ON adr_conversions(converted_adr_id)");
+  // Idempotence du lien : une seule ligne par couple (origine, convertie).
+  await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_adr_conversions_pair ON adr_conversions(original_adr_id, converted_adr_id)");
+  // A002 : `migrations` porte l'entité « session de migration » d'un PROJET
+  // (type dédié, à l'image des sessions sprint/recette), ancrée sur le SPRINT
+  // PAR DÉFAUT (= l'ancien sprint). Une migration par projet (index unique) :
+  // `startMigration` est IDEMPOTENT (relance = même ligne).
+  await pool().query(`CREATE TABLE IF NOT EXISTS migrations (
+    migration_id    TEXT PRIMARY KEY,
+    project         TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    sprint_id       TEXT REFERENCES sprints(id) ON DELETE SET NULL,
+    session_id      TEXT,
+    status          TEXT NOT NULL DEFAULT 'open',
+    title           TEXT,
+    organization_id TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT,
+    finished_at     TEXT,
+    created_by      TEXT
+  )`);
+  await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_migrations_project ON migrations(project)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_migrations_status ON migrations(status)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_migrations_sprint ON migrations(sprint_id)");
 }
 
 // Détecte l'état de sprint d'un PROJET (table `sprints`, livrée par
@@ -1105,6 +1145,211 @@ export async function migrateExistingToDefaultSprint({ projectId, title, startDa
     [pid, sprint.id],
   );
   return { sprintId: sprint.id, recettes: rec.rowCount, tasks: tsk.rowCount, sprint };
+}
+
+// ===========================================================================
+// SESSION DE MIGRATION DES ANCIENS SPRINTS (ADR-001 §6) — A005/A006/A007.
+// Entité « migration » d'un PROJET (type dédié, à l'image des sessions
+// sprint/recette), ANCRÉE sur le SPRINT PAR DÉFAUT du projet (= l'ancien
+// sprint). GARDE CRITIQUE : l'émergence n'est JAMAIS rétroactive — les
+// rattachements se font par INSERT DIRECTS, sans écrire `emergent`/
+// `emergent_origin` et sans passer par `attachPiecesToSprint`.
+// ===========================================================================
+
+// Statuts d'une session de migration (cycle de vie simple et idempotent).
+export const MIGRATION_STATUS = ["open", "in_progress", "done", "aborted"];
+
+// Sérialise une ligne `migrations` (camelCase).
+function rowToMigration(r) {
+  if (!r) return null;
+  return {
+    migrationId: r.migration_id,
+    project: r.project,
+    sprintId: r.sprint_id ?? null,
+    sessionId: r.session_id ?? null,
+    status: r.status,
+    title: r.title ?? null,
+    organizationId: r.organization_id ?? null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at ?? null,
+    finishedAt: r.finished_at ?? null,
+    createdBy: r.created_by ?? null,
+  };
+}
+
+// DÉMARRE (ou résout) la session de migration d'un projet. IDEMPOTENT : si une
+// migration existe pour le projet, elle est retournée (le sprint par défaut est
+// ré-ancré s'il manquait). Le sprint cible est le SPRINT PAR DÉFAUT
+// (`ensureDefaultSprint`) — c'est l'ANCIEN sprint auquel tous les éléments
+// migrés sont rattachés. Retourne `{ migration, sprint }`.
+export async function startMigration({ projectId, title, startDate, endDate, createdBy } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  await assertProjectExists(pid);
+  // Ancien sprint = sprint par défaut du projet (créé au besoin, idempotent).
+  const sprint = await ensureDefaultSprint(pid, { startDate, endDate, createdBy });
+  const ts = nowIso();
+  const existing = (await pool().query("SELECT * FROM migrations WHERE project = $1 LIMIT 1", [pid])).rows[0];
+  if (existing) {
+    if (!existing.sprint_id) {
+      await pool().query(
+        "UPDATE migrations SET sprint_id = $1, updated_at = $2 WHERE migration_id = $3",
+        [sprint.id, ts, existing.migration_id],
+      );
+    }
+    return { migration: await getMigration(existing.migration_id), sprint };
+  }
+  const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
+  const id = `MIG-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO migrations (migration_id, project, sprint_id, status, title, organization_id, created_at, created_by)
+     VALUES ($1,$2,$3,'open',$4,$5,$6,$7)
+     ON CONFLICT (project) DO NOTHING`,
+    [
+      id, pid, sprint.id,
+      title ? String(title).trim() : `Migration des anciens sprints — ${pid}`,
+      org, ts, createdBy ?? null,
+    ],
+  );
+  // Course concurrente possible : relire la ligne effectivement présente.
+  const row = (await pool().query("SELECT * FROM migrations WHERE project = $1 LIMIT 1", [pid])).rows[0];
+  return { migration: rowToMigration(row), sprint };
+}
+
+// DÉTAIL d'une migration (+ sprint cible résolu). `null` si inconnue.
+export async function getMigration(migrationId) {
+  await ensureSchema();
+  if (!migrationId) return null;
+  const r = (await pool().query(
+    "SELECT * FROM migrations WHERE migration_id = $1", [String(migrationId)],
+  )).rows[0];
+  if (!r) return null;
+  const m = rowToMigration(r);
+  m.sprint = m.sprintId ? await getSprint(m.sprintId) : null;
+  return m;
+}
+
+// LISTE les migrations (toutes, ou celles d'un projet), plus récentes d'abord.
+export async function listMigrations({ project, limit = 500 } = {}) {
+  await ensureSchema();
+  const params = [];
+  let where = "";
+  if (project) { params.push(String(project).trim()); where = `WHERE project = $${params.length}`; }
+  params.push(limit);
+  const rows = (await pool().query(
+    `SELECT * FROM migrations ${where} ORDER BY created_at DESC, migration_id DESC LIMIT $${params.length}`, params,
+  )).rows;
+  return rows.map(rowToMigration);
+}
+
+// RATTACHE / REPREND la SESSION IA dédiée (agent-migration) à une migration
+// EXISTANTE. Miroir de `setSprintSession` : NE TOUCHE PAS au statut du sprint
+// (open/close et donc la garde d'émergence restent inchangés). Une migration
+// `open` passe `in_progress` au rattachement ; un statut terminal n'est pas
+// modifié. `sessionId` null détache la session. Retourne la migration.
+export async function setMigrationSession({ migrationId, sessionId }) {
+  await ensureSchema();
+  if (!migrationId) throw new Error("migrationId requis");
+  const id = String(migrationId);
+  const row = (await pool().query("SELECT migration_id, status FROM migrations WHERE migration_id = $1", [id])).rows[0];
+  if (!row) throw new Error(`migration inconnue : ${id}`);
+  const nextStatus = row.status === "open" ? "in_progress" : row.status;
+  await pool().query(
+    "UPDATE migrations SET session_id = $1, status = $2, updated_at = $3 WHERE migration_id = $4",
+    [sessionId != null ? String(sessionId) : null, nextStatus, nowIso(), id],
+  );
+  return getMigration(id);
+}
+
+// CLÔTURE d'une session de migration (`done` = migrée, `aborted` = abandonnée).
+// Pose `finished_at`. Idempotent (re-clôturer met à jour l'horodatage).
+export async function finishMigration({ migrationId, status = "done", by } = {}) {
+  await ensureSchema();
+  if (!migrationId) throw new Error("migrationId requis");
+  const id = String(migrationId);
+  const row = (await pool().query("SELECT migration_id FROM migrations WHERE migration_id = $1", [id])).rows[0];
+  if (!row) throw new Error(`migration inconnue : ${id}`);
+  const st = status ? String(status).trim() : "done";
+  if (!["done", "aborted"].includes(st)) throw new Error(`status invalide : ${st} (attendu : done | aborted)`);
+  const ts = nowIso();
+  await pool().query(
+    "UPDATE migrations SET status = $1, finished_at = $2, updated_at = $3 WHERE migration_id = $4",
+    [st, ts, ts, id],
+  );
+  return getMigration(id);
+}
+
+// A007 — RATTACHEMENT des éléments EXISTANTS à l'ANCIEN SPRINT (sprint par
+// défaut du projet) : fonctionnalités (`sprint_fonctionnalites`), règles métier
+// (`sprint_regles`), pièces client (`sprint_pieces`), tâches (`task_sprints`) et
+// recettes (`recette_sprints`) SANS lien sprint. IDEMPOTENT.
+//
+// GARDE CRITIQUE — AUCUN FAUX ÉMERGENT : les rattachements sont des INSERT
+// DIRECTS (`INSERT ... SELECT ... ON CONFLICT DO NOTHING`). On n'appelle JAMAIS
+// `attachPiecesToSprint` (qui écrit `meta.emergent`/`emergent_origin`) et on
+// n'écrit AUCUNE colonne `emergent`/`emergent_origin` : l'émergence n'est jamais
+// rétroactive (ADR-001 §5). Retourne les compteurs par type.
+export async function migrateProjectElementsToDefaultSprint({ projectId, title, startDate, endDate, createdBy } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  await assertProjectExists(pid);
+  const sprint = await ensureDefaultSprint(pid, { title, startDate, endDate, createdBy });
+  const sid = sprint.id;
+  const feats = await pool().query(
+    `INSERT INTO sprint_fonctionnalites (sprint_id, fonctionnalite_id)
+     SELECT $2, f.id FROM fonctionnalites f
+      WHERE f.project = $1
+        AND NOT EXISTS (SELECT 1 FROM sprint_fonctionnalites sf WHERE sf.fonctionnalite_id = f.id)
+     ON CONFLICT DO NOTHING`,
+    [pid, sid],
+  );
+  const regs = await pool().query(
+    `INSERT INTO sprint_regles (sprint_id, regle_id)
+     SELECT $2, r.id FROM regles_metier r
+      WHERE r.project = $1
+        AND NOT EXISTS (SELECT 1 FROM sprint_regles sr WHERE sr.regle_id = r.id)
+     ON CONFLICT DO NOTHING`,
+    [pid, sid],
+  );
+  // Pièces client : artefact `doc_type='piece'` rattaché au projet
+  // (`artifact_projects`). INSERT direct — JAMAIS `attachPiecesToSprint`.
+  const pieces = await pool().query(
+    `INSERT INTO sprint_pieces (sprint_id, piece_id)
+     SELECT $2, a.artifact_id FROM artifacts a
+      WHERE a.doc_type = 'piece'
+        AND EXISTS (SELECT 1 FROM artifact_projects ap WHERE ap.artifact_id = a.artifact_id AND ap.project_id = $1)
+        AND NOT EXISTS (SELECT 1 FROM sprint_pieces sp WHERE sp.piece_id = a.artifact_id)
+     ON CONFLICT DO NOTHING`,
+    [pid, sid],
+  );
+  // Anciennes tâches associées à l'ancien sprint — SANS marquage émergent.
+  const tasks = await pool().query(
+    `INSERT INTO task_sprints (task_id, sprint_id)
+     SELECT t.id, $2 FROM tasks t
+      WHERE t.project = $1
+        AND NOT EXISTS (SELECT 1 FROM task_sprints ts WHERE ts.task_id = t.id)
+     ON CONFLICT DO NOTHING`,
+    [pid, sid],
+  );
+  const recs = await pool().query(
+    `INSERT INTO recette_sprints (recette_id, sprint_id)
+     SELECT r.recette_id, $2 FROM recettes r
+      WHERE r.project = $1
+        AND NOT EXISTS (SELECT 1 FROM recette_sprints rs WHERE rs.recette_id = r.recette_id)
+     ON CONFLICT DO NOTHING`,
+    [pid, sid],
+  );
+  return {
+    sprintId: sid,
+    sprint,
+    fonctionnalites: feats.rowCount,
+    regles: regs.rowCount,
+    pieces: pieces.rowCount,
+    tasks: tasks.rowCount,
+    recettes: recs.rowCount,
+  };
 }
 
 // REPRISE / RÉOUVERTURE d'un sprint clôturé (le cycle n'est PAS définitif,
@@ -4471,6 +4716,136 @@ export async function attachAdr({ adrId, repoId, docId, path, title, kind, natur
     });
   }
   return getAdr(adrId);
+}
+
+// ===========================================================================
+// CONVERSION D'ADR (ADR-001 §6) — A003/A004.
+// Une ADR MONOLITHIQUE d'origine (kind='adr-tech', colonnes structurées vides)
+// est CONVERTIE en PLUSIEURS ADR ATOMIQUES (titre/statut/contexte/décision/
+// conséquences). Les grands détails partent en PIÈCES JOINTES (`adr_file`).
+// GARANTIES :
+//   - l'ADR d'origine reste INTACTE (jamais de UPDATE doc_type/content_id/path/
+//     meta) — la conversion est purement ADDITIVE (nouvelles lignes `artifacts`) ;
+//   - le LIEN HISTORIQUE est conservé dans `adr_conversions` (N converties / 1
+//     origine) ET rappelé dans `meta.converted_from_adr_id` de la convertie ;
+//   - IDEMPOTENT sur le couple (origine, convertie).
+// ===========================================================================
+
+// Sérialise une ligne `adr_conversions` (camelCase).
+function rowToAdrConversion(r) {
+  if (!r) return null;
+  return {
+    conversionId: r.conversion_id,
+    originalAdrId: r.original_adr_id,
+    convertedAdrId: r.converted_adr_id,
+    createdAt: r.created_at,
+    createdBy: r.created_by ?? null,
+  };
+}
+
+// Écrit le lien de conversion ADR d'origine → ADR convertie. GARDES : les deux
+// ADR doivent exister (`kind='adr-tech'`) et différer. IDEMPOTENT : un couple
+// déjà lié retourne la ligne existante (aucun doublon).
+export async function linkAdrConversion({ originalAdrId, convertedAdrId, createdBy } = {}) {
+  await ensureSchema();
+  if (!originalAdrId) throw new Error("originalAdrId requis");
+  if (!convertedAdrId) throw new Error("convertedAdrId requis");
+  const orig = String(originalAdrId).trim();
+  const conv = String(convertedAdrId).trim();
+  if (orig === conv) throw new Error("originalAdrId et convertedAdrId doivent différer");
+  if (!(await getAdr(orig))) throw new Error(`ADR d'origine inconnue (kind='adr-tech' attendu) : ${orig}`);
+  if (!(await getAdr(conv))) throw new Error(`ADR convertie inconnue (kind='adr-tech' attendu) : ${conv}`);
+  const existing = (await pool().query(
+    "SELECT * FROM adr_conversions WHERE original_adr_id = $1 AND converted_adr_id = $2", [orig, conv],
+  )).rows[0];
+  if (existing) return rowToAdrConversion(existing);
+  const id = `cnv-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO adr_conversions (conversion_id, original_adr_id, converted_adr_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5) ON CONFLICT (original_adr_id, converted_adr_id) DO NOTHING`,
+    [id, orig, conv, nowIso(), createdBy ?? null],
+  );
+  const row = (await pool().query(
+    "SELECT * FROM adr_conversions WHERE original_adr_id = $1 AND converted_adr_id = $2", [orig, conv],
+  )).rows[0];
+  return rowToAdrConversion(row);
+}
+
+// Liste les liens de conversion (par ADR d'origine et/ou par ADR convertie).
+export async function listAdrConversions({ originalAdrId, convertedAdrId, limit = 500 } = {}) {
+  await ensureSchema();
+  const conds = [];
+  const params = [];
+  if (originalAdrId) { params.push(String(originalAdrId).trim()); conds.push(`original_adr_id = $${params.length}`); }
+  if (convertedAdrId) { params.push(String(convertedAdrId).trim()); conds.push(`converted_adr_id = $${params.length}`); }
+  const where = conds.length ? `WHERE ${conds.join(" AND ")}` : "";
+  params.push(limit);
+  const rows = (await pool().query(
+    `SELECT * FROM adr_conversions ${where} ORDER BY created_at, conversion_id LIMIT $${params.length}`, params,
+  )).rows;
+  return rows.map(rowToAdrConversion);
+}
+
+// CONVERTIT un monolithe en UNE ADR ATOMIQUE. Crée l'ADR atomique (via
+// `registerAdr`, donc signal de cardinalité ADR→1..N fonctionnalités NON
+// bloquant), rattache les détails en pièces jointes (`attachments`, source
+// registry/import/ref), écrit le lien `adr_conversions` et rappelle l'origine
+// dans `meta.converted_from_adr_id`. NE MODIFIE JAMAIS l'ADR d'origine.
+// R3 : le projet est résolu depuis l'ADR d'origine (`artifact_projects`) ;
+// erreur explicite si aucun projet n'est rattaché. `path` (optionnel) : chemin
+// du fichier de l'ADR atomique (défaut : celui de l'origine — l'extrait vient
+// du même document, dont les détails restent en pièces jointes).
+export async function convertAdr({
+  originalAdrId, title, status, context, decision, consequences, description,
+  path, repoIds, global: isGlobal, attachments, createdBy, by,
+} = {}) {
+  await ensureSchema();
+  if (!originalAdrId) throw new Error("originalAdrId requis");
+  const orig = String(originalAdrId).trim();
+  const original = await getAdr(orig);
+  if (!original) throw new Error(`ADR d'origine inconnue (kind='adr-tech' attendu) : ${orig}`);
+  const t = title ? String(title).trim() : "";
+  if (!t) throw new Error("title requis (titre de l'ADR atomique)");
+  // R3 — résolution du projet depuis l'ADR d'origine.
+  let projectId = Array.isArray(original.projects) && original.projects.length ? original.projects[0] : null;
+  if (!projectId) {
+    const r = (await pool().query(
+      "SELECT project_id FROM artifact_projects WHERE artifact_id = $1 ORDER BY project_id LIMIT 1", [orig],
+    )).rows[0];
+    projectId = r ? r.project_id : null;
+  }
+  if (!projectId) {
+    throw new Error(`impossible de résoudre le projet de l'ADR d'origine ${orig} (aucun artifact_projects rattaché)`);
+  }
+  const actor = createdBy ?? by ?? null;
+  const repos = Array.isArray(repoIds) && repoIds.length ? repoIds.map(String) : (original.repos || []).map(String);
+  // Statut : demandé, sinon hérité de l'origine, sinon 'Proposé' (défaut registerAdr).
+  const st = status ? assertAdrStatus(status) : (original.status || undefined);
+  const adr = await registerAdr({
+    projectId,
+    repoIds: repos,
+    title: t,
+    path: path ? String(path).trim() : original.path,
+    description,
+    status: st,
+    context,
+    decision,
+    consequences,
+    global: isGlobal,
+    attachments,
+    createdBy: actor,
+  });
+  const conversion = await linkAdrConversion({ originalAdrId: orig, convertedAdrId: adr.adrId, createdBy: actor });
+  // Traçabilité lisible (meta) sur l'ADR CONVERTIE uniquement — l'origine intacte.
+  await pool().query(
+    "UPDATE artifacts SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb, updated_at = $3 WHERE artifact_id = $1",
+    [adr.adrId, JSON.stringify({ converted_from_adr_id: orig, conversion_id: conversion.conversionId }), nowIso()],
+  );
+  return {
+    adr: await getAdr(adr.adrId),
+    conversion,
+    original: await getAdr(orig),
+  };
 }
 
 // Signale un conflit code ↔ ADR. Le conflit est TOUJOURS persisté ; si `taskId`

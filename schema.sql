@@ -849,3 +849,41 @@ CREATE TABLE IF NOT EXISTS recette_adr (
   PRIMARY KEY (recette_id, adr_id)
 );
 CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id);
+
+-- ===========================================================================
+-- SESSION DE MIGRATION DES ANCIENS SPRINTS (ADR-001 §6) — DDL ADDITIVE.
+-- Miroir EXACT de la DDL posée dans `migrate()` (db.mjs). Aucune colonne
+-- existante n'est modifiée ; l'ADR d'origine n'est jamais altérée.
+-- ===========================================================================
+
+-- A001 — LIEN HISTORIQUE ADR monolithique d'origine ↔ ADR atomiques converties
+-- (N converties pour 1 origine). Idempotence par couple (origine, convertie).
+CREATE TABLE IF NOT EXISTS adr_conversions (
+  conversion_id     TEXT PRIMARY KEY,
+  original_adr_id   TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  converted_adr_id  TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  created_at        TEXT NOT NULL,
+  created_by        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_adr_conversions_original ON adr_conversions(original_adr_id);
+CREATE INDEX IF NOT EXISTS idx_adr_conversions_converted ON adr_conversions(converted_adr_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_adr_conversions_pair ON adr_conversions(original_adr_id, converted_adr_id);
+
+-- A002 — SESSION DE MIGRATION d'un PROJET (type dédié, reprise), ancrée sur le
+-- SPRINT PAR DÉFAUT (= l'ancien sprint). Une migration par projet (idempotent).
+CREATE TABLE IF NOT EXISTS migrations (
+  migration_id    TEXT PRIMARY KEY,
+  project         TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  sprint_id       TEXT REFERENCES sprints(id) ON DELETE SET NULL,
+  session_id      TEXT,
+  status          TEXT NOT NULL DEFAULT 'open',
+  title           TEXT,
+  organization_id TEXT,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT,
+  finished_at     TEXT,
+  created_by      TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_migrations_project ON migrations(project);
+CREATE INDEX IF NOT EXISTS idx_migrations_status ON migrations(status);
+CREATE INDEX IF NOT EXISTS idx_migrations_sprint ON migrations(sprint_id);
