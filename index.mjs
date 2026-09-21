@@ -130,6 +130,11 @@ import {
   ADR_VIGILANCE_STATUS,
   DOC_ATTACHMENT_SOURCES,
   DOC_TYPES,
+  PIECE_NATURES,
+  addPiece,
+  listPieces,
+  requalifyDocsAsPieces,
+  removePiece,
   ARTIFACT_SOURCES,
   ARTIFACT_KINDS,
   resolveDecisionAndTransition,
@@ -509,6 +514,72 @@ server.registerTool("doc_attachment_list", {
   try {
     const attachments = await listDocAttachments({ docId });
     return text(JSON.stringify({ count: attachments.length, attachments }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// ===========================================================================
+// Famille « PIÈCE CLIENT » (ADR-001, item 4) — matière première des sprints.
+// Une pièce est un artefact `doc_type='piece'`, `content_id = projectId`
+// (traçage par le gestionnaire central d'artefacts). Natures admises :
+// markdown | pdf | docx | lien externe (Drive public). PHOTO et VIDÉO REFUSÉES.
+// ===========================================================================
+
+server.registerTool("piece_add", {
+  description: "Ajoute une PIÈCE CLIENT à un projet (matière première des sprints). Natures admises : markdown | pdf | docx | lien (lien externe type Drive public, mis en PUBLIC par l'utilisateur — l'agent lit le contenu via l'URL). PHOTO et VIDÉO sont REFUSÉES (garde à l'import ET pour les liens externes). Traçage : artefact `doc_type='piece'`, `content_id=projectId`, lien `artifact_projects`. Une pièce reçue APRÈS l'initialisation d'un sprint est marquée ÉMERGENTE (`emergent`, origine `apres_init_sprint`/`apres_cloture`) — non bloquant.",
+  inputSchema: {
+    projectId: z.string().describe("Projet (produit) porteur de la pièce."),
+    nature: z.enum(PIECE_NATURES).optional().describe("Nature : markdown | pdf | docx | lien (déduite de l'extension si absente ; 'lien' si url)."),
+    title: z.string().optional().describe("Titre lisible de la pièce."),
+    path: z.string().optional().describe("Chemin du fichier (markdown/pdf/docx) — import ou référence."),
+    url: z.string().optional().describe("URL PUBLIQUE d'un lien externe (ex. Drive public) — nature 'lien'."),
+    filename: z.string().optional().describe("Nom du fichier d'origine (contrôle d'extension)."),
+    description: z.string().optional(),
+    createdBy: z.string().optional(),
+  },
+}, async ({ projectId, nature, title, path, url, filename, description, createdBy }) => {
+  try {
+    const piece = await addPiece({ projectId, nature, title, path, url, filename, description, createdBy });
+    return text(JSON.stringify({ ok: true, piece }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("piece_list", {
+  description: "Liste les PIÈCES CLIENT d'un projet : pièces nouvelles (`doc_type='piece'`) + documents ADR-12 REQUALIFIÉS (`requalified=true`). Chaque pièce expose nature, url (Drive), emergent (+ origine), sprintId, securityNote. Filtres : nature, emergent, includeRequalified (défaut true).",
+  inputSchema: {
+    projectId: z.string().describe("Projet dont on liste les pièces."),
+    nature: z.enum(PIECE_NATURES).optional().describe("Filtre par nature."),
+    emergent: z.boolean().optional().describe("Filtre les pièces émergentes (reçues après l'init d'un sprint)."),
+    includeRequalified: z.boolean().optional().describe("Inclure les docs ADR-12 requalifiés (défaut true)."),
+  },
+}, async ({ projectId, nature, emergent, includeRequalified }) => {
+  try {
+    const pieces = await listPieces({ projectId, nature, emergent, includeRequalified });
+    return text(JSON.stringify({ count: pieces.length, pieces }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("piece_requalify", {
+  description: "Requalifie SANS PERTE les documents ADR-12 (adr/specs/gherkin/project_doc) en PIÈCES CLIENT du projet : n'écrit QUE le marqueur `meta` (`piece_client`, `piece_nature`, `requalified_at`, `requalified_from_doc_type`) — jamais `doc_type`/`content_id`/`path`/liens. Idempotent, relançable. Sans projectId : tous les docs ADR-12 du registre.",
+  inputSchema: {
+    projectId: z.string().optional().describe("Projet à requalifier (défaut : tous les docs ADR-12)."),
+  },
+}, async ({ projectId }) => {
+  try {
+    const r = await requalifyDocsAsPieces({ projectId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("piece_delete", {
+  description: "Retire une PIÈCE CLIENT (famille `doc_type='piece'` uniquement) par son pieceId. Les liens projet (`artifact_projects`) et sprint (`sprint_pieces`) suivent en CASCADE. Nécessaire à la route panneau DELETE /api/pieces/:id.",
+  inputSchema: {
+    pieceId: z.string().describe("pieceId (= artifact_id de la pièce)."),
+  },
+}, async ({ pieceId }) => {
+  try {
+    const r = await removePiece({ pieceId });
+    if (!r) return err(`pièce inconnue : ${pieceId}`);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

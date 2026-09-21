@@ -4,7 +4,7 @@
 import pg from "pg";
 import Database from "better-sqlite3"; // lecture seule d'opencode.db (chaîne de sessions)
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadGlobalEnv } from "../../scripts/load-env.mjs";
@@ -602,6 +602,25 @@ $$ LANGUAGE plpgsql`);
     PRIMARY KEY (recette_id, adr_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id)");
+}
+
+// Détecte l'état de sprint d'un PROJET (table `sprints`, livrée par
+// T-20260921-091728-nviw) — support de l'ÉMERGENCE des pièces client.
+// Retourne `{ sprintId, status }` : le sprint OUVERT s'il existe, sinon le
+// DERNIER sprint (quel que soit son statut, ex. `close`), sinon `null`.
+// « Sprint initialisé » = existence d'au moins un sprint du projet.
+export async function detectOpenSprint(projectId) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) return null;
+  const pid = String(projectId).trim();
+  const open = (await pool().query(
+    "SELECT id, status FROM sprints WHERE project = $1 AND status = 'open' ORDER BY created_at DESC, id DESC LIMIT 1", [pid],
+  )).rows[0];
+  if (open) return { sprintId: open.id, status: open.status };
+  const last = (await pool().query(
+    "SELECT id, status FROM sprints WHERE project = $1 ORDER BY created_at DESC, id DESC LIMIT 1", [pid],
+  )).rows[0];
+  return last ? { sprintId: last.id, status: last.status } : null;
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -1813,7 +1832,22 @@ export const DOC_ATTACHMENT_SOURCES = ["registry", "import", "ref"];
 // (panneau orchestrator-panel) et la tâche T-20260920-162801-jxtr.
 // Une SEULE table `artifacts` porte tous les artefacts, identifiés par le
 // couple (doc_type, content_id). `kind` est la NATURE, distincte de `doc_type`.
-export const DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file", "plan", "task_synthese", "task_report", "audit_report", "recette_report", "recette_doc", "e2e_report", "e2e_video", "autre"];
+export const DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file", "plan", "task_synthese", "task_report", "audit_report", "recette_report", "recette_doc", "e2e_report", "e2e_video", "piece", "autre"];
+// Famille « pièce client » (ADR-001) : matière première des sprints. Une pièce
+// est un artefact `doc_type='piece'`, `content_id = projectId` (le PROJET est
+// l'entité porteuse), `kind='autre'` ; les métadonnées vivent dans `meta` (JSONB).
+export const PIECE_DOC_TYPES = ["piece"];
+// Natures ADMISES d'une pièce client : markdown | pdf | docx | lien externe
+// (lien Drive public, mis en PUBLIC par l'utilisateur). PHOTO et VIDÉO sont REFUSÉES.
+export const PIECE_NATURES = ["markdown", "pdf", "docx", "lien"];
+// Extension de fichier → nature admise.
+export const PIECE_NATURE_BY_EXT = { ".md": "markdown", ".markdown": "markdown", ".pdf": "pdf", ".docx": "docx" };
+// Extensions PHOTO / VIDÉO explicitement REFUSÉES (import de fichier ET lien externe).
+export const PIECE_REFUSED_EXT = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp", ".tiff", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"];
+// Hôtes vidéo connus REFUSÉS pour les liens externes (une vidéo n'est pas une pièce client).
+export const PIECE_REFUSED_HOSTS = ["youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "twitch.tv", "tiktok.com"];
+// Avertissement de sécurité attaché aux pièces « lien » (URL publique = accès ouvert).
+export const PIECE_LINK_SECURITY_NOTE = "Lien public : toute personne disposant de l'URL accède au contenu (limite de sécurité assumée — ADR-001, mécanisme plus strict prévu ultérieurement). Ne jamais y placer de contenu sensible.";
 // Famille « docs » (ADR-12) : documents du registre + leurs pièces jointes.
 export const DOCS_DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file"];
 // Famille « task » : artefacts rattachés à une tâche (content_id = taskId).
@@ -4433,4 +4467,256 @@ async function orgIdOfProject(project) {
 async function defaultOrganizationId() {
   const r = (await pool().query("SELECT id FROM organizations ORDER BY created_at ASC LIMIT 1")).rows[0];
   return r ? r.id : "onirtech";
+}
+
+// ===========================================================================
+// PIÈCES CLIENT (ADR-001, item 4) — matière première des sprints.
+// Une pièce est un artefact `doc_type='piece'`, `content_id = projectId`.
+// Natures admises : markdown | pdf | docx | lien externe (Drive public).
+// PHOTO et VIDÉO REFUSÉES (garde `assertPieceAllowed`, import ET lien externe).
+// Requalification SANS PERTE des docs ADR-12 (marqueur `meta.piece_client`).
+// ===========================================================================
+
+// Extension (minuscule, sans query/fragment) d'un chemin ou d'une URL.
+function pieceExtOf(p) {
+  if (!p) return "";
+  const clean = String(p).trim().toLowerCase().split("?")[0].split("#")[0];
+  const i = clean.lastIndexOf(".");
+  return i >= 0 ? clean.slice(i) : "";
+}
+
+// Nature déduite du chemin d'un document (repli : markdown — texte).
+export function pieceNatureFromPath(p) {
+  return PIECE_NATURE_BY_EXT[pieceExtOf(p)] || "markdown";
+}
+
+// GARDE AUTORITATIVE des natures de pièce client.
+// Refuse : (1) une PHOTO/VIDÉO importée (extension fichier), (2) un LIEN externe
+// vers une vidéo (hôte connu) ou une photo/vidéo (extension de l'URL).
+// Retourne la nature RÉSOLUE (markdown | pdf | docx | lien).
+export function assertPieceAllowed({ nature, path, url, filename } = {}) {
+  const p = path ? String(path).trim() : null;
+  const u = url ? String(url).trim() : null;
+  const f = filename ? String(filename).trim() : null;
+
+  // (1) Import de fichier : refus photo/vidéo par extension.
+  for (const cand of [f, p]) {
+    const ext = pieceExtOf(cand);
+    if (ext && PIECE_REFUSED_EXT.includes(ext)) {
+      throw new Error(`pièce refusée : les photos et vidéos ne sont pas admises (extension « ${ext} »). Natures admises : ${PIECE_NATURES.join(" | ")}`);
+    }
+  }
+
+  // (2) Lien externe : refus vidéo (hôte connu) / photo-vidéo (extension d'URL).
+  if (u) {
+    let host = "";
+    let pathname = "";
+    try {
+      const parsed = new URL(u);
+      if (!/^https?:$/.test(parsed.protocol)) throw new Error("protocole non http(s)");
+      host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+      pathname = parsed.pathname || "";
+    } catch {
+      throw new Error(`lien invalide : ${u} (une URL http(s) publique est attendue)`);
+    }
+    if (PIECE_REFUSED_HOSTS.some((h) => host === h || host.endsWith("." + h))) {
+      throw new Error(`lien refusé : la vidéo (${host}) n'est pas une pièce client admise. Natures admises : ${PIECE_NATURES.join(" | ")}`);
+    }
+    const ext = pieceExtOf(pathname);
+    if (ext && PIECE_REFUSED_EXT.includes(ext)) {
+      throw new Error(`lien refusé : photo/vidéo non admise (extension « ${ext} »). Natures admises : ${PIECE_NATURES.join(" | ")}`);
+    }
+  }
+
+  // (3) Nature résolue puis validée.
+  let nat = nature ? String(nature).trim() : "";
+  if (u) nat = "lien";
+  else if (!nat) nat = PIECE_NATURE_BY_EXT[pieceExtOf(f || p)] || "";
+  if (!PIECE_NATURES.includes(nat)) {
+    throw new Error(`nature de pièce invalide : ${nature || "(absente)"} (attendu : ${PIECE_NATURES.join(" | ")})`);
+  }
+  if (nat === "lien") {
+    if (!u) throw new Error("nature 'lien' exige une URL publique (url)");
+  } else if (!p && !f) {
+    throw new Error(`nature '${nat}' exige un fichier (path ou filename)`);
+  }
+  return nat;
+}
+
+// Sérialise une ligne `artifacts` → pièce client (nouvelle OU doc requalifié).
+function rowToPiece(r) {
+  if (!r) return null;
+  const meta = parseDocMeta(r.meta);
+  const m = meta && typeof meta === "object" ? meta : {};
+  return {
+    pieceId: r.artifact_id,
+    docType: r.doc_type,
+    contentId: r.content_id,
+    kind: r.kind ?? null,
+    nature: m.piece_nature ?? r.nature ?? null,
+    title: r.title ?? null,
+    path: r.path ?? null,
+    url: m.url ?? null,
+    filename: m.filename ?? null,
+    description: r.description ?? null,
+    source: r.source ?? null,
+    emergent: m.emergent === true || m.emergent === "true",
+    emergentOrigin: m.emergent_origin ?? null,
+    sprintId: m.sprint_id ?? null,
+    securityNote: m.security_note ?? null,
+    requalified: m.piece_client === true || m.piece_client === "true",
+    meta: meta,
+    createdAt: r.created_at,
+    createdBy: r.created_by ?? null,
+  };
+}
+
+// Ajoute une PIÈCE CLIENT à un projet. Garde `assertPieceAllowed` incluse.
+// Traçage : artefact `doc_type='piece'`, `content_id=projectId`, lien
+// `artifact_projects`. ÉMERGENCE (non bloquante) : si le projet possède un
+// sprint, la pièce est marquée `emergent` + `sprint_pieces`.
+export async function addPiece({ projectId, nature, title, path, url, filename, description, createdBy } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis (une pièce client appartient à un projet)");
+  const pid = String(projectId).trim();
+  await assertProjectExists(pid);
+  const resolvedNature = assertPieceAllowed({ nature, path, url, filename });
+  const p = path ? String(path).trim() : null;
+  const u = url ? String(url).trim() : null;
+  const f = filename ? String(filename).trim() : (p ? basename(p) : null);
+  // `path` est NOT NULL dans `artifacts` : un lien stocke son URL comme localisation.
+  const storedPath = p || u;
+
+  // Idempotence : même projet + même localisation (chemin OU url).
+  const existing = (await pool().query(
+    "SELECT * FROM artifacts WHERE doc_type = 'piece' AND content_id = $1 AND path = $2 ORDER BY id LIMIT 1", [pid, storedPath],
+  )).rows[0];
+  if (existing) return getPiece(existing.artifact_id);
+
+  // Émergence (JAMAIS bloquante) : pièce reçue après l'initialisation d'un sprint.
+  const sprint = await detectOpenSprint(pid);
+  const emergentOrigin = sprint ? (sprint.status === "open" ? "apres_init_sprint" : "apres_cloture") : null;
+  const meta = {
+    piece_nature: resolvedNature,
+    url: u,
+    filename: f,
+    emergent: sprint ? true : false,
+    emergent_origin: emergentOrigin,
+    sprint_id: sprint ? sprint.sprintId : null,
+    security_note: resolvedNature === "lien" ? PIECE_LINK_SECURITY_NOTE : null,
+  };
+  const src = u ? "ref" : "import";
+  const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
+  const artifactId = `ART-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const ts = nowIso();
+  await pool().query(
+    `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, path, nature, source, meta, description, organization_id, created_at, created_by)
+     VALUES ($1,'piece',$2,'autre',$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    [
+      artifactId, pid,
+      title ? String(title).trim() : (f || u || "pièce client"),
+      storedPath, resolvedNature, src, meta,
+      description ? String(description).trim() : null,
+      org, ts, createdBy ?? null,
+    ],
+  );
+  await pool().query("INSERT INTO artifact_projects (artifact_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [artifactId, pid]);
+  if (sprint) {
+    await pool().query("INSERT INTO sprint_pieces (sprint_id, piece_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [sprint.sprintId, artifactId]);
+  }
+  return getPiece(artifactId);
+}
+
+// Détail d'une pièce client (forme pièce + cibles projet/repo).
+export async function getPiece(pieceId) {
+  await ensureSchema();
+  const r = (await pool().query("SELECT * FROM artifacts WHERE artifact_id = $1 AND doc_type = 'piece'", [String(pieceId)])).rows[0];
+  if (!r) return null;
+  const [projects, repos] = await Promise.all([getArtifactProjects(r.artifact_id), getArtifactRepos(r.artifact_id)]);
+  return { ...rowToPiece(r), projects, repos };
+}
+
+// Liste unifiée des pièces d'un projet : pièces NOUVELLES (`doc_type='piece'`)
+// + docs ADR-12 REQUALIFIÉS (`meta.piece_client=true`, `requalified=true`).
+// Filtres : nature, emergent ; includeRequalified (défaut true).
+export async function listPieces({ projectId, nature, emergent, includeRequalified = true } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+
+  const params = [pid];
+  const conds = ["a.doc_type = 'piece'", "a.content_id = $1"];
+  if (nature) { params.push(String(nature)); conds.push(`a.meta->>'piece_nature' = $${params.length}`); }
+  if (emergent !== undefined && emergent !== null) {
+    params.push(emergent ? "true" : "false");
+    conds.push(`COALESCE(a.meta->>'emergent', 'false') = $${params.length}`);
+  }
+  const pieceRows = (await pool().query(
+    `SELECT a.* FROM artifacts a WHERE ${conds.join(" AND ")} ORDER BY a.created_at DESC, a.id DESC`, params,
+  )).rows;
+  const [pieceProj, pieceRepo] = await Promise.all([getArtifactProjectsBatch(pieceRows), getArtifactReposBatch(pieceRows)]);
+  const pieces = pieceRows.map((r) => ({ ...rowToPiece(r), projects: pieceProj[r.artifact_id] || [], repos: pieceRepo[r.artifact_id] || [] }));
+
+  let requalified = [];
+  if (includeRequalified !== false && emergent !== true) {
+    const rqParams = [pid, DOCS_DOC_TYPES];
+    const rqConds = ["ap.project_id = $1", "a.doc_type = ANY($2)", "(a.meta->>'piece_client') = 'true'"];
+    if (nature) { rqParams.push(String(nature)); rqConds.push(`a.meta->>'piece_nature' = $${rqParams.length}`); }
+    const rqRows = (await pool().query(
+      `SELECT DISTINCT a.* FROM artifacts a JOIN artifact_projects ap ON ap.artifact_id = a.artifact_id
+        WHERE ${rqConds.join(" AND ")} ORDER BY a.doc_type, a.title NULLS LAST`, rqParams,
+    )).rows;
+    const [rqProj, rqRepo] = await Promise.all([getArtifactProjectsBatch(rqRows), getArtifactReposBatch(rqRows)]);
+    requalified = rqRows.map((r) => ({ ...rowToPiece(r), projects: rqProj[r.artifact_id] || [], repos: rqRepo[r.artifact_id] || [] }));
+  }
+  return [...pieces, ...requalified];
+}
+
+// REQUALIFICATION SANS PERTE des documents ADR-12 en PIÈCES CLIENT du projet.
+// N'écrit QUE `meta` (marqueur `piece_client` + nature + traçage) : jamais
+// `doc_type` / `content_id` / `path` / liens `artifact_projects`|`artifact_repos`.
+// Idempotente (les docs déjà requalifiés sont ignorés). Sans `projectId` :
+// requalifie TOUS les docs ADR-12 du registre.
+export async function requalifyDocsAsPieces({ projectId } = {}) {
+  await ensureSchema();
+  const pid = projectId ? String(projectId).trim() : null;
+  const rows = pid
+    ? (await pool().query(
+        `SELECT DISTINCT a.* FROM artifacts a JOIN artifact_projects ap ON ap.artifact_id = a.artifact_id
+          WHERE ap.project_id = $1 AND a.doc_type = ANY($2) ORDER BY a.id`, [pid, DOCS_DOC_TYPES],
+      )).rows
+    : (await pool().query("SELECT * FROM artifacts WHERE doc_type = ANY($1) ORDER BY id", [DOCS_DOC_TYPES])).rows;
+  const ts = nowIso();
+  const requalified = [];
+  let alreadyCount = 0;
+  for (const r of rows) {
+    const meta = parseDocMeta(r.meta);
+    const m = meta && typeof meta === "object" ? meta : {};
+    if (m.piece_client === true || m.piece_client === "true") { alreadyCount++; continue; }
+    const nature = pieceNatureFromPath(r.path);
+    const marker = {
+      piece_client: true,
+      piece_nature: nature,
+      requalified_at: ts,
+      requalified_from_doc_type: r.doc_type,
+    };
+    await pool().query(
+      `UPDATE artifacts SET meta = COALESCE(meta, '{}'::jsonb) || $2::jsonb, updated_at = $3 WHERE artifact_id = $1`,
+      [r.artifact_id, JSON.stringify(marker), ts],
+    );
+    requalified.push({ docId: r.artifact_id, docType: r.doc_type, nature, path: r.path ?? null });
+  }
+  return { count: requalified.length, total: rows.length, alreadyRequalified: alreadyCount, requalified };
+}
+
+// Retire une pièce client (famille `piece` uniquement). Les liens
+// `artifact_projects` / `sprint_pieces` suivent en CASCADE.
+export async function removePiece({ pieceId } = {}) {
+  await ensureSchema();
+  if (!pieceId) throw new Error("pieceId requis");
+  const id = String(pieceId);
+  const row = (await pool().query("SELECT * FROM artifacts WHERE artifact_id = $1 AND doc_type = 'piece'", [id])).rows[0];
+  if (!row) return null;
+  await pool().query("DELETE FROM artifacts WHERE artifact_id = $1", [id]);
+  return { pieceId: id, deleted: true };
 }
