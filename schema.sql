@@ -27,8 +27,18 @@ CREATE TABLE IF NOT EXISTS tasks (
   recette_id     TEXT,                             -- recette SOURCE si la tâche a été générée par une recette
   title          TEXT,                             -- titre court de la tâche (obligatoire)
   direct_execution INTEGER NOT NULL DEFAULT 0,     -- 1 = exécution directe via build-notify (pas d'atomic-plan)
+  emergent       INTEGER NOT NULL DEFAULT 0,      -- 1 = émergente (hors sprint / après clôture)
+  emergent_origin TEXT,                           -- hors_sprint | apres_cloture
   version        INTEGER NOT NULL DEFAULT 0        -- optimistic lock
 );
+
+-- Émergence d'une TÂCHE (apparue hors sprint / après clôture) : tracée, non
+-- bloquante. Les colonnes sont d'abord ajoutées idempotemment aux bases
+-- EXISTANTES (CREATE TABLE IF NOT EXISTS ne modifie pas une table déjà créée) —
+-- miroir de migrate() dans db.mjs.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS emergent INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS emergent_origin TEXT;
+CREATE INDEX IF NOT EXISTS idx_tasks_emergent ON tasks(project) WHERE emergent = 1;
 
 -- Organisations : tenant de premier niveau (multi-organisation). Toutes les
 -- entités de 1er niveau (projets, repos, tâches, recettes, tests, docs,
@@ -705,8 +715,13 @@ CREATE TABLE IF NOT EXISTS sprints (
   project         TEXT NOT NULL,
   title           TEXT NOT NULL,
   start_date      TEXT,                            -- début (ISO 8601)
-  end_date        TEXT,                            -- fin (ISO 8601)
-  status          TEXT NOT NULL DEFAULT 'open',    -- open | close
+  end_date        TEXT,                            -- fin (ISO 8601) — échéance de clôture AUTO
+  status          TEXT NOT NULL DEFAULT 'open',    -- open | close (reprise : close -> open)
+  is_default      INTEGER NOT NULL DEFAULT 0,      -- 1 = sprint par défaut du projet (« anciens sprints »)
+  auto_close      INTEGER NOT NULL DEFAULT 1,      -- 1 = clôture automatique à end_date
+  closed_at       TEXT,                            -- date de clôture (auto ou manuelle)
+  close_reason    TEXT,                            -- auto_echeance | manuel
+  reopened_at     TEXT,                            -- dernière réouverture
   session_id      TEXT,                            -- session IA dédiée
   organization_id TEXT,
   created_at      TEXT NOT NULL,
@@ -715,6 +730,16 @@ CREATE TABLE IF NOT EXISTS sprints (
 );
 CREATE INDEX IF NOT EXISTS idx_sprints_project ON sprints(project);
 CREATE INDEX IF NOT EXISTS idx_sprints_status ON sprints(status);
+CREATE INDEX IF NOT EXISTS idx_sprints_project_status ON sprints(project, status);
+-- Colonnes du cycle de vie produit sur une base EXISTANTE (CREATE TABLE IF NOT
+-- EXISTS ne modifie pas une table déjà créée) — miroir idempotent de migrate().
+ALTER TABLE sprints ADD COLUMN IF NOT EXISTS is_default INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sprints ADD COLUMN IF NOT EXISTS auto_close INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE sprints ADD COLUMN IF NOT EXISTS closed_at TEXT;
+ALTER TABLE sprints ADD COLUMN IF NOT EXISTS close_reason TEXT;
+ALTER TABLE sprints ADD COLUMN IF NOT EXISTS reopened_at TEXT;
+-- Au plus UN sprint par défaut par projet.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sprints_default ON sprints(project) WHERE is_default = 1;
 
 CREATE TABLE IF NOT EXISTS fonctionnalite_regles (
   fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,

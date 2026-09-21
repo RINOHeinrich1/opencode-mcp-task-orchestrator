@@ -507,6 +507,18 @@ async function migrate() {
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_sprints_project ON sprints(project)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_sprints_status ON sprints(status)");
+  // Sprint — cycle de vie produit : sprint par défaut, clôture auto à l'échéance, reprise.
+  await pool().query("ALTER TABLE sprints ADD COLUMN IF NOT EXISTS is_default INTEGER NOT NULL DEFAULT 0");
+  await pool().query("ALTER TABLE sprints ADD COLUMN IF NOT EXISTS auto_close INTEGER NOT NULL DEFAULT 1");
+  await pool().query("ALTER TABLE sprints ADD COLUMN IF NOT EXISTS closed_at TEXT");
+  await pool().query("ALTER TABLE sprints ADD COLUMN IF NOT EXISTS close_reason TEXT");
+  await pool().query("ALTER TABLE sprints ADD COLUMN IF NOT EXISTS reopened_at TEXT");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_sprints_project_status ON sprints(project, status)");
+  await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_sprints_default ON sprints(project) WHERE is_default = 1");
+  // Tâche — émergence (apparue hors sprint / après clôture) : tracée, non bloquante.
+  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS emergent INTEGER NOT NULL DEFAULT 0");
+  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS emergent_origin TEXT");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_tasks_emergent ON tasks(project) WHERE emergent = 1");
   await pool().query(`CREATE TABLE IF NOT EXISTS fonctionnalite_regles (
     fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
     regle_id          TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
@@ -613,6 +625,9 @@ export async function detectOpenSprint(projectId) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) return null;
   const pid = String(projectId).trim();
+  // La clôture AUTOMATIQUE à l'échéance est appliquée avant toute lecture : dès
+  // le premier accès, un sprint échu est `close` (forme de retour inchangée).
+  await autoCloseExpiredSprints({ projectId: pid });
   const open = (await pool().query(
     "SELECT id, status FROM sprints WHERE project = $1 AND status = 'open' ORDER BY created_at DESC, id DESC LIMIT 1", [pid],
   )).rows[0];
@@ -621,6 +636,391 @@ export async function detectOpenSprint(projectId) {
     "SELECT id, status FROM sprints WHERE project = $1 ORDER BY created_at DESC, id DESC LIMIT 1", [pid],
   )).rows[0];
   return last ? { sprintId: last.id, status: last.status } : null;
+}
+
+// ===========================================================================
+// SPRINT — cycle de vie PRODUIT (ADR-001). Le sprint est un objet de 1er
+// niveau : durée paramétrable, statut open|close, clôture AUTOMATIQUE à
+// l'échéance (DISTINCTE de la clôture d'exécution des tâches), reprise
+// possible, sprint par défaut (« anciens sprints »), émergence traçable.
+// Ces primitives sont réutilisées par la famille MCP `sprint_*` (T4).
+// ===========================================================================
+
+// Sérialise une ligne `sprints` → sprint (camelCase).
+function rowToSprint(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    project: r.project,
+    title: r.title,
+    startDate: r.start_date ?? null,
+    endDate: r.end_date ?? null,
+    status: r.status,
+    isDefault: !!r.is_default,
+    autoClose: !!r.auto_close,
+    closedAt: r.closed_at ?? null,
+    closeReason: r.close_reason ?? null,
+    reopenedAt: r.reopened_at ?? null,
+    sessionId: r.session_id ?? null,
+    organizationId: r.organization_id ?? null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at ?? null,
+    createdBy: r.created_by ?? null,
+  };
+}
+
+// Clôture BAS NIVEAU d'un sprint (idempotente). N'ÉCRIT JAMAIS sur `tasks` ni
+// `executions` : la clôture de sprint est DISTINCTE de la clôture d'exécution
+// des tâches (ADR-001 §1) — clôturer un sprint ne clôt aucune tâche.
+// `reason` : `auto_echeance` (balayage) | `manuel` (T4).
+export async function closeSprint(sprintId, { reason = "manuel", by } = {}) {
+  await ensureSchema();
+  if (!sprintId) throw new Error("sprintId requis");
+  const id = String(sprintId);
+  const row = (await pool().query("SELECT * FROM sprints WHERE id = $1", [id])).rows[0];
+  if (!row) throw new Error(`sprint inconnu : ${id}`);
+  if (row.status === "close") return rowToSprint(row); // idempotent : déjà clôturé
+  const ts = nowIso();
+  const res = await pool().query(
+    `UPDATE sprints
+        SET status = 'close', closed_at = $2, close_reason = $3, updated_at = $2
+      WHERE id = $1 RETURNING *`,
+    [id, ts, reason || "manuel"],
+  );
+  void by;
+  return rowToSprint(res.rows[0]);
+}
+
+// CLÔTURE AUTOMATIQUE à l'échéance : passe à `close` les sprints `open`,
+// `auto_close = 1` et `end_date < now`, en posant `closed_at` +
+// `close_reason='auto_echeance'`. Idempotent. N'ÉCRIT JAMAIS sur `tasks` /
+// `executions` (distinction exigée). `projectId` optionnel (balayage global).
+export async function autoCloseExpiredSprints({ projectId } = {}) {
+  await ensureSchema();
+  const params = [nowIso()];
+  let where = "status = 'open' AND auto_close = 1 AND end_date IS NOT NULL AND end_date < $1";
+  if (projectId && String(projectId).trim()) {
+    params.push(String(projectId).trim());
+    where += ` AND project = $${params.length}`;
+  }
+  const rows = (await pool().query(
+    `SELECT id FROM sprints WHERE ${where} ORDER BY end_date ASC, id ASC`, params,
+  )).rows;
+  const closed = [];
+  for (const r of rows) {
+    await closeSprint(r.id, { reason: "auto_echeance" });
+    closed.push(r.id);
+  }
+  return { closed };
+}
+
+// Détail d'un sprint.
+export async function getSprint(sprintId) {
+  await ensureSchema();
+  if (!sprintId) return null;
+  const r = (await pool().query("SELECT * FROM sprints WHERE id = $1", [String(sprintId)])).rows[0];
+  return rowToSprint(r);
+}
+
+// Liste des sprints d'un projet (du plus récent au plus ancien). Filtre `status`.
+export async function listProjectSprints(projectId, { status } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  const params = [pid];
+  let where = "project = $1";
+  if (status) {
+    params.push(String(status));
+    where += ` AND status = $${params.length}`;
+  }
+  const rows = (await pool().query(
+    `SELECT * FROM sprints WHERE ${where} ORDER BY created_at DESC, id DESC`, params,
+  )).rows;
+  return rows.map(rowToSprint);
+}
+
+// GARDE UNIQUE d'ÉMERGENCE (ADR-001 §5). JAMAIS bloquante, JAMAIS rétroactive :
+// elle ne fait que CLASSER un élément en cours de création.
+//   kind='piece'   : un sprint existe → émergent (apres_init_sprint si open,
+//                    apres_cloture si close) ; aucun sprint → non émergent.
+//   kind='element' : (fonctionnalité / règle / tâche) aucun sprint → émergent
+//                    `hors_sprint` ; dernier sprint close → `apres_cloture` ;
+//                    sprint open → non émergent (appartient au sprint courant).
+// Balaye d'abord la clôture auto (l'état lu est à jour).
+export async function classifyEmergence(projectId, { kind = "element" } = {}) {
+  await ensureSchema();
+  const pid = projectId ? String(projectId).trim() : "";
+  if (!pid) return { sprintId: null, sprintStatus: null, emergent: false, emergentOrigin: null };
+  await autoCloseExpiredSprints({ projectId: pid });
+  const sprint = await detectOpenSprint(pid);
+  const isPiece = kind === "piece";
+  if (!sprint) {
+    return isPiece
+      ? { sprintId: null, sprintStatus: null, emergent: false, emergentOrigin: null }
+      : { sprintId: null, sprintStatus: null, emergent: true, emergentOrigin: "hors_sprint" };
+  }
+  if (sprint.status === "open") {
+    return {
+      sprintId: sprint.sprintId,
+      sprintStatus: "open",
+      emergent: isPiece,
+      emergentOrigin: isPiece ? "apres_init_sprint" : null,
+    };
+  }
+  return { sprintId: sprint.sprintId, sprintStatus: "close", emergent: true, emergentOrigin: "apres_cloture" };
+}
+
+// SPRINT PAR DÉFAUT du projet (« anciens sprints »). Idempotent : si un sprint
+// `is_default = 1` existe, il est retourné. Sinon INSERT `SPRINT-<ts>-<rand>`
+// (statut `close` + `close_reason='auto_echeance'` si `endDate` est passée,
+// sinon `open`). Un seul sprint par défaut par projet (index partiel unique).
+export async function ensureDefaultSprint(projectId, { title, startDate, endDate, createdBy } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  await assertProjectExists(pid);
+  const existing = (await pool().query(
+    "SELECT * FROM sprints WHERE project = $1 AND is_default = 1 ORDER BY created_at DESC LIMIT 1", [pid],
+  )).rows[0];
+  if (existing) return rowToSprint(existing);
+
+  const end = endDate ? String(endDate) : null;
+  const ts = nowIso();
+  const expired = end ? end < ts : false;
+  const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
+  const id = `SPRINT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const inserted = (await pool().query(
+    `INSERT INTO sprints
+       (id, project, title, start_date, end_date, status, is_default, auto_close,
+        closed_at, close_reason, organization_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,1,1,$7,$8,$9,$10,$11)
+     ON CONFLICT (project) WHERE is_default = 1 DO NOTHING
+     RETURNING id`,
+    [
+      id, pid,
+      title ? String(title).trim() : `Sprint par défaut — ${pid}`,
+      startDate ? String(startDate) : null,
+      end,
+      expired ? "close" : "open",
+      expired ? ts : null,
+      expired ? "auto_echeance" : null,
+      org, ts, createdBy ?? null,
+    ],
+  )).rows[0];
+  if (!inserted) {
+    // Course concurrente : un autre sprint par défaut vient d'être créé.
+    const again = (await pool().query(
+      "SELECT * FROM sprints WHERE project = $1 AND is_default = 1 LIMIT 1", [pid],
+    )).rows[0];
+    return rowToSprint(again);
+  }
+  return getSprint(inserted.id);
+}
+
+// MIGRATION des éléments EXISTANTS vers le sprint par défaut du projet :
+// rattache `recette_sprints` / `task_sprints` pour les recettes/tâches SANS lien
+// sprint. AUCUN marquage émergent (émergence NON rétroactive — ADR-001 §2).
+export async function migrateExistingToDefaultSprint({ projectId, title, startDate, endDate, createdBy } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  const sprint = await ensureDefaultSprint(pid, { title, startDate, endDate, createdBy });
+  const rec = await pool().query(
+    `INSERT INTO recette_sprints (recette_id, sprint_id)
+     SELECT r.recette_id, $2 FROM recettes r
+      WHERE r.project = $1
+        AND NOT EXISTS (SELECT 1 FROM recette_sprints rs WHERE rs.recette_id = r.recette_id)
+     ON CONFLICT DO NOTHING`,
+    [pid, sprint.id],
+  );
+  const tsk = await pool().query(
+    `INSERT INTO task_sprints (task_id, sprint_id)
+     SELECT t.id, $2 FROM tasks t
+      WHERE t.project = $1
+        AND NOT EXISTS (SELECT 1 FROM task_sprints ts WHERE ts.task_id = t.id)
+     ON CONFLICT DO NOTHING`,
+    [pid, sprint.id],
+  );
+  return { sprintId: sprint.id, recettes: rec.rowCount, tasks: tsk.rowCount, sprint };
+}
+
+// REPRISE / RÉOUVERTURE d'un sprint clôturé (le cycle n'est PAS définitif,
+// contrairement à la clôture d'une tâche) : repasse `status='open'`, efface
+// `closed_at`/`close_reason`, pose `reopened_at`.
+// Règle anti re-clôture immédiate : si l'échéance résultante est PASSÉE et que
+// `autoClose` n'est pas explicitement fourni → `auto_close = 0` (sinon le
+// balayage re-clôturerait aussitôt). Une prolongation vers une date FUTURE
+// rétablit `auto_close = 1`.
+export async function reopenSprint(sprintId, { endDate, autoClose, by } = {}) {
+  await ensureSchema();
+  if (!sprintId) throw new Error("sprintId requis");
+  const id = String(sprintId);
+  const row = (await pool().query("SELECT * FROM sprints WHERE id = $1", [id])).rows[0];
+  if (!row) throw new Error(`sprint inconnu : ${id}`);
+  const ts = nowIso();
+  const newEnd = endDate !== undefined && endDate !== null ? String(endDate) : (row.end_date ?? null);
+  const expired = newEnd ? newEnd < ts : false;
+  let newAutoClose;
+  if (autoClose !== undefined && autoClose !== null) {
+    newAutoClose = autoClose ? 1 : 0;
+  } else if (expired) {
+    newAutoClose = 0; // reprise sans prolongation (ou prolongation déjà échue)
+  } else if (endDate !== undefined && endDate !== null && String(endDate) !== (row.end_date ?? null)) {
+    newAutoClose = 1; // prolongation vers une échéance future
+  } else {
+    newAutoClose = row.auto_close ? 1 : 0;
+  }
+  const res = await pool().query(
+    `UPDATE sprints
+        SET status = 'open', closed_at = NULL, close_reason = NULL, reopened_at = $2,
+            end_date = $3, auto_close = $4, updated_at = $2
+      WHERE id = $1 RETURNING *`,
+    [id, ts, newEnd, newAutoClose],
+  );
+  void by;
+  return rowToSprint(res.rows[0]);
+}
+
+// RAPPORT DE SPRINT (agrégation REGISTRE, ADR-001 §4) : fonctionnalités
+// implémentées (≥1 tâche liée dont la DERNIÈRE exécution est `done`) et
+// émergentes, tâches effectuées / émergentes, règles émergentes, pièces
+// (+ émergentes), recettes. Retourne `{ sprint, stats, sections, markdown }`.
+export async function buildSprintReport(sprintId, { format = "markdown" } = {}) {
+  await ensureSchema();
+  if (!sprintId) throw new Error("sprintId requis");
+  const sprint = await getSprint(sprintId);
+  if (!sprint) throw new Error(`sprint inconnu : ${sprintId}`);
+  const sid = sprint.id;
+
+  // Fonctionnalités du sprint : `done_tasks` = nb de tâches liées dont la
+  // dernière exécution est `done` (définition explicite « implémentée »).
+  const feats = (await pool().query(
+    `SELECT f.*,
+            (SELECT COUNT(DISTINCT tf.task_id) FROM task_fonctionnalites tf
+              WHERE tf.fonctionnalite_id = f.id
+                AND EXISTS (SELECT 1 FROM executions e
+                             WHERE e.task_id = tf.task_id AND e.status = 'done'
+                               AND e.attempt = (SELECT MAX(x.attempt) FROM executions x WHERE x.task_id = tf.task_id))
+            ) AS done_tasks,
+            (SELECT COUNT(*) FROM task_fonctionnalites tf2 WHERE tf2.fonctionnalite_id = f.id) AS total_tasks
+       FROM fonctionnalites f
+       JOIN sprint_fonctionnalites sf ON sf.fonctionnalite_id = f.id
+      WHERE sf.sprint_id = $1
+      ORDER BY f.ref ASC`, [sid],
+  )).rows.map((r) => ({
+    id: r.id,
+    ref: r.ref,
+    role: r.role ?? null,
+    userStory: r.user_story,
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+    doneTasks: Number(r.done_tasks) || 0,
+    totalTasks: Number(r.total_tasks) || 0,
+    implemented: (Number(r.done_tasks) || 0) >= 1,
+  }));
+
+  const tasks = (await pool().query(
+    `SELECT t.id, t.title, t.request, t.emergent, t.emergent_origin, t.created_at,
+            (SELECT e.status FROM executions e WHERE e.task_id = t.id ORDER BY e.attempt DESC LIMIT 1) AS status
+       FROM tasks t JOIN task_sprints ts ON ts.task_id = t.id
+      WHERE ts.sprint_id = $1
+      ORDER BY t.created_at ASC, t.id ASC`, [sid],
+  )).rows.map((r) => ({
+    id: r.id,
+    title: r.title ?? null,
+    request: r.request,
+    status: r.status ?? "queued",
+    done: (r.status ?? "") === "done",
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+    createdAt: r.created_at,
+  }));
+
+  const regles = (await pool().query(
+    `SELECT r.* FROM regles_metier r
+       JOIN sprint_regles sr ON sr.regle_id = r.id
+      WHERE sr.sprint_id = $1
+      ORDER BY r.ref ASC`, [sid],
+  )).rows.map((r) => ({
+    id: r.id,
+    ref: r.ref,
+    content: r.content,
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+  }));
+
+  const pieces = (await pool().query(
+    `SELECT a.* FROM artifacts a
+       JOIN sprint_pieces sp ON sp.piece_id = a.artifact_id
+      WHERE sp.sprint_id = $1
+      ORDER BY a.created_at ASC, a.id ASC`, [sid],
+  )).rows.map((r) => {
+    const p = rowToPiece(r);
+    return { pieceId: p.pieceId, nature: p.nature, title: p.title, url: p.url, emergent: p.emergent, emergentOrigin: p.emergentOrigin };
+  });
+
+  const recettes = (await pool().query(
+    `SELECT r.recette_id, r.title, r.status FROM recettes r
+       JOIN recette_sprints rs ON rs.recette_id = r.recette_id
+      WHERE rs.sprint_id = $1
+      ORDER BY r.created_at ASC`, [sid],
+  )).rows.map((r) => ({ recetteId: r.recette_id, title: r.title ?? null, status: r.status ?? null }));
+
+  const sections = {
+    fonctionnalitesImplementees: feats.filter((f) => f.implemented),
+    fonctionnalitesEmergentes: feats.filter((f) => f.emergent),
+    tachesEffectuees: tasks.filter((t) => t.done),
+    tachesEmergentes: tasks.filter((t) => t.emergent),
+    regles: regles,
+    reglesEmergentes: regles.filter((r) => r.emergent),
+    pieces: pieces,
+    piecesEmergentes: pieces.filter((p) => p.emergent),
+    recettes: recettes,
+  };
+
+  const stats = {
+    fonctionnalites: { total: feats.length, implementees: sections.fonctionnalitesImplementees.length, emergentes: sections.fonctionnalitesEmergentes.length },
+    taches: { total: tasks.length, effectuees: sections.tachesEffectuees.length, emergentes: sections.tachesEmergentes.length },
+    regles: { total: regles.length, emergentes: sections.reglesEmergentes.length },
+    pieces: { total: pieces.length, emergentes: sections.piecesEmergentes.length },
+    recettes: { total: recettes.length },
+  };
+
+  const md = [];
+  md.push(`# Rapport de sprint — ${sprint.title}`);
+  md.push("");
+  md.push(`- **Sprint** : \`${sprint.id}\`${sprint.isDefault ? " (sprint par défaut)" : ""}`);
+  md.push(`- **Projet** : \`${sprint.project}\``);
+  md.push(`- **Période** : ${sprint.startDate || "?"} → ${sprint.endDate || "?"}`);
+  md.push(`- **Statut** : \`${sprint.status}\`${sprint.closedAt ? ` (clôturé le ${sprint.closedAt}${sprint.closeReason ? ` — ${sprint.closeReason}` : ""})` : ""}`);
+  md.push(`- **Rapport généré** : ${nowIso()}`);
+  md.push("");
+  md.push("## Synthèse");
+  md.push("");
+  md.push("| Élément | Total | Détail |");
+  md.push("|---|---|---|");
+  md.push(`| Fonctionnalités | ${stats.fonctionnalites.total} | ${stats.fonctionnalites.implementees} implémentée(s), ${stats.fonctionnalites.emergentes} émergente(s) |`);
+  md.push(`| Tâches | ${stats.taches.total} | ${stats.taches.effectuees} effectuée(s), ${stats.taches.emergentes} émergente(s) |`);
+  md.push(`| Règles métier | ${stats.regles.total} | ${stats.regles.emergentes} émergente(s) |`);
+  md.push(`| Pièces client | ${stats.pieces.total} | ${stats.pieces.emergentes} émergente(s) |`);
+  md.push(`| Recettes | ${stats.recettes.total} | — |`);
+  md.push("");
+  const list = (title, arr, fmt) => {
+    md.push(`## ${title} (${arr.length})`);
+    md.push("");
+    if (!arr.length) { md.push("_Aucun élément._"); md.push(""); return; }
+    for (const it of arr) md.push(`- ${fmt(it)}`);
+    md.push("");
+  };
+  list("Fonctionnalités implémentées", sections.fonctionnalitesImplementees, (f) => `**${f.ref}** — ${f.userStory} (${f.doneTasks}/${f.totalTasks} tâche(s) done)`);
+  list("Fonctionnalités émergentes", sections.fonctionnalitesEmergentes, (f) => `**${f.ref}** — ${f.userStory} _(origine : ${f.emergentOrigin || "?"})_`);
+  list("Tâches effectuées", sections.tachesEffectuees, (t) => `\`${t.id}\` — ${t.title || t.request}`);
+  list("Tâches émergentes", sections.tachesEmergentes, (t) => `\`${t.id}\` — ${t.title || t.request} _(origine : ${t.emergentOrigin || "?"}, statut : ${t.status})_`);
+  list("Règles métier", sections.regles, (r) => `**${r.ref}** — ${r.content}${r.emergent ? ` _(émergente : ${r.emergentOrigin || "?"})_` : ""}`);
+  list("Pièces client", sections.pieces, (p) => `[${p.nature || "?"}] ${p.title || p.pieceId}${p.url ? ` — ${p.url}` : ""}${p.emergent ? ` _(émergente : ${p.emergentOrigin || "?"})_` : ""}`);
+  list("Recettes", sections.recettes, (r) => `\`${r.recetteId}\` — ${r.title || ""} (${r.status || "?"})`);
+
+  return { sprint, stats, sections, markdown: md.join("\n") };
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -687,6 +1087,17 @@ export async function createTask(task) {
      VALUES ($1,$2,1,0,'queued',$3,$3)`,
     [task.executionId, task.id, nowIso()],
   );
+  // ÉMERGENCE de la TÂCHE (ADR-001 §5) via la garde partagée : créée hors sprint
+  // (`hors_sprint`) ou après clôture (`apres_cloture`) → marquée émergente,
+  // TRACÉE et NON BLOQUANTE. Jamais rétroactif (les tâches existantes ne sont
+  // pas re-marquées — migration T9).
+  const emergence = await classifyEmergence(task.project, { kind: "element" });
+  if (emergence.emergent) {
+    await pool().query(
+      "UPDATE tasks SET emergent = 1, emergent_origin = $2 WHERE id = $1",
+      [task.id, emergence.emergentOrigin],
+    );
+  }
   // Tâches liées éventuelles (nature de liaison).
   for (const l of task.linkedTasks || []) {
     if (l && l.taskId) {
@@ -813,6 +1224,8 @@ function rowToTask(row) {
     recetteId: row.recette_id ?? null,
     title: row.title ?? null,
     directExecution: !!row.direct_execution,
+    emergent: !!row.emergent,
+    emergentOrigin: row.emergent_origin ?? null,
     organizationId: row.organization_id ?? null,
     version: row.version,
   };
@@ -4593,16 +5006,18 @@ export async function addPiece({ projectId, nature, title, path, url, filename, 
   )).rows[0];
   if (existing) return getPiece(existing.artifact_id);
 
-  // Émergence (JAMAIS bloquante) : pièce reçue après l'initialisation d'un sprint.
-  const sprint = await detectOpenSprint(pid);
-  const emergentOrigin = sprint ? (sprint.status === "open" ? "apres_init_sprint" : "apres_cloture") : null;
+  // Émergence (JAMAIS bloquante) via la GARDE PARTAGÉE `classifyEmergence` :
+  // pièce reçue après l'initialisation d'un sprint → `emergent`, origine
+  // `apres_init_sprint` (sprint open) ou `apres_cloture` (sprint close).
+  // Comportement T2 conservé (mêmes origines, même lien `sprint_pieces`).
+  const em = await classifyEmergence(pid, { kind: "piece" });
   const meta = {
     piece_nature: resolvedNature,
     url: u,
     filename: f,
-    emergent: sprint ? true : false,
-    emergent_origin: emergentOrigin,
-    sprint_id: sprint ? sprint.sprintId : null,
+    emergent: em.emergent,
+    emergent_origin: em.emergentOrigin,
+    sprint_id: em.sprintId,
     security_note: resolvedNature === "lien" ? PIECE_LINK_SECURITY_NOTE : null,
   };
   const src = u ? "ref" : "import";
@@ -4621,8 +5036,8 @@ export async function addPiece({ projectId, nature, title, path, url, filename, 
     ],
   );
   await pool().query("INSERT INTO artifact_projects (artifact_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [artifactId, pid]);
-  if (sprint) {
-    await pool().query("INSERT INTO sprint_pieces (sprint_id, piece_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [sprint.sprintId, artifactId]);
+  if (em.sprintId) {
+    await pool().query("INSERT INTO sprint_pieces (sprint_id, piece_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [em.sprintId, artifactId]);
   }
   return getPiece(artifactId);
 }

@@ -135,6 +135,7 @@ import {
   listPieces,
   requalifyDocsAsPieces,
   removePiece,
+  buildSprintReport,
   ARTIFACT_SOURCES,
   ARTIFACT_KINDS,
   resolveDecisionAndTransition,
@@ -580,6 +581,26 @@ server.registerTool("piece_delete", {
     const r = await removePiece({ pieceId });
     if (!r) return err(`pièce inconnue : ${pieceId}`);
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// ===========================================================================
+// Famille « SPRINT » — rapport (ADR-001, item 4). Le CRUD `sprint_*` complet
+// appartient à T4 ; ici SEUL le rapport de sprint (lecture seule) est exposé
+// pour le téléchargement depuis le panneau.
+// ===========================================================================
+
+server.registerTool("sprint_report", {
+  description: "RAPPORT DE SPRINT (lecture seule, téléchargeable) — agrégation du registre : fonctionnalités implémentées (≥1 tâche liée dont la dernière exécution est `done`) et émergentes, tâches effectuées et émergentes, règles métier (émergentes), pièces client (émergentes), recettes. `format='markdown'` (défaut) renvoie le rapport rédigé ; `format='json'` renvoie `{ sprint, stats, sections, markdown }`.",
+  inputSchema: {
+    sprintId: z.string().describe("Identifiant du sprint (SPRINT-<ts>-<rand>)."),
+    format: z.enum(["markdown", "json"]).optional().describe("Format de sortie : markdown (défaut) | json."),
+  },
+}, async ({ sprintId, format }) => {
+  try {
+    const report = await buildSprintReport(sprintId, { format: format || "markdown" });
+    if ((format || "markdown") === "json") return text(JSON.stringify(report, null, 2));
+    return text(report.markdown);
   } catch (e) { return err(e.message); }
 });
 
