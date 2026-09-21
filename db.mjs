@@ -2039,7 +2039,11 @@ async function featureLinkCounts(ids) {
 }
 
 // Compteurs de LIENS des règles métier — UNE requête bulk (pas de N+1 SQL).
-// Retourne `{ [id]: { features, sprints } }` (zéros inclus).
+// Retourne `{ [id]: { features, sprints, roles } }` (zéros / tableau vide inclus).
+// `roles` = rôles DISTINCTS des fonctionnalités liées (`fonctionnalite_regles` ⨝
+// `fonctionnalites.role`, rôles NULL/vides exclus). Calculé par une 3ᵉ sous-requête
+// scalaire DANS LA MÊME requête `unnest` que les compteurs ⇒ 1 aller-retour, 0 N+1.
+// Le rôle d'une règle = union des rôles de ses fonctionnalités ; `[]` = « Sans rôle ».
 async function ruleLinkCounts(ids) {
   const out = {};
   const list = (ids || []).map((x) => String(x)).filter(Boolean);
@@ -2047,12 +2051,21 @@ async function ruleLinkCounts(ids) {
   const rows = (await pool().query(
     `SELECT i.id AS id,
             (SELECT count(*) FROM fonctionnalite_regles x WHERE x.regle_id = i.id) AS features,
-            (SELECT count(*) FROM sprint_regles         x WHERE x.regle_id = i.id) AS sprints
+            (SELECT count(*) FROM sprint_regles         x WHERE x.regle_id = i.id) AS sprints,
+            (SELECT array_agg(DISTINCT f.role)
+               FROM fonctionnalite_regles x
+               JOIN fonctionnalites f ON f.id = x.fonctionnalite_id
+              WHERE x.regle_id = i.id AND f.role IS NOT NULL AND f.role <> '') AS roles
        FROM unnest($1::text[]) AS i(id)`,
     [list],
   )).rows;
   for (const r of rows) {
-    out[r.id] = { features: Number(r.features) || 0, sprints: Number(r.sprints) || 0 };
+    out[r.id] = {
+      features: Number(r.features) || 0,
+      sprints: Number(r.sprints) || 0,
+      // Dédup + tri déterministes (sortie stable pour les options de select).
+      roles: Array.from(new Set((r.roles || []).filter(Boolean))).sort(),
+    };
   }
   return out;
 }
@@ -2246,13 +2259,20 @@ export async function listRules({ projectId, emergent, search, limit } = {}) {
     `SELECT * FROM regles_metier WHERE ${where} ORDER BY ref ASC, created_at ASC LIMIT $${params.length}`, params,
   )).rows;
   const rules = rows.map(rowToRegle);
-  // Compteurs de liens portés par la liste (⇒ 0 appel réseau côté panneau) :
-  // UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel.
+  // Compteurs de liens + rôles dérivés portés par la liste (⇒ 0 appel réseau côté
+  // panneau) : UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel.
   const counts = await ruleLinkCounts(rules.map((r) => r.id));
-  return rules.map((r) => ({
-    ...r,
-    links: counts[r.id] || { features: 0, sprints: 0 },
-  }));
+  return rules.map((r) => {
+    const c = counts[r.id] || { features: 0, sprints: 0, roles: [] };
+    return {
+      ...r,
+      // `links` STRICTEMENT inchangé (`{ features, sprints }`) : ré-extraction
+      // explicite pour éviter toute fuite de `roles` dans ce contrat existant.
+      links: { features: c.features, sprints: c.sprints },
+      // Champ ADDITIF : rôles distincts des fonctionnalités liées ([] = « Sans rôle »).
+      roles: c.roles || [],
+    };
+  });
 }
 
 // --- Liaisons N:N (T1) ------------------------------------------------------

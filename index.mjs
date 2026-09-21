@@ -1051,7 +1051,7 @@ server.registerTool("rule_get", {
 });
 
 server.registerTool("rule_list", {
-  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote` ET le champ additif `links` (compteurs de liens `{features,sprints}`, calculés en UNE requête bulk — plus de N+1 côté panneau). Retourne `{ count, rules }`.",
+  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`, le champ additif `links` (compteurs de liens `{features,sprints}`, calculés en UNE requête bulk — plus de N+1 côté panneau) ET le champ additif `roles` (tableau des rôles DISTINCTS des fonctionnalités liées via `fonctionnalite_regles` ; `[]` = aucune fonctionnalité liée ou rôles vides ⇒ « Sans rôle »). `links` et `roles` proviennent de la MÊME requête bulk (0 N+1). Retourne `{ count, rules }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les règles."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
