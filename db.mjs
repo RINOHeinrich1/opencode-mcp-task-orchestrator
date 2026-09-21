@@ -164,13 +164,10 @@ async function migrate() {
     );
     await pool().query("DROP TABLE IF EXISTS e2e_secrets");
   }
-  await pool().query(`CREATE TABLE IF NOT EXISTS recette_documents (
-    id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
-    title TEXT, nature TEXT, source TEXT NOT NULL DEFAULT 'import',
-    path TEXT, artifact_id TEXT, created_at TEXT NOT NULL
-  )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_documents_recette ON recette_documents(recette_id)");
+  // LEGACY (T-20260920-162801-jxtr) : `recette_documents` est fusionnée dans
+  // `artifacts` (doc_type ∈ {recette_doc, recette_report}, content_id = recetteId).
+  // Une base NEUVE ne la crée plus ; les bases existantes sont migrées puis
+  // neutralisées (renommée `legacy_recette_documents`) — JAMAIS supprimée.
   // =========================================================================
   // ADR 09 — Projets ⇄ Repos (N:N). `projects` = PRODUITS (métier). `repos` =
   // dépôts de code physiques (workspace, git_path, branches, e2e). Un repo peut
@@ -205,80 +202,81 @@ async function migrate() {
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_project_repos_repo ON project_repos(repo_id)");
   // =========================================================================
-  // ADR-12 — Documents de référence (contexte architecture & comportement).
-  // Registre générique N:N : un DOCUMENT (kind = adr-tech | specs-fonctionnelles
-  // | scenarios-gherkin, chemin + titre) est rattaché à des projets ET/OU des
-  // repos (N:N). Il n'y a PAS de contenu en base : le `path` pointe le fichier
-  // (workspace Coder / checkout) que les agents LISENT en contexte (test-agent à
-  // la création d'un test, agent-recette en début de recette).
+  // ARTEFACTS — table polymorphe UNIQUE (T-20260920-162801-jxtr).
+  // Expansion ADDITIVE d'une base existante : `artifacts` (ancien silo tâche)
+  // reçoit les colonnes du modèle cible ; `artifact_projects`/`artifact_repos`
+  // remplacent doc_projects/doc_repos. Aucune perte ; idempotent.
   // =========================================================================
-  await pool().query(`CREATE TABLE IF NOT EXISTS docs (
-    id          TEXT PRIMARY KEY,          -- doc-<ts>-<rand>
-    kind        TEXT NOT NULL,             -- adr-tech | specs-fonctionnelles | scenarios-gherkin
-    title       TEXT,
-    path        TEXT NOT NULL,             -- chemin du fichier (lu par l'agent)
-    description TEXT,
-    status      TEXT,                      -- ADR : Proposé | Accepté | Déprécié | Remplacé
-    context     TEXT,                      -- ADR : contexte
-    decision    TEXT,                      -- ADR : décision
-    consequences TEXT,                     -- ADR : conséquences
-    replaced_by TEXT,                      -- ADR : docId de l'ADR qui remplace celle-ci (statut Remplacé)
-    is_global   INTEGER NOT NULL DEFAULT 0,-- ADR globale : rattachée à tous les repos du projet
-    meta        TEXT,                      -- JSON sérialisé (préservable pour la fusion artifacts)
-    updated_at  TEXT,                      -- dernière mise à jour
-    created_at  TEXT NOT NULL,
-    created_by  TEXT
+  await pool().query(`CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER GENERATED ALWAYS AS IDENTITY,
+    artifact_id TEXT PRIMARY KEY,
+    doc_type TEXT NOT NULL DEFAULT 'autre',
+    content_id TEXT,
+    kind TEXT NOT NULL DEFAULT 'autre',
+    title TEXT, path TEXT, nature TEXT,
+    source TEXT NOT NULL DEFAULT 'import',
+    meta JSONB, description TEXT, status TEXT, context TEXT,
+    decision TEXT, consequences TEXT, replaced_by TEXT,
+    is_global INTEGER NOT NULL DEFAULT 0,
+    organization_id TEXT, created_at TEXT NOT NULL, updated_at TEXT, created_by TEXT
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_docs_kind ON docs(kind)");
-  // ADR structurées (item 120) : bases PostgreSQL EXISTANTES (branche
-  // feature/migration-postgresql) → migrer sans perte. `ALTER ... IF NOT EXISTS`
-  // idempotent : les docs legacy restent lisibles, champs ADR `null` (rétrocompat).
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS status TEXT");
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS context TEXT");
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS decision TEXT");
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS consequences TEXT");
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS replaced_by TEXT");
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS is_global INTEGER NOT NULL DEFAULT 0");
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS meta TEXT");
-  await pool().query("ALTER TABLE docs ADD COLUMN IF NOT EXISTS updated_at TEXT");
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_docs_status ON docs(status)");
-  await pool().query(`CREATE TABLE IF NOT EXISTS doc_projects (
-    doc_id     TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    PRIMARY KEY (doc_id, project_id)
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS doc_type TEXT NOT NULL DEFAULT 'autre'");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS content_id TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS nature TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'import'");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS meta JSONB");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS description TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS status TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS context TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS decision TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS consequences TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS replaced_by TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS is_global INTEGER NOT NULL DEFAULT 0");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS organization_id TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS updated_at TEXT");
+  await pool().query("ALTER TABLE artifacts ADD COLUMN IF NOT EXISTS created_by TEXT");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_artifacts_doc_type ON artifacts(doc_type)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_artifacts_content ON artifacts(content_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind)");
+  // NB : `content_id` est ajoutée NULLABLE sur une base EXISTANTE (des lignes
+  // préexistent) ; le backfill ci-dessous la remplit depuis `task_id`.
+  await pool().query(`CREATE TABLE IF NOT EXISTS artifact_projects (
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    PRIMARY KEY (artifact_id, project_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_projects_project ON doc_projects(project_id)");
-  await pool().query(`CREATE TABLE IF NOT EXISTS doc_repos (
-    doc_id  TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
-    repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-    PRIMARY KEY (doc_id, repo_id)
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_artifact_projects_project ON artifact_projects(project_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS artifact_repos (
+    artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+    repo_id     TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+    PRIMARY KEY (artifact_id, repo_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_repos_repo ON doc_repos(repo_id)");
-  // Pièces jointes d'ADR (item 122) : DDL identique à schema.sql (source
-  // logique) pour créer la table sur une base PostgreSQL déjà migrée, de façon
-  // idempotente (mapping 1:1 vers `artifacts` de T8).
-  await pool().query(`CREATE TABLE IF NOT EXISTS doc_attachments (
-    attachment_id TEXT PRIMARY KEY,
-    doc_id        TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
-    doc_type      TEXT NOT NULL DEFAULT 'adr_file',
-    content_id    TEXT,
-    kind          TEXT,
-    nature        TEXT,
-    title         TEXT,
-    path          TEXT,
-    target_doc_id TEXT REFERENCES docs(id) ON DELETE CASCADE,
-    source        TEXT NOT NULL DEFAULT 'registry',
-    meta          TEXT,
-    created_at    TEXT NOT NULL,
-    created_by    TEXT
-  )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_attachments_doc ON doc_attachments(doc_id)");
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_doc_attachments_target ON doc_attachments(target_doc_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_artifact_repos_repo ON artifact_repos(repo_id)");
+  // Backfill idempotent du silo TÂCHE (ne s'exécute que si `task_id` existe).
+  const hasArtifactsTaskId = (await pool().query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name = 'artifacts' AND column_name = 'task_id'",
+  )).rows.length > 0;
+  if (hasArtifactsTaskId) {
+    // Levée de contrainte (PAS un DROP de colonne) : les familles non-task
+    // (recette/docs/attachments) n'ont pas de `task_id`.
+    await pool().query("ALTER TABLE artifacts ALTER COLUMN task_id DROP NOT NULL");
+    await pool().query("UPDATE artifacts SET content_id = task_id WHERE content_id IS NULL");
+  }
+  await pool().query(
+    `UPDATE artifacts SET doc_type = CASE kind
+       WHEN 'plan' THEN 'plan' WHEN 'audit' THEN 'audit_report'
+       WHEN 'report' THEN 'task_report' ELSE 'autre' END
+     WHERE doc_type IS NULL OR (doc_type = 'autre' AND kind IN ('plan','audit','report'))`,
+  );
+  // LEGACY (T-20260920-162801-jxtr) : `docs`, `doc_projects`, `doc_repos`,
+  // `doc_attachments` ne sont PLUS créées ici (fusionnées dans `artifacts`).
+  // Les bases existantes sont migrées puis NEUTRALISÉES (renommées `legacy_*`)
+  // par `scripts/artifacts-fusion-migration.mjs` — JAMAIS supprimées.
   // Conflits code ↔ ADR (item 125) : DDL identique à schema.sql (source logique)
   // pour créer la table sur une base PostgreSQL déjà migrée, de façon idempotente.
   await pool().query(`CREATE TABLE IF NOT EXISTS adr_conflicts (
     conflict_id TEXT PRIMARY KEY,
-    adr_id      TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+    adr_id      TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
     task_id     TEXT REFERENCES tasks(id) ON DELETE SET NULL,
     description TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'open',
@@ -445,14 +443,14 @@ async function migrate() {
   await pool().query("CREATE INDEX IF NOT EXISTS idx_org_git_tokens_org ON org_git_tokens(org)");
   // Liaison repo↔projet : token git choisi parmi les tokens de l'organisation.
   await pool().query("ALTER TABLE project_repos ADD COLUMN IF NOT EXISTS git_token_id TEXT");
-  for (const tbl of ["projects", "repos", "recettes", "tasks", "e2e_tests", "docs", "artifacts"]) {
+  for (const tbl of ["projects", "repos", "recettes", "tasks", "e2e_tests", "artifacts"]) {
     await pool().query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS organization_id TEXT`);
     await pool().query(`UPDATE ${tbl} SET organization_id = 'onirtech' WHERE organization_id IS NULL`);
   }
   for (const tbl of ["recettes", "e2e_tests", "artifacts"]) {
     await pool().query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS created_by TEXT`);
   }
-  for (const tbl of ["projects", "repos", "recettes", "tasks", "e2e_tests", "docs", "artifacts"]) {
+  for (const tbl of ["projects", "repos", "recettes", "tasks", "e2e_tests", "artifacts"]) {
     await pool().query(`UPDATE ${tbl} SET created_by = 'Rino' WHERE created_by IS NULL`);
   }
 }
@@ -577,12 +575,12 @@ export async function listTaskLinks(taskId) {
             t.request AS linked_request, t.recette_status AS linked_recette,
             (SELECT x.status FROM executions x WHERE x.task_id = l.linked_task_id ORDER BY attempt DESC LIMIT 1) AS linked_status,
             (SELECT COUNT(*) FROM plans p WHERE p.task_id = l.linked_task_id) AS linked_plans,
-            (SELECT COUNT(*) FROM artifacts a WHERE a.task_id = l.linked_task_id) AS linked_artifacts
+            (SELECT COUNT(*) FROM artifacts a WHERE a.content_id = l.linked_task_id AND a.doc_type = ANY($2)) AS linked_artifacts
      FROM task_links l
      LEFT JOIN tasks t ON t.id = l.linked_task_id
      WHERE l.task_id = $1
      ORDER BY l.id ASC`,
-    [taskId],
+    [taskId, TASK_DOC_TYPES],
   );
   return res.rows.map((r) => ({
     linkedTaskId: r.linked_task_id,
@@ -1181,47 +1179,152 @@ export async function escalateDecision(decisionId) {
   return getDecision(decisionId);
 }
 
-// --- Artifacts (documents/livrables liés à une tâche) ----------------------
-export async function addArtifact({ taskId, kind, title, path }) {
-  await assertTaskExists(taskId);
-  // Idempotence : renvoyer l'artifact existant si (task_id, kind, path) identique.
+// --- Artefacts (table polymorphe UNIQUE) -----------------------------------
+// T-20260920-162801-jxtr : `artifacts` porte TOUS les artefacts, identifiés par
+// le couple (doc_type, content_id). Rétrocompat : `artifact_add(taskId, kind,
+// path)` et `artifact_list(taskId)` restent fonctionnels (familles TASK_DOC_TYPES).
+export async function addArtifact({
+  taskId, docType, contentId, kind, title, path, nature, meta, source, organizationId, createdBy,
+}) {
+  await ensureSchema();
+  const k = kind ? String(kind).trim() : "autre";
+  if (!ARTIFACT_KINDS.includes(k)) throw new Error(`kind invalide : ${kind} (attendu : ${ARTIFACT_KINDS.join(" | ")})`);
+  // docType dérivé de `kind` si absent (rétrocompat artifact_add(taskId, kind, path)).
+  const dt = docType ? String(docType).trim() : (DOC_TYPE_BY_ARTIFACT_KIND[k] || "autre");
+  if (!DOC_TYPES.includes(dt)) throw new Error(`docType invalide : ${docType} (attendu : ${DOC_TYPES.join(" | ")})`);
+  const cid = contentId ? String(contentId).trim() : (taskId ? String(taskId).trim() : null);
+  if (!cid) throw new Error("contentId requis (ou taskId)");
+  // Famille task : la tâche porteuse doit exister (rétrocompat).
+  if (TASK_DOC_TYPES.includes(dt)) await assertTaskExists(cid);
+  // Idempotence par (doc_type, content_id, kind, path).
   const existing = (await pool().query(
-    "SELECT * FROM artifacts WHERE task_id = $1 AND kind = $2 AND path = $3 ORDER BY id LIMIT 1",
-    [taskId, kind, path],
+    "SELECT * FROM artifacts WHERE doc_type = $1 AND content_id = $2 AND kind = $3 AND path = $4 ORDER BY id LIMIT 1",
+    [dt, cid, k, path ?? null],
   )).rows[0];
   if (existing) return rowToArtifact(existing);
-  const artifactId = `ART-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const src = source ? String(source).trim() : "import";
+  if (!ARTIFACT_SOURCES.includes(src)) throw new Error(`source invalide : ${source} (attendu : ${ARTIFACT_SOURCES.join(" | ")})`);
+  let org = organizationId || null;
+  if (!org && TASK_DOC_TYPES.includes(dt)) {
+    const t = (await pool().query("SELECT organization_id FROM tasks WHERE id = $1", [cid])).rows[0];
+    org = (t && t.organization_id) || null;
+  }
+  if (!org) org = await defaultOrganizationId();
+  const artifactId = `ART-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
-    `INSERT INTO artifacts (artifact_id, task_id, kind, title, path, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6)`,
-    [artifactId, taskId, kind, title ?? null, path, nowIso()],
+    `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, path, nature, source, meta, organization_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [artifactId, dt, cid, k, title ?? null, path ?? null, nature ?? null, src, meta ?? null, org, nowIso(), createdBy ?? null],
   );
   return getArtifact(artifactId);
 }
 
 function rowToArtifact(r) {
   if (!r) return null;
+  const dt = r.doc_type || "autre";
   return {
     artifactId: r.artifact_id,
-    taskId: r.task_id,
+    id: r.id === undefined || r.id === null ? null : Number(r.id),
+    docType: dt,
+    contentId: r.content_id ?? null,
+    // Rétrocompat `artifact_list(taskId)` : `taskId` = content_id (famille task).
+    taskId: TASK_DOC_TYPES.includes(dt) ? (r.content_id ?? null) : null,
     kind: r.kind,
-    title: r.title,
-    path: r.path,
+    title: r.title ?? null,
+    path: r.path ?? null,
+    nature: r.nature ?? null,
+    source: r.source ?? null,
+    meta: parseDocMeta(r.meta),
+    description: r.description ?? null,
+    status: r.status ?? null,
+    context: r.context ?? null,
+    decision: r.decision ?? null,
+    consequences: r.consequences ?? null,
+    replacedBy: r.replaced_by ?? null,
+    isGlobal: r.is_global === 1 || r.is_global === true,
+    organizationId: r.organization_id ?? null,
     createdAt: r.created_at,
+    updatedAt: r.updated_at ?? null,
+    createdBy: r.created_by ?? null,
   };
+}
+
+// Cibles N:N d'un artefact (remplacent docTargets/getProjectsForDocs/getReposForDocs).
+export async function getArtifactProjects(artifactId) {
+  return (await pool().query(
+    "SELECT project_id FROM artifact_projects WHERE artifact_id = $1 ORDER BY project_id", [artifactId],
+  )).rows.map((r) => r.project_id);
+}
+
+export async function getArtifactRepos(artifactId) {
+  return (await pool().query(
+    "SELECT repo_id FROM artifact_repos WHERE artifact_id = $1 ORDER BY repo_id", [artifactId],
+  )).rows.map((r) => r.repo_id);
+}
+
+async function getArtifactProjectsBatch(rows) {
+  if (!rows.length) return {};
+  const ids = [...new Set(rows.map((r) => r.artifact_id || r.id))];
+  const links = (await pool().query(
+    "SELECT artifact_id, project_id FROM artifact_projects WHERE artifact_id = ANY($1) ORDER BY project_id", [ids],
+  )).rows;
+  const map = {};
+  for (const l of links) (map[l.artifact_id] = map[l.artifact_id] || []).push(l.project_id);
+  return map;
+}
+
+async function getArtifactReposBatch(rows) {
+  if (!rows.length) return {};
+  const ids = [...new Set(rows.map((r) => r.artifact_id || r.id))];
+  const links = (await pool().query(
+    "SELECT artifact_id, repo_id FROM artifact_repos WHERE artifact_id = ANY($1) ORDER BY repo_id", [ids],
+  )).rows;
+  const map = {};
+  for (const l of links) (map[l.artifact_id] = map[l.artifact_id] || []).push(l.repo_id);
+  return map;
+}
+
+// Pièces jointes d'ADR : artefacts `doc_type='adr_file'` portés par `artifactId`.
+async function listArtifactAttachments(artifactId) {
+  const rows = (await pool().query(
+    "SELECT * FROM artifacts WHERE content_id = $1 AND doc_type = 'adr_file' ORDER BY created_at", [artifactId],
+  )).rows;
+  return rows.map(rowToAttachment);
 }
 
 export async function getArtifact(artifactId) {
   await ensureSchema();
   const res = await pool().query("SELECT * FROM artifacts WHERE artifact_id = $1", [artifactId]);
-  return rowToArtifact(res.rows[0]);
+  if (!res.rows[0]) return null;
+  const base = rowToArtifact(res.rows[0]);
+  const [projects, repos, attachments] = await Promise.all([
+    getArtifactProjects(artifactId),
+    getArtifactRepos(artifactId),
+    listArtifactAttachments(artifactId),
+  ]);
+  return { ...base, projects, repos, attachments };
 }
 
-export async function listArtifacts(taskId) {
+// Lecture centrale filtrée. `listArtifacts(taskId)` (string) reste RÉTROCOMPATIBLE.
+export async function listArtifacts(arg) {
   await ensureSchema();
-  const res = taskId
-    ? await pool().query("SELECT * FROM artifacts WHERE task_id = $1 ORDER BY id DESC", [taskId])
-    : await pool().query("SELECT * FROM artifacts ORDER BY id DESC");
+  const opts = typeof arg === "string" ? { taskId: arg } : (arg || {});
+  const conds = [];
+  const params = [];
+  if (opts.taskId) {
+    params.push(String(opts.taskId)); conds.push(`content_id = $${params.length}`);
+    params.push(TASK_DOC_TYPES); conds.push(`doc_type = ANY($${params.length})`);
+  }
+  if (opts.docType) { params.push(String(opts.docType)); conds.push(`doc_type = $${params.length}`); }
+  if (opts.contentId) { params.push(String(opts.contentId)); conds.push(`content_id = $${params.length}`); }
+  if (opts.kind) { params.push(String(opts.kind)); conds.push(`kind = $${params.length}`); }
+  if (opts.q) { params.push(`%${String(opts.q)}%`); conds.push(`(title ILIKE $${params.length} OR path ILIKE $${params.length})`); }
+  const lim = Number.isFinite(Number(opts.limit)) && Number(opts.limit) > 0 ? Math.min(Number(opts.limit), 5000) : 500;
+  params.push(lim);
+  const res = await pool().query(
+    `SELECT * FROM artifacts ${conds.length ? "WHERE " + conds.join(" AND ") : ""} ORDER BY id DESC LIMIT $${params.length}`,
+    params,
+  );
   return res.rows.map(rowToArtifact);
 }
 
@@ -1414,11 +1517,12 @@ export async function listRepos(projectId) {
   if (rows.length) {
     const map = {};
     const docs = (await pool().query(
-      "SELECT d.*, dr.repo_id AS rid FROM docs d JOIN doc_repos dr ON dr.doc_id = d.id ORDER BY d.kind, d.title NULLS LAST",
+      `SELECT d.*, dr.repo_id AS rid FROM artifacts d JOIN artifact_repos dr ON dr.artifact_id = d.artifact_id
+       WHERE d.doc_type = ANY($1) ORDER BY d.doc_type, d.title NULLS LAST`, [DOCS_DOC_TYPES],
     )).rows;
     const enriched = await enrichDocs(docs);
     const byRepo = {};
-    for (const d of docs) (byRepo[d.rid] = byRepo[d.rid] || []).push(d.id);
+    for (const d of docs) (byRepo[d.rid] = byRepo[d.rid] || []).push(d.artifact_id);
     const byId = {};
     for (const e of enriched) byId[e.docId] = e;
     for (const r of rows) {
@@ -1502,15 +1606,15 @@ async function docsByProjectRepoBatch(projectIds, repoIds) {
   const enrich = async (rows) => enrichDocs(rows);
   if (projectIds.length) {
     const rows = (await pool().query(
-      `SELECT DISTINCT d.* FROM docs d JOIN doc_projects dp ON dp.doc_id = d.id
-       WHERE dp.project_id = ANY($1) ORDER BY d.kind, d.title NULLS LAST`, [projectIds],
+      `SELECT DISTINCT d.* FROM artifacts d JOIN artifact_projects dp ON dp.artifact_id = d.artifact_id
+       WHERE dp.project_id = ANY($1) AND d.doc_type = ANY($2) ORDER BY d.doc_type, d.title NULLS LAST`, [projectIds, DOCS_DOC_TYPES],
     )).rows;
     for (const e of await enrich(rows)) (out.projects[e.projects[0]] = out.projects[e.projects[0]] || []).push(e);
   }
   if (repoIds.length) {
     const rows = (await pool().query(
-      `SELECT DISTINCT d.* FROM docs d JOIN doc_repos dr ON dr.doc_id = d.id
-       WHERE dr.repo_id = ANY($1) ORDER BY d.kind, d.title NULLS LAST`, [repoIds],
+      `SELECT DISTINCT d.* FROM artifacts d JOIN artifact_repos dr ON dr.artifact_id = d.artifact_id
+       WHERE dr.repo_id = ANY($1) AND d.doc_type = ANY($2) ORDER BY d.doc_type, d.title NULLS LAST`, [repoIds, DOCS_DOC_TYPES],
     )).rows;
     for (const e of await enrich(rows)) (out.repos[e.repos[0]] = out.repos[e.repos[0]] || []).push(e);
   }
@@ -1571,31 +1675,35 @@ function parseDocMeta(raw) {
   try { return JSON.parse(raw); } catch { return raw; }
 }
 
-// Sérialise une ligne `doc_attachments` (camelCase) — réutilisé par les
-// fonctions et les tools. `meta` tolérant aux valeurs legacy.
+// Sérialise une ligne `artifacts` de famille `adr_file` (camelCase) — réutilisé
+// par les fonctions et les tools. `meta` tolérant aux valeurs legacy.
 function rowToAttachment(r) {
   if (!r) return null;
+  const meta = parseDocMeta(r.meta);
   return {
-    attachmentId: r.attachment_id,
-    docId: r.doc_id,
+    attachmentId: r.artifact_id,
+    docId: r.content_id,
     docType: r.doc_type,
     contentId: r.content_id,
     kind: r.kind ?? null,
     nature: r.nature ?? null,
     title: r.title ?? null,
     path: r.path ?? null,
-    targetDocId: r.target_doc_id ?? null,
+    targetDocId: meta && typeof meta === "object" ? (meta.targetDocId ?? null) : null,
     source: r.source,
-    meta: parseDocMeta(r.meta),
+    meta,
     createdAt: r.created_at,
     createdBy: r.created_by ?? null,
   };
 }
 
+// Mappe une ligne `artifacts` → forme `doc_*` (rétrocompat agents/panneau).
+// `docId` = artifact_id ; `kind` ADR-12 = inverse de doc_type.
 function rowToDoc(r) {
   if (!r) return null;
+  const dt = r.doc_type || "autre";
   return {
-    docId: r.id, kind: r.kind, title: r.title ?? null, path: r.path,
+    docId: r.artifact_id, kind: DOC_KIND_BY_DOC_TYPE[dt] || dt, title: r.title ?? null, path: r.path,
     description: r.description ?? null,
     status: r.status ?? null,
     context: r.context ?? null,
@@ -1617,62 +1725,30 @@ function hydrateDocs(rows) {
   return out;
 }
 
-async function docTargets(docId) {
-  const [projects, repos] = await Promise.all([
-    (await pool().query("SELECT project_id FROM doc_projects WHERE doc_id = $1 ORDER BY project_id", [docId])).rows.map((r) => r.project_id),
-    (await pool().query("SELECT repo_id FROM doc_repos WHERE doc_id = $1 ORDER BY repo_id", [docId])).rows.map((r) => r.repo_id),
-  ]);
-  return { projects, repos };
-}
-
-// Docs rattachés à des projets (N:N).
-async function getProjectsForDocs(rows) {
-  if (!rows.length) return {};
-  const ids = [...new Set(rows.map((r) => r.id))];
-  const links = (await pool().query(
-    "SELECT doc_id, project_id FROM doc_projects WHERE doc_id = ANY($1) ORDER BY project_id", [ids],
-  )).rows;
-  const map = {};
-  for (const l of links) (map[l.doc_id] = map[l.doc_id] || []).push(l.project_id);
-  return map;
-}
-
-// Docs rattachés à des repos (N:N).
-async function getReposForDocs(rows) {
-  if (!rows.length) return {};
-  const ids = [...new Set(rows.map((r) => r.id))];
-  const links = (await pool().query(
-    "SELECT doc_id, repo_id FROM doc_repos WHERE doc_id = ANY($1) ORDER BY repo_id", [ids],
-  )).rows;
-  const map = {};
-  for (const l of links) (map[l.doc_id] = map[l.doc_id] || []).push(l.repo_id);
-  return map;
-}
-
 // Pièces jointes d'ADR rattachées à des docs (0..N) — une requête batch.
 async function getAttachmentsForDocs(rows) {
   if (!rows.length) return {};
-  const ids = [...new Set(rows.map((r) => r.id))];
+  const ids = [...new Set(rows.map((r) => r.artifact_id))];
   const links = (await pool().query(
-    "SELECT * FROM doc_attachments WHERE doc_id = ANY($1) ORDER BY created_at", [ids],
+    "SELECT * FROM artifacts WHERE content_id = ANY($1) AND doc_type = 'adr_file' ORDER BY created_at", [ids],
   )).rows;
   const map = {};
-  for (const l of links) (map[l.doc_id] = map[l.doc_id] || []).push(rowToAttachment(l));
+  for (const l of links) (map[l.content_id] = map[l.content_id] || []).push(rowToAttachment(l));
   return map;
 }
 
 // Un doc enrichi avec ses cibles (projets/repos) et ses pièces jointes (0..N).
-// rows = lignes docs. Le champ `attachments` est additif (rétrocompat item 120).
+// rows = lignes `artifacts`. `attachments` additif (rétrocompat item 120).
 async function enrichDocs(rows) {
   if (!rows.length) return [];
   const [projMap, repoMap, attMap] = await Promise.all([
-    getProjectsForDocs(rows), getReposForDocs(rows), getAttachmentsForDocs(rows),
+    getArtifactProjectsBatch(rows), getArtifactReposBatch(rows), getAttachmentsForDocs(rows),
   ]);
   return rows.map((r) => ({
     ...rowToDoc(r),
-    projects: projMap[r.id] || [],
-    repos: repoMap[r.id] || [],
-    attachments: attMap[r.id] || [],
+    projects: projMap[r.artifact_id] || [],
+    repos: repoMap[r.artifact_id] || [],
+    attachments: attMap[r.artifact_id] || [],
   }));
 }
 
@@ -1694,12 +1770,16 @@ export async function registerDoc({
   const id = `doc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const globalFlag = isGlobal === true ? 1 : 0;
   const ts = nowIso();
+  // REBASAGE : un doc ADR-12 est un artefact `doc_type` ∈ DOCS_DOC_TYPES,
+  // `content_id = id` (le doc est sa propre entité porteuse), `source='registry'`.
   await pool().query(
-    `INSERT INTO docs (id, kind, title, path, description, status, context, decision, consequences,
-                       replaced_by, is_global, organization_id, created_at, created_by, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+    `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, path, description,
+                            status, context, decision, consequences, replaced_by, is_global,
+                            source, organization_id, created_at, created_by, updated_at)
+     VALUES ($1,$2,$3,'autre',$4,$5,$6,$7,$8,$9,$10,$11,$12,'registry',$13,$14,$15,$16)`,
     [
-      id, k, title ? String(title).trim() : null, p,
+      id, DOC_TYPE_BY_DOC_KIND[k], id,
+      title ? String(title).trim() : null, p,
       description ? String(description).trim() : null,
       st,
       context === undefined || context === null ? null : String(context),
@@ -1710,7 +1790,7 @@ export async function registerDoc({
     ],
   );
   if (projectId) {
-    await pool().query("INSERT INTO doc_projects (doc_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, String(projectId).trim()]);
+    await pool().query("INSERT INTO artifact_projects (artifact_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, String(projectId).trim()]);
   }
   // Rattachement repos : repoId legacy + repoIds (1..N) + ADR globale (tous les
   // repos du projet, résolus depuis project_repos).
@@ -1722,7 +1802,7 @@ export async function registerDoc({
     for (const r of rows) repoSet.add(r.repo_id);
   }
   for (const r of repoSet) {
-    await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, r]);
+    await pool().query("INSERT INTO artifact_repos (artifact_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [id, r]);
   }
   return getDoc(id);
 }
@@ -1737,7 +1817,7 @@ export async function updateDoc({
   const params = [];
   if (kind !== undefined) {
     if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind}`);
-    params.push(kind); sets.push(`kind = $${params.length}`);
+    params.push(DOC_TYPE_BY_DOC_KIND[kind]); sets.push(`doc_type = $${params.length}`);
   }
   if (title !== undefined) { params.push(title === null ? null : String(title).trim()); sets.push(`title = $${params.length}`); }
   if (path !== undefined) { params.push(String(path).trim()); sets.push(`path = $${params.length}`); }
@@ -1753,38 +1833,41 @@ export async function updateDoc({
     params.push(nowIso());
     sets.push(`updated_at = $${params.length}`);
     params.push(docId);
-    await pool().query(`UPDATE docs SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+    await pool().query(`UPDATE artifacts SET ${sets.join(", ")} WHERE artifact_id = $${params.length}`, params);
   }
-  if (addProjectId) await pool().query("INSERT INTO doc_projects (doc_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addProjectId).trim()]);
-  if (addRepoId) await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addRepoId).trim()]);
+  if (addProjectId) await pool().query("INSERT INTO artifact_projects (artifact_id, project_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addProjectId).trim()]);
+  if (addRepoId) await pool().query("INSERT INTO artifact_repos (artifact_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(addRepoId).trim()]);
   if (Array.isArray(addRepoIds)) {
     for (const r of addRepoIds) {
-      if (r) await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(r).trim()]);
+      if (r) await pool().query("INSERT INTO artifact_repos (artifact_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, String(r).trim()]);
     }
   }
   // ADR globale : `setGlobal=true` rattache TOUS les repos des projets du doc
   // (+ is_global=1) ; `setGlobal=false` remet is_global=0 sans retirer les liens.
   if (setGlobal === true) {
-    const projectIds = (await pool().query("SELECT project_id FROM doc_projects WHERE doc_id = $1", [docId])).rows.map((r) => r.project_id);
+    const projectIds = (await pool().query("SELECT project_id FROM artifact_projects WHERE artifact_id = $1", [docId])).rows.map((r) => r.project_id);
     if (!projectIds.length) throw new Error("setGlobal=true exige au moins un projet rattaché au doc");
-    await pool().query("UPDATE docs SET is_global = 1, updated_at = $2 WHERE id = $1", [docId, nowIso()]);
+    await pool().query("UPDATE artifacts SET is_global = 1, updated_at = $2 WHERE artifact_id = $1", [docId, nowIso()]);
     for (const pid of projectIds) {
       const rows = (await pool().query("SELECT repo_id FROM project_repos WHERE project_id = $1", [pid])).rows;
       for (const r of rows) {
-        await pool().query("INSERT INTO doc_repos (doc_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, r.repo_id]);
+        await pool().query("INSERT INTO artifact_repos (artifact_id, repo_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", [docId, r.repo_id]);
       }
     }
   } else if (setGlobal === false) {
-    await pool().query("UPDATE docs SET is_global = 0, updated_at = $2 WHERE id = $1", [docId, nowIso()]);
+    await pool().query("UPDATE artifacts SET is_global = 0, updated_at = $2 WHERE artifact_id = $1", [docId, nowIso()]);
   }
   return getDoc(docId);
 }
 
+// REBASAGE doc_delete : supprime l'artefact (famille docs) + ses pièces jointes
+// (`adr_file`) ; les liens artifact_projects/artifact_repos suivent en CASCADE.
 export async function deleteDoc(docId) {
   await ensureSchema();
   const existing = await getDoc(docId);
   if (!existing) return null;
-  await pool().query("DELETE FROM docs WHERE id = $1", [docId]);
+  await pool().query("DELETE FROM artifacts WHERE content_id = $1 AND doc_type = 'adr_file'", [docId]);
+  await pool().query("DELETE FROM artifacts WHERE artifact_id = $1 AND doc_type = ANY($2)", [docId, DOCS_DOC_TYPES]);
   return { docId, deleted: true };
 }
 
@@ -1798,7 +1881,10 @@ export async function addDocAttachment({
 }) {
   await ensureSchema();
   if (!docId) throw new Error("docId requis");
-  const doc = (await pool().query("SELECT id FROM docs WHERE id = $1", [docId])).rows[0];
+  // Porteur : un artefact de la famille docs (adr/specs/gherkin/project_doc).
+  const doc = (await pool().query(
+    "SELECT artifact_id FROM artifacts WHERE artifact_id = $1 AND doc_type = ANY($2)", [docId, DOCS_DOC_TYPES],
+  )).rows[0];
   if (!doc) throw new Error(`doc porteur inconnu : ${docId}`);
   const src = assertAttachmentSource(source);
   let target = null;
@@ -1807,7 +1893,9 @@ export async function addDocAttachment({
     target = targetDocId ? String(targetDocId).trim() : "";
     if (!target) throw new Error("source='registry' exige targetDocId (document du registre)");
     if (target === String(docId)) throw new Error("une pièce jointe ne peut pas cibler l'ADR porteuse elle-même");
-    const t = (await pool().query("SELECT id FROM docs WHERE id = $1", [target])).rows[0];
+    const t = (await pool().query(
+      "SELECT artifact_id FROM artifacts WHERE artifact_id = $1 AND doc_type = ANY($2)", [target, DOCS_DOC_TYPES],
+    )).rows[0];
     if (!t) throw new Error(`document cible inconnu : ${target}`);
   } else {
     p = path ? String(path).trim() : "";
@@ -1815,21 +1903,26 @@ export async function addDocAttachment({
   }
   const defaultNature = { registry: "document", import: "fichier", ref: "lien" };
   const nat = nature && String(nature).trim() ? String(nature).trim() : defaultNature[src];
-  const metaStr = meta === undefined || meta === null
+  let metaObj = meta === undefined || meta === null
     ? null
-    : (typeof meta === "string" ? meta : JSON.stringify(meta));
+    : (typeof meta === "string" ? parseDocMeta(meta) : meta);
+  if (src === "registry") {
+    metaObj = { ...(metaObj && typeof metaObj === "object" ? metaObj : {}), targetDocId: target };
+  }
   const id = `att-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();
+  // REBASAGE : une pièce jointe est un artefact `doc_type='adr_file'` porté par
+  // l'ADR (`content_id = docId`) ; la cible registre vit dans `meta.targetDocId`.
   await pool().query(
-    `INSERT INTO doc_attachments
-       (attachment_id, doc_id, doc_type, content_id, kind, nature, title, path, target_doc_id, source, meta, created_at, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+    `INSERT INTO artifacts
+       (artifact_id, doc_type, content_id, kind, nature, title, path, source, meta, created_at, created_by)
+     VALUES ($1,'adr_file',$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
     [
-      id, String(docId), "adr_file", String(docId),
+      id, String(docId),
       kind ? String(kind).trim() : null,
       nat,
       title ? String(title).trim() : null,
-      p, target, src, metaStr, ts, createdBy ?? null,
+      p, src, metaObj, ts, createdBy ?? null,
     ],
   );
   return getDoc(docId);
@@ -1840,13 +1933,15 @@ export async function addDocAttachment({
 export async function removeDocAttachment({ attachmentId, docId }) {
   await ensureSchema();
   if (!attachmentId) throw new Error("attachmentId requis");
-  const row = (await pool().query("SELECT * FROM doc_attachments WHERE attachment_id = $1", [attachmentId])).rows[0];
+  const row = (await pool().query(
+    "SELECT * FROM artifacts WHERE artifact_id = $1 AND doc_type = 'adr_file'", [attachmentId],
+  )).rows[0];
   if (!row) return null;
-  if (docId && String(docId) !== String(row.doc_id)) {
+  if (docId && String(docId) !== String(row.content_id)) {
     throw new Error(`la pièce jointe ${attachmentId} n'appartient pas au doc ${docId}`);
   }
-  await pool().query("DELETE FROM doc_attachments WHERE attachment_id = $1", [attachmentId]);
-  return { attachmentId, docId: row.doc_id, deleted: true };
+  await pool().query("DELETE FROM artifacts WHERE artifact_id = $1", [attachmentId]);
+  return { attachmentId, docId: row.content_id, deleted: true };
 }
 
 // Lecture dédiée des pièces jointes d'une ADR (symétrie artifact_list).
@@ -1854,14 +1949,16 @@ export async function listDocAttachments({ docId }) {
   await ensureSchema();
   if (!docId) throw new Error("docId requis");
   const rows = (await pool().query(
-    "SELECT * FROM doc_attachments WHERE doc_id = $1 ORDER BY created_at", [String(docId)],
+    "SELECT * FROM artifacts WHERE content_id = $1 AND doc_type = 'adr_file' ORDER BY created_at", [String(docId)],
   )).rows;
   return rows.map(rowToAttachment);
 }
 
 export async function getDoc(docId) {
   await ensureSchema();
-  const r = (await pool().query("SELECT * FROM docs WHERE id = $1", [docId])).rows[0];
+  const r = (await pool().query(
+    "SELECT * FROM artifacts WHERE artifact_id = $1 AND doc_type = ANY($2)", [docId, DOCS_DOC_TYPES],
+  )).rows[0];
   if (!r) return null;
   const [e] = await enrichDocs([r]);
   return e;
@@ -1874,12 +1971,15 @@ export async function listDocs({ kind, status, projectId, repoId, includeRepoDoc
   await ensureSchema();
   const conds = [];
   const params = [];
+  // Base : famille docs (doc_type adr/specs/gherkin/project_doc).
+  params.push(DOCS_DOC_TYPES); conds.push(`d.doc_type = ANY($${params.length})`);
   if (kind) {
     if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind}`);
-    params.push(kind); conds.push(`d.kind = $${params.length}`);
+    params.push(DOC_TYPE_BY_DOC_KIND[kind]); conds.push(`d.doc_type = $${params.length}`);
   }
   // Filtre ADR par statut (ajoute une condition — le SQL `includeRepoDocs` et
-  // `repoId` ci-dessous restent inchangés : rétrocompat préservée).
+  // `repoId` ci-dessous restent inchangés : rétrocompat + ⚠️ INC-011 PRÉSERVÉ,
+  // la précédence SQL d'origine n'est PAS corrigée ici).
   if (status) {
     const s = assertAdrStatus(status);
     params.push(s); conds.push(`d.status = $${params.length}`);
@@ -1891,30 +1991,30 @@ export async function listDocs({ kind, status, projectId, repoId, includeRepoDoc
     if (includeRepoDocs) {
       params.push(prj, prj);
       rows = (await pool().query(
-        `SELECT DISTINCT d.* FROM docs d
-         WHERE d.id IN (SELECT doc_id FROM doc_projects WHERE project_id = $${params.length - 1})
-            OR d.id IN (SELECT dr.doc_id FROM doc_repos dr JOIN project_repos pr ON pr.repo_id = dr.repo_id WHERE pr.project_id = $${params.length})
-         ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`,
+        `SELECT DISTINCT d.* FROM artifacts d
+         WHERE d.artifact_id IN (SELECT artifact_id FROM artifact_projects WHERE project_id = $${params.length - 1})
+            OR d.artifact_id IN (SELECT ar.artifact_id FROM artifact_repos ar JOIN project_repos pr ON pr.repo_id = ar.repo_id WHERE pr.project_id = $${params.length})
+         ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.doc_type, d.title NULLS LAST, d.created_at DESC`,
         params,
       )).rows;
     } else {
       params.push(prj);
       rows = (await pool().query(
-        `SELECT DISTINCT d.* FROM docs d JOIN doc_projects dp ON dp.doc_id = d.id WHERE dp.project_id = $${params.length}
-         ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`,
+        `SELECT DISTINCT d.* FROM artifacts d JOIN artifact_projects dp ON dp.artifact_id = d.artifact_id WHERE dp.project_id = $${params.length}
+         ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.doc_type, d.title NULLS LAST, d.created_at DESC`,
         params,
       )).rows;
     }
   } else if (repoId) {
     params.push(String(repoId));
     rows = (await pool().query(
-      `SELECT DISTINCT d.* FROM docs d JOIN doc_repos dr ON dr.doc_id = d.id WHERE dr.repo_id = $${params.length}
-       ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`,
+      `SELECT DISTINCT d.* FROM artifacts d JOIN artifact_repos dr ON dr.artifact_id = d.artifact_id WHERE dr.repo_id = $${params.length}
+       ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.doc_type, d.title NULLS LAST, d.created_at DESC`,
       params,
     )).rows;
   } else {
     rows = (await pool().query(
-      `SELECT d.* FROM docs d ${conds.length ? "WHERE " + conds.join(" AND ") : ""} ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC LIMIT ${Number(limit) || 500}`,
+      `SELECT d.* FROM artifacts d ${conds.length ? "WHERE " + conds.join(" AND ") : ""} ORDER BY d.doc_type, d.title NULLS LAST, d.created_at DESC LIMIT ${Number(limit) || 500}`,
       params,
     )).rows;
   }
@@ -1927,10 +2027,11 @@ export async function listDocs({ kind, status, projectId, repoId, includeRepoDoc
 export async function docsForProjectContext(projectId) {
   await ensureSchema();
   const rows = (await pool().query(
-    `SELECT DISTINCT d.* FROM docs d
-     WHERE d.id IN (SELECT doc_id FROM doc_projects WHERE project_id = $1)
-        OR d.id IN (SELECT dr.doc_id FROM doc_repos dr JOIN project_repos pr ON pr.repo_id = dr.repo_id WHERE pr.project_id = $1)
-     ORDER BY d.kind, d.title NULLS LAST, d.created_at DESC`, [projectId],
+    `SELECT DISTINCT d.* FROM artifacts d
+     WHERE d.doc_type = ANY($2)
+       AND (d.artifact_id IN (SELECT artifact_id FROM artifact_projects WHERE project_id = $1)
+         OR d.artifact_id IN (SELECT ar.artifact_id FROM artifact_repos ar JOIN project_repos pr ON pr.repo_id = ar.repo_id WHERE pr.project_id = $1))
+     ORDER BY d.doc_type, d.title NULLS LAST, d.created_at DESC`, [projectId, DOCS_DOC_TYPES],
   )).rows;
   return enrichDocs(rows);
 }
@@ -2452,7 +2553,8 @@ export async function deleteTask(taskId) {
     await client.query("DELETE FROM task_sessions WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM deployments WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM decisions WHERE task_id = $1", [taskId]);
-    await client.query("DELETE FROM artifacts WHERE task_id = $1", [taskId]);
+    // ON DELETE famille task (content_id polymorphe → pas de FK).
+    await client.query("DELETE FROM artifacts WHERE content_id = $1 AND doc_type = ANY($2)", [taskId, TASK_DOC_TYPES]);
     await client.query("DELETE FROM worktrees WHERE task_id = $1", [taskId]);
     await client.query("DELETE FROM plan_steps WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
     await client.query("DELETE FROM plan_incidents WHERE plan_id IN (SELECT id FROM plans WHERE task_id = $1)", [taskId]);
@@ -2897,30 +2999,40 @@ export async function getRecetteById(recetteId) {
   };
 }
 
-// --- Documents de recette --------------------------------------------------
+// --- Documents de recette (rebasés sur `artifacts`) ------------------------
+// Un document de recette est un artefact `doc_type` ∈ {recette_doc,
+// recette_report}, `content_id` = recetteId. `documentId` reste un ENTIER
+// (= artifacts.id IDENTITY) pour la rétrocompat des routes panneau `[0-9]+`.
 export async function addRecetteDocument({ recetteId, title, nature, source, path, artifactId }) {
   await ensureSchema();
-  const r = (await pool().query(
-    `INSERT INTO recette_documents (recette_id, title, nature, source, path, artifact_id, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-    [recetteId, title ?? null, nature ?? null, source || "import", path ?? null, artifactId ?? null, nowIso()],
-  )).rows[0];
+  let docType = "recette_doc";
+  if (artifactId) {
+    const a = (await pool().query("SELECT kind FROM artifacts WHERE artifact_id = $1", [artifactId])).rows[0];
+    if (a && a.kind === "report") docType = "recette_report";
+  }
+  const id = `ART-REC-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
+     VALUES ($1,$2,$3,'report',$4,$5,$6,$7,$8,$9)`,
+    [id, docType, String(recetteId), title ?? null, nature ?? null, source || "import", path ?? null,
+     artifactId ? { artifactId } : null, nowIso()],
+  );
   return listRecetteDocuments(recetteId);
 }
 
 export async function listRecetteDocuments(recetteId) {
   await ensureSchema();
   const rows = (await pool().query(
-    `SELECT d.id, d.recette_id, d.title, d.nature, d.source, d.path, d.artifact_id, d.created_at,
-            a.title AS artifact_title, a.task_id AS artifact_task
-     FROM recette_documents d
-     LEFT JOIN artifacts a ON a.artifact_id = d.artifact_id
-     WHERE d.recette_id = $1 ORDER BY d.id ASC`,
-    [recetteId],
+    `SELECT d.id, d.artifact_id, d.content_id, d.title, d.nature, d.source, d.path, d.created_at,
+            a.title AS artifact_title, a.content_id AS artifact_task
+     FROM artifacts d
+     LEFT JOIN artifacts a ON a.artifact_id = (d.meta->>'artifactId')
+     WHERE d.content_id = $1 AND d.doc_type = ANY($2) ORDER BY d.id ASC`,
+    [String(recetteId), RECETTE_DOC_TYPES],
   )).rows;
   return rows.map((r) => ({
     documentId: Number(r.id),
-    recetteId: r.recette_id,
+    recetteId: r.content_id,
     title: r.title || r.artifact_title || (r.path ? r.path.split("/").pop() : null) || null,
     nature: r.nature,
     source: r.source,
@@ -2934,10 +3046,10 @@ export async function listRecetteDocuments(recetteId) {
 export async function removeRecetteDocument(documentId) {
   await ensureSchema();
   const r = (await pool().query(
-    "DELETE FROM recette_documents WHERE id = $1 RETURNING recette_id",
-    [documentId],
+    "DELETE FROM artifacts WHERE id = $1 AND doc_type = ANY($2) RETURNING content_id",
+    [documentId, RECETTE_DOC_TYPES],
   )).rows[0];
-  return r ? r.recette_id : null;
+  return r ? r.content_id : null;
 }
 
 export async function addRecetteItem({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent }) {
@@ -3510,6 +3622,31 @@ export async function updateE2EExecution({ executionId, status, durationMs, repo
   if (!sets.length) throw new Error("aucun champ à mettre à jour");
   params.push(executionId);
   await pool().query(`UPDATE e2e_executions SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  // TAXONOMIE E2E (T-20260920-162801-jxtr) : les preuves deviennent des artefacts
+  // (`e2e_report` = rapport texte ; `e2e_video` = preuve HUMAINE) visibles dans le
+  // gestionnaire central. `report_artifact_id` reste un `artifact_id` inchangé.
+  const row = (await pool().query("SELECT e2e_test_id FROM e2e_executions WHERE id = $1", [executionId])).rows[0];
+  if (row) {
+    if (reportArtifactId) {
+      const a = (await pool().query("SELECT 1 FROM artifacts WHERE artifact_id = $1", [reportArtifactId])).rows[0];
+      if (!a) console.error(`[e2e] reportArtifactId inconnu : ${reportArtifactId} (exécution ${executionId})`);
+    }
+    if (videoUrl) {
+      const existing = (await pool().query(
+        "SELECT artifact_id FROM artifacts WHERE doc_type = 'e2e_video' AND content_id = $1 AND path = $2 LIMIT 1",
+        [String(row.e2e_test_id), String(videoUrl)],
+      )).rows[0];
+      if (!existing) {
+        await pool().query(
+          `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, path, source, meta, created_at)
+           VALUES ($1,'e2e_video',$2,'autre',$3,$4,'artifact',$5,$6)`,
+          [`ART-E2E-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+           String(row.e2e_test_id), `Vidéo E2E — ${row.e2e_test_id}`, String(videoUrl),
+           { executionId, videoUrl: String(videoUrl) }, nowIso()],
+        );
+      }
+    }
+  }
   return getE2EExecution(executionId);
 }
 

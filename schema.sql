@@ -112,77 +112,69 @@ CREATE TABLE IF NOT EXISTS task_repos (
 );
 CREATE INDEX IF NOT EXISTS idx_task_repos_repo ON task_repos(repo_id);
 
--- Documents de référence (ADR-12) + ADR STRUCTURÉES (item 120). Le registre
--- porte Titre/Statut/Contexte/Décision/Conséquences ; `path` pointe le fichier
--- que les agents LISENT en contexte (jamais de contenu en base).
---   status      : Proposé | Accepté | Déprécié | Remplacé (null pour un doc legacy)
---   replaced_by : docId de l'ADR qui remplace celle-ci (statut Remplacé)
---   is_global   : 1 = ADR globale, rattachée à TOUS les repos du projet
---   meta        : JSON sérialisé — champs préservables pour la fusion `artifacts`
---   updated_at  : dernière mise à jour
-CREATE TABLE IF NOT EXISTS docs (
-  id            TEXT PRIMARY KEY,                  -- doc-<ts>-<rand>
-  kind          TEXT NOT NULL,                     -- adr-tech | specs-fonctionnelles | scenarios-gherkin
-  title         TEXT,
-  path          TEXT NOT NULL,                     -- chemin du fichier (lu par l'agent)
-  description   TEXT,
-  status        TEXT,                              -- ADR : Proposé | Accepté | Déprécié | Remplacé
-  context       TEXT,                              -- ADR : contexte
-  decision      TEXT,                              -- ADR : décision
-  consequences  TEXT,                              -- ADR : conséquences
-  replaced_by   TEXT,                              -- ADR : docId de l'ADR qui remplace
-  is_global     INTEGER NOT NULL DEFAULT 0,        -- ADR globale : tous les repos du projet
-  meta          TEXT,                              -- JSON sérialisé (préservable pour `artifacts`)
-  organization_id TEXT,                            -- organisation (tenant)
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT,                              -- dernière mise à jour
-  created_by    TEXT
+-- ===========================================================================
+-- ARTEFACTS — table polymorphe UNIQUE (fusion physique `artifacts` + `docs` +
+-- `recette_documents` + `doc_attachments` ; tâche T-20260920-162801-jxtr).
+-- Identifiée par le couple (doc_type, content_id) :
+--   doc_type   : type d'artefact (taxonomie énumérée — cf. nomenclature-doc-type.md)
+--   content_id : identifiant de l'entité porteuse (taskId/recetteId/projectId/docId)
+--   kind       : NATURE de l'artefact (plan | audit | report | autre)
+-- `content_type` est un nom RÉSERVÉ (futur « type d'artefact ») : JAMAIS créé.
+-- Champs ADR structurés conservés : status/context/decision/consequences/
+-- replaced_by/is_global. Rattachement N:N via artifact_projects/artifact_repos.
+-- NB : définie AVANT `adr_conflicts` (FK adr_id → artifacts.artifact_id).
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS artifacts (
+  id              INTEGER GENERATED ALWAYS AS IDENTITY,  -- ordre d'insertion (ex-rowid)
+  artifact_id     TEXT PRIMARY KEY,                      -- PK stable (ART-… / doc-… / att-…)
+  doc_type        TEXT NOT NULL DEFAULT 'autre',         -- taxonomie (cf. nomenclature)
+  content_id      TEXT NOT NULL,                         -- entité porteuse (polymorphe, sans FK)
+  kind            TEXT NOT NULL DEFAULT 'autre',         -- NATURE : plan | audit | report | autre
+  title           TEXT,
+  path            TEXT,
+  nature          TEXT,                                  -- liaison libre (recette : à quoi sert)
+  source          TEXT NOT NULL DEFAULT 'import',        -- import | artifact | registry | ref
+  meta            JSONB,                                 -- champs propres à une famille
+  description     TEXT,
+  status          TEXT,                                  -- ADR : Proposé | Accepté | Déprécié | Remplacé
+  context         TEXT,                                  -- ADR : contexte
+  decision        TEXT,                                  -- ADR : décision
+  consequences    TEXT,                                  -- ADR : conséquences
+  replaced_by     TEXT,                                  -- ADR : artifact_id qui remplace
+  is_global       INTEGER NOT NULL DEFAULT 0,            -- ADR globale : tous les repos du projet
+  organization_id TEXT,                                  -- organisation (tenant)
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT,                                  -- dernière mise à jour
+  created_by      TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_docs_kind ON docs(kind);
--- NB : l'index sur `status` est créé par migrate() APRÈS les ALTER (une base
--- existante n'a pas encore la colonne au moment où schema.sql est chargé).
+CREATE INDEX IF NOT EXISTS idx_artifacts_doc_type ON artifacts(doc_type);
+CREATE INDEX IF NOT EXISTS idx_artifacts_content ON artifacts(content_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_kind ON artifacts(kind);
 
--- Docs ⇄ Projets (N:N) et Docs ⇄ Repos (N:N).
-CREATE TABLE IF NOT EXISTS doc_projects (
-  doc_id     TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
-  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  PRIMARY KEY (doc_id, project_id)
+-- Artefacts ⇄ Projets (N:N) et Artefacts ⇄ Repos (N:N) — remplacent
+-- doc_projects/doc_repos (rattachement projet/repo des ADR-12 ; ADR globale).
+CREATE TABLE IF NOT EXISTS artifact_projects (
+  artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  PRIMARY KEY (artifact_id, project_id)
 );
-CREATE INDEX IF NOT EXISTS idx_doc_projects_project ON doc_projects(project_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_projects_project ON artifact_projects(project_id);
 
-CREATE TABLE IF NOT EXISTS doc_repos (
-  doc_id  TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
-  repo_id TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
-  PRIMARY KEY (doc_id, repo_id)
+CREATE TABLE IF NOT EXISTS artifact_repos (
+  artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+  repo_id     TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+  PRIMARY KEY (artifact_id, repo_id)
 );
-CREATE INDEX IF NOT EXISTS idx_doc_repos_repo ON doc_repos(repo_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_repos_repo ON artifact_repos(repo_id);
 
--- Pièces jointes d'ADR (item 122) : une ADR (docs.kind='adr-tech') peut être
--- rattachée à 0..N documents/fichiers. Table de liaison DÉDIÉE (distincte de
--- doc_projects/doc_repos = rattachement projet/repo) : elle donne un ID stable
--- (retrait d'une pièce précise), distingue les natures et préfigure la table
--- polymorphe `artifacts` (T8) par un mapping 1:1 (doc_type/content_id/kind/
--- nature/source/meta).
---   source='registry' → target_doc_id : document du registre (target_doc_id)
---   source='import'   → path : fichier importé (stocké sous storage/ref-docs)
---   source='ref'      → path : fichier référencé par chemin (workspace/checkout)
-CREATE TABLE IF NOT EXISTS doc_attachments (
-  attachment_id TEXT PRIMARY KEY,                    -- att-<ts>-<rand>
-  doc_id        TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,       -- ADR porteuse
-  doc_type      TEXT NOT NULL DEFAULT 'adr_file',    -- préfigure artifacts.doc_type (T8)
-  content_id    TEXT,                                -- = doc_id (préfigure artifacts.content_id)
-  kind          TEXT,                                -- libellé libre (annexe, spec, capture…)
-  nature        TEXT,                                -- document | fichier | lien
-  title         TEXT,
-  path          TEXT,                                -- source import/ref : chemin du fichier
-  target_doc_id TEXT REFERENCES docs(id) ON DELETE CASCADE,                -- source registry
-  source        TEXT NOT NULL DEFAULT 'registry',    -- registry | import | ref
-  meta          TEXT,                                -- JSON sérialisé
-  created_at    TEXT NOT NULL,
-  created_by    TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_doc_attachments_doc ON doc_attachments(doc_id);
-CREATE INDEX IF NOT EXISTS idx_doc_attachments_target ON doc_attachments(target_doc_id);
+-- ===========================================================================
+-- LEGACY (neutralisées par T-20260920-162801-jxtr — cf. `nomenclature-doc-type.md`)
+-- Tables `docs`, `doc_projects`, `doc_repos`, `doc_attachments` et
+-- `recette_documents` : une base NEUVE ne les crée plus (source logique unique =
+-- `artifacts`). Les bases existantes sont migrées par
+-- `scripts/artifacts-fusion-migration.mjs` puis NEUTRALISÉES (renommées
+-- `legacy_*`) — JAMAIS supprimées.
+-- ===========================================================================
 
 -- Conflits code ↔ ADR (item 125) : un agent signale qu'une implémentation
 -- contredit une ADR. Le conflit est PERSISTÉ même sans `task_id` (« pas de
@@ -192,7 +184,7 @@ CREATE INDEX IF NOT EXISTS idx_doc_attachments_target ON doc_attachments(target_
 --   status : open | resolved
 CREATE TABLE IF NOT EXISTS adr_conflicts (
   conflict_id TEXT PRIMARY KEY,                             -- adr-conf-<ts>-<rand>
-  adr_id      TEXT NOT NULL REFERENCES docs(id) ON DELETE CASCADE,
+  adr_id      TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
   task_id     TEXT REFERENCES tasks(id) ON DELETE SET NULL,  -- nullable (hors tâche)
   description TEXT NOT NULL,
   status      TEXT NOT NULL DEFAULT 'open',                 -- open | resolved
@@ -299,17 +291,10 @@ CREATE TABLE IF NOT EXISTS participants (
 );
 CREATE INDEX IF NOT EXISTS idx_participants_task ON participants(task_id);
 
--- Artifacts (documents/livrables liés à une tâche : plan, audit, rapport...).
-CREATE TABLE IF NOT EXISTS artifacts (
-  id          INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
-  artifact_id TEXT PRIMARY KEY,
-  task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  kind        TEXT NOT NULL,              -- plan | audit | report | autre
-  title       TEXT,
-  path        TEXT NOT NULL,
-  created_at  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+-- LEGACY : l'ancien bloc `artifacts (task_id NOT NULL)` a été remplacé par la
+-- table polymorphe définie plus haut (T-20260920-162801-jxtr). La colonne
+-- `task_id` est neutralisée (renommée `legacy_task_id`) sur les bases
+-- existantes par `scripts/artifacts-fusion-migration.mjs neutralize`.
 
 -- Tâches liées (tâches associées à une tâche, avec nature de la liaison).
 -- Permet à atomic-plan d'exploiter les tâches sources (commits, plans, docs).
@@ -383,19 +368,10 @@ CREATE TABLE IF NOT EXISTS recette_items (
 );
 CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id);
 
--- Documents rattachés à une recette (importés ou liés à un artefact existant),
--- avec la NATURE de la liaison (à quoi sert le document / comment l'exploiter).
-CREATE TABLE IF NOT EXISTS recette_documents (
-  id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  recette_id  TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
-  title       TEXT,                          -- titre affiché (défaut : nom du fichier)
-  nature      TEXT,                          -- à quoi sert le doc / comment l'exploiter
-  source      TEXT NOT NULL DEFAULT 'import',-- import | artifact
-  path        TEXT,                          -- chemin du fichier
-  artifact_id TEXT,                          -- si lié à un artefact existant
-  created_at  TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_recette_documents_recette ON recette_documents(recette_id);
+-- LEGACY : `recette_documents` (documents de recette) est fusionnée dans
+-- `artifacts` (`doc_type` ∈ {recette_doc, recette_report}, `content_id` =
+-- recetteId) — T-20260920-162801-jxtr. Table neutralisée (renommée
+-- `legacy_recette_documents`) par le script de migration ; JAMAIS supprimée.
 
 -- Points de vigilance ADR remontés par les sessions de RECETTE / TEST (item 126) :
 -- une ADR MANQUANTE pour une entité réellement discutée, ou un CONFLIT d'ADR
