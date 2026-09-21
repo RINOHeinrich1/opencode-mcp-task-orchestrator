@@ -145,6 +145,39 @@ import {
   autoCloseExpiredSprints,
   reopenSprint,
   classifyEmergence,
+  // FONCTIONNALITÉS / RÈGLES / LIAISONS (T5) — CRUD + liens N:N + workflow ADR.
+  registerFeature,
+  updateFeature,
+  getFeature,
+  listFeatures,
+  registerRule,
+  updateRule,
+  getRule,
+  listRules,
+  linkFeatureRule,
+  unlinkFeatureRule,
+  linkFeatureGherkin,
+  unlinkFeatureGherkin,
+  linkFeatureAdr,
+  unlinkFeatureAdr,
+  linkFeatureSprint,
+  unlinkFeatureSprint,
+  linkRuleSprint,
+  unlinkRuleSprint,
+  linkTaskSprint,
+  unlinkTaskSprint,
+  linkTaskFeature,
+  unlinkTaskFeature,
+  proposeTaskAdr,
+  validateTaskAdr,
+  unlinkTaskAdr,
+  listTaskAdrs,
+  linkRecetteSprint,
+  unlinkRecetteSprint,
+  linkRecetteFeature,
+  unlinkRecetteFeature,
+  linkRecetteAdr,
+  unlinkRecetteAdr,
   ARTIFACT_SOURCES,
   ARTIFACT_KINDS,
   resolveDecisionAndTransition,
@@ -723,6 +756,406 @@ server.registerTool("sprint_attach_pieces", {
     const r = await attachPiecesToSprint(sprintId, { pieceIds, atInit: atInit === true, by });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
+});
+
+// ===========================================================================
+// Famille « FONCTIONNALITÉS / RÈGLES / LIAISONS » (ADR-001, T5). CRUD MCP
+// `feature_*` / `rule_*` au-dessus des tables T1 (`fonctionnalites`,
+// `regles_metier`) + outils de LIAISON sur les tables N:N T1. Règles :
+//   - PIÈCE SOURCE gardée (garde nature T2) + appartenance au projet ;
+//   - ÉMERGENCE réutilisant `classifyEmergence` (hors_sprint / apres_cloture),
+//     rattachable à un sprint ULTÉRIEUR (tools `*_sprint_link`) ;
+//   - LIEN ADR d'une tâche PROPOSÉ par l'agent (`task_adr_propose`) → EFFECTIF
+//     seulement après validation HUMAINE (`task_adr_validate`) ;
+//   - aucune création systématique d'ADR (liaison vers une ADR EXISTANTE).
+// La famille `sprint_*` (ci-dessus) et `adr_*` (ci-dessous) restent intactes.
+// ===========================================================================
+
+server.registerTool("feature_register", {
+  description: "CRÉE une FONCTIONNALITÉ (`US-xxx`, ADR-001 §3) : `projectId` + `ref` + `userStory` requis ; `role` libre ; `sourcedPieceId` = pièce client SOURCE (optionnelle) GARDÉE (garde nature T2 + appartenance au projet). ÉMERGENCE : hors sprint → `hors_sprint` ; dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et rattachée au sprint courant. `ref` dupliquée pour le projet → erreur. Retourne le détail (liens inclus).",
+  inputSchema: {
+    projectId: z.string().describe("Projet de la fonctionnalité."),
+    ref: z.string().describe("Référence de la fonctionnalité (ex. US-xxx)."),
+    role: z.string().optional().describe("Rôle / acteur de la fonctionnalité."),
+    userStory: z.string().describe("User story (formulation du besoin)."),
+    sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
+    createdBy: z.string().optional().describe("Acteur créateur."),
+  },
+}, async ({ projectId, ref, role, userStory, sourcedPieceId, createdBy }) => {
+  try {
+    const feature = await registerFeature({ projectId, ref, role, userStory, sourcedPieceId, createdBy });
+    return text(JSON.stringify({ ok: true, feature }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_update", {
+  description: "MODIFIE partiellement une FONCTIONNALITÉ (champs fournis uniquement) : `ref`, `role`, `userStory`, `sourcedPieceId` (re-gardée). `updated_at` posé. Retourne le détail.",
+  inputSchema: {
+    featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
+    ref: z.string().optional().describe("Nouvelle référence (US-xxx)."),
+    role: z.string().optional().describe("Nouveau rôle."),
+    userStory: z.string().optional().describe("Nouvelle user story."),
+    sourcedPieceId: z.string().optional().describe("Nouvelle pièce source (gardée) ; vide pour détacher."),
+    by: z.string().optional().describe("Acteur de la modification."),
+  },
+}, async ({ featureId, ref, role, userStory, sourcedPieceId, by }) => {
+  try {
+    const feature = await updateFeature({ featureId, ref, role, userStory, sourcedPieceId, by });
+    return text(JSON.stringify({ ok: true, feature }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_get", {
+  description: "DÉTAIL d'une FONCTIONNALITÉ + liens : règles métier, scénarios Gherkin (`e2e_tests`), ADR, sprints, tâches, recettes. `err` si inconnue.",
+  inputSchema: { featureId: z.string().describe("Identifiant de la fonctionnalité.") },
+}, async ({ featureId }) => {
+  try {
+    const feature = await getFeature(featureId);
+    if (!feature) return err(`fonctionnalité inconnue : ${featureId}`);
+    return text(JSON.stringify({ ok: true, feature }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_list", {
+  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Retourne `{ count, features }`.",
+  inputSchema: {
+    projectId: z.string().describe("Projet dont on liste les fonctionnalités."),
+    emergent: z.boolean().optional().describe("Filtre émergence."),
+    search: z.string().optional().describe("Recherche texte (ref/user_story)."),
+    limit: z.number().optional().describe("Nombre max (défaut 500)."),
+  },
+}, async ({ projectId, emergent, search, limit }) => {
+  try {
+    const features = await listFeatures({ projectId, emergent, search, limit });
+    return text(JSON.stringify({ count: features.length, features }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_register", {
+  description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
+  inputSchema: {
+    projectId: z.string().describe("Projet de la règle."),
+    ref: z.string().describe("Référence de la règle (ex. RM-xxxx)."),
+    content: z.string().describe("Contenu de la règle métier."),
+    sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
+    createdBy: z.string().optional().describe("Acteur créateur."),
+  },
+}, async ({ projectId, ref, content, sourcedPieceId, createdBy }) => {
+  try {
+    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, createdBy });
+    return text(JSON.stringify({ ok: true, rule }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_update", {
+  description: "MODIFIE partiellement une RÈGLE MÉTIER (champs fournis uniquement) : `ref`, `content`, `sourcedPieceId` (re-gardée). `updated_at` posé. Retourne le détail.",
+  inputSchema: {
+    ruleId: z.string().describe("Identifiant de la règle (RMET-<ts>-<rand>)."),
+    ref: z.string().optional().describe("Nouvelle référence (RM-xxxx)."),
+    content: z.string().optional().describe("Nouveau contenu."),
+    sourcedPieceId: z.string().optional().describe("Nouvelle pièce source (gardée) ; vide pour détacher."),
+    by: z.string().optional().describe("Acteur de la modification."),
+  },
+}, async ({ ruleId, ref, content, sourcedPieceId, by }) => {
+  try {
+    const rule = await updateRule({ ruleId, ref, content, sourcedPieceId, by });
+    return text(JSON.stringify({ ok: true, rule }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_get", {
+  description: "DÉTAIL d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse), sprints. `err` si inconnue.",
+  inputSchema: { ruleId: z.string().describe("Identifiant de la règle.") },
+}, async ({ ruleId }) => {
+  try {
+    const rule = await getRule(ruleId);
+    if (!rule) return err(`règle inconnue : ${ruleId}`);
+    return text(JSON.stringify({ ok: true, rule }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_list", {
+  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Retourne `{ count, rules }`.",
+  inputSchema: {
+    projectId: z.string().describe("Projet dont on liste les règles."),
+    emergent: z.boolean().optional().describe("Filtre émergence."),
+    search: z.string().optional().describe("Recherche texte (ref/content)."),
+    limit: z.number().optional().describe("Nombre max (défaut 500)."),
+  },
+}, async ({ projectId, emergent, search, limit }) => {
+  try {
+    const rules = await listRules({ projectId, emergent, search, limit });
+    return text(JSON.stringify({ count: rules.length, rules }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_rule_link", {
+  description: "LIE une FONCTIONNALITÉ à une RÈGLE MÉTIER (N:N `fonctionnalite_regles`, idempotent). Valide les 2 extrémités.",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    regleId: z.string().describe("Règle métier."),
+  },
+}, async ({ featureId, regleId }) => {
+  try { return text(JSON.stringify(await linkFeatureRule({ featureId, regleId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_rule_unlink", {
+  description: "DÉLIE une FONCTIONNALITÉ d'une RÈGLE MÉTIER (`fonctionnalite_regles`).",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    regleId: z.string().describe("Règle métier."),
+  },
+}, async ({ featureId, regleId }) => {
+  try { return text(JSON.stringify(await unlinkFeatureRule({ featureId, regleId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_gherkin_link", {
+  description: "LIE une FONCTIONNALITÉ à un SCÉNARIO GHERKIN EXISTANT (`fonctionnalite_gherkin` → `e2e_tests`, N:N, idempotent). AUCUNE création de test : le test E2E doit EXISTER (`e2eTestId`).",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    e2eTestId: z.string().describe("Test E2E existant (scénario Gherkin)."),
+  },
+}, async ({ featureId, e2eTestId }) => {
+  try { return text(JSON.stringify(await linkFeatureGherkin({ featureId, e2eTestId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_gherkin_unlink", {
+  description: "DÉLIE une FONCTIONNALITÉ d'un SCÉNARIO GHERKIN (`fonctionnalite_gherkin`).",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    e2eTestId: z.string().describe("Test E2E."),
+  },
+}, async ({ featureId, e2eTestId }) => {
+  try { return text(JSON.stringify(await unlinkFeatureGherkin({ featureId, e2eTestId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_adr_link", {
+  description: "LIE une FONCTIONNALITÉ à une ADR EXISTANTE (N:N `fonctionnalite_adr`, idempotent). L'ADR doit exister (`kind='adr-tech'`).",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    adrId: z.string().describe("docId de l'ADR (kind='adr-tech')."),
+  },
+}, async ({ featureId, adrId }) => {
+  try { return text(JSON.stringify(await linkFeatureAdr({ featureId, adrId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_adr_unlink", {
+  description: "DÉLIE une FONCTIONNALITÉ d'une ADR (`fonctionnalite_adr`). Une ADR garde ≥1 fonctionnalité : si c'est la DERNIÈRE, l'erreur du trigger T1 est remontée telle quelle (aucun contournement).",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    adrId: z.string().describe("docId de l'ADR."),
+  },
+}, async ({ featureId, adrId }) => {
+  try { return text(JSON.stringify(await unlinkFeatureAdr({ featureId, adrId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_sprint_link", {
+  description: "RATTACHE une FONCTIONNALITÉ (souvent émergente) à un SPRINT ULTÉRIEUR (`sprint_fonctionnalites`, idempotent). N'EFFACE PAS le flag `emergent` (traçabilité conservée).",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    sprintId: z.string().describe("Sprint cible."),
+  },
+}, async ({ featureId, sprintId }) => {
+  try { return text(JSON.stringify(await linkFeatureSprint({ featureId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_sprint_unlink", {
+  description: "DÉTACHE une FONCTIONNALITÉ d'un SPRINT (`sprint_fonctionnalites`).",
+  inputSchema: {
+    featureId: z.string().describe("Fonctionnalité."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ featureId, sprintId }) => {
+  try { return text(JSON.stringify(await unlinkFeatureSprint({ featureId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_sprint_link", {
+  description: "RATTACHE une RÈGLE MÉTIER (souvent émergente) à un SPRINT ULTÉRIEUR (`sprint_regles`, idempotent). N'EFFACE PAS le flag `emergent`.",
+  inputSchema: {
+    regleId: z.string().describe("Règle métier."),
+    sprintId: z.string().describe("Sprint cible."),
+  },
+}, async ({ regleId, sprintId }) => {
+  try { return text(JSON.stringify(await linkRuleSprint({ regleId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_sprint_unlink", {
+  description: "DÉTACHE une RÈGLE MÉTIER d'un SPRINT (`sprint_regles`).",
+  inputSchema: {
+    regleId: z.string().describe("Règle métier."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ regleId, sprintId }) => {
+  try { return text(JSON.stringify(await unlinkRuleSprint({ regleId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_sprint_link", {
+  description: "LIE une TÂCHE à un SPRINT (`task_sprints`, idempotent). Valide la tâche et le sprint.",
+  inputSchema: {
+    taskId: z.string().describe("Tâche."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ taskId, sprintId }) => {
+  try { return text(JSON.stringify(await linkTaskSprint({ taskId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_sprint_unlink", {
+  description: "DÉLIE une TÂCHE d'un SPRINT (`task_sprints`).",
+  inputSchema: {
+    taskId: z.string().describe("Tâche."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ taskId, sprintId }) => {
+  try { return text(JSON.stringify(await unlinkTaskSprint({ taskId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_feature_link", {
+  description: "LIE une TÂCHE à une FONCTIONNALITÉ (`task_fonctionnalites`, idempotent) — alimente `sprint_report` (fonctionnalités implémentées).",
+  inputSchema: {
+    taskId: z.string().describe("Tâche."),
+    featureId: z.string().describe("Fonctionnalité."),
+  },
+}, async ({ taskId, featureId }) => {
+  try { return text(JSON.stringify(await linkTaskFeature({ taskId, featureId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_feature_unlink", {
+  description: "DÉLIE une TÂCHE d'une FONCTIONNALITÉ (`task_fonctionnalites`).",
+  inputSchema: {
+    taskId: z.string().describe("Tâche."),
+    featureId: z.string().describe("Fonctionnalité."),
+  },
+}, async ({ taskId, featureId }) => {
+  try { return text(JSON.stringify(await unlinkTaskFeature({ taskId, featureId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_adr_propose", {
+  description: "PROPOSE (action AGENT) un LIEN ADR sur une TÂCHE vers une ADR EXISTANTE (`kind='adr-tech'`) : `task_adr.status='propose'` (NON effectif). Idempotent ; ne rétrograde JAMAIS un lien déjà `valide`. AUCUNE création d'ADR : si aucune ADR pertinente n'existe, utiliser `adr_register` + `adr_report_missing`. Le lien devient EFFECTIF seulement après `task_adr_validate` (action HUMAINE).",
+  inputSchema: {
+    taskId: z.string().describe("Tâche concernée."),
+    adrId: z.string().describe("docId de l'ADR EXISTANTE (kind='adr-tech')."),
+    reason: z.string().optional().describe("Raison de la proposition (pertinence de l'ADR)."),
+    by: z.string().optional().describe("Agent proposant (ex. build-notify, agent-recette)."),
+  },
+}, async ({ taskId, adrId, reason, by }) => {
+  try { return text(JSON.stringify(await proposeTaskAdr({ taskId, adrId, reason, by }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_adr_validate", {
+  description: "VALIDE (action HUMAINE, en recette) un lien ADR PROPOSÉ sur une tâche : `task_adr.status='valide'` + `validated_by`/`validated_at` ⇒ lien EFFECTIF. Erreur si AUCUNE proposition n'existe (utiliser `task_adr_propose` d'abord).",
+  inputSchema: {
+    taskId: z.string().describe("Tâche concernée."),
+    adrId: z.string().describe("docId de l'ADR proposée."),
+    by: z.string().optional().describe("Acteur humain validant (défaut : human)."),
+  },
+}, async ({ taskId, adrId, by }) => {
+  try { return text(JSON.stringify(await validateTaskAdr({ taskId, adrId, by: by || "human" }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_adr_unlink", {
+  description: "DÉLIE un lien ADR d'une TÂCHE (`task_adr`) — proposé ou validé.",
+  inputSchema: {
+    taskId: z.string().describe("Tâche."),
+    adrId: z.string().describe("docId de l'ADR."),
+  },
+}, async ({ taskId, adrId }) => {
+  try { return text(JSON.stringify(await unlinkTaskAdr({ taskId, adrId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("task_adr_list", {
+  description: "LISTE les liens ADR d'une TÂCHE avec leur état tracé : `status` (`propose` = proposé par l'agent, NON effectif ; `valide` = validé par l'humain, EFFECTIF), `effective`, `reason`, `proposed_by/at`, `validated_by/at`. Filtre `status`.",
+  inputSchema: {
+    taskId: z.string().describe("Tâche dont on liste les liens ADR."),
+    status: z.enum(["propose", "valide"]).optional().describe("Filtre par état du lien."),
+  },
+}, async ({ taskId, status }) => {
+  try {
+    const adrs = await listTaskAdrs({ taskId, status });
+    return text(JSON.stringify({ count: adrs.length, adrs }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("recette_sprint_link", {
+  description: "LIE une RECETTE à un SPRINT (`recette_sprints`, idempotent). Valide la recette et le sprint.",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ recetteId, sprintId }) => {
+  try { return text(JSON.stringify(await linkRecetteSprint({ recetteId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("recette_sprint_unlink", {
+  description: "DÉLIE une RECETTE d'un SPRINT (`recette_sprints`).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ recetteId, sprintId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteSprint({ recetteId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("recette_feature_link", {
+  description: "LIE une RECETTE à une FONCTIONNALITÉ (`recette_fonctionnalites`, idempotent).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    featureId: z.string().describe("Fonctionnalité."),
+  },
+}, async ({ recetteId, featureId }) => {
+  try { return text(JSON.stringify(await linkRecetteFeature({ recetteId, featureId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("recette_feature_unlink", {
+  description: "DÉLIE une RECETTE d'une FONCTIONNALITÉ (`recette_fonctionnalites`).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    featureId: z.string().describe("Fonctionnalité."),
+  },
+}, async ({ recetteId, featureId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteFeature({ recetteId, featureId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("recette_adr_link", {
+  description: "LIE une RECETTE à une ADR EXISTANTE (`recette_adr`, idempotent).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    adrId: z.string().describe("docId de l'ADR (kind='adr-tech')."),
+  },
+}, async ({ recetteId, adrId }) => {
+  try { return text(JSON.stringify(await linkRecetteAdr({ recetteId, adrId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("recette_adr_unlink", {
+  description: "DÉLIE une RECETTE d'une ADR (`recette_adr`).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    adrId: z.string().describe("docId de l'ADR."),
+  },
+}, async ({ recetteId, adrId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteAdr({ recetteId, adrId }), null, 2)); }
+  catch (e) { return err(e.message); }
 });
 
 // ===========================================================================

@@ -596,6 +596,18 @@ $$ LANGUAGE plpgsql`);
     PRIMARY KEY (task_id, adr_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_task_adr_adr ON task_adr(adr_id)");
+  // Lien ADR d'une TÂCHE — workflow PROPOSÉ → VALIDÉ (ADR-001 §5, T5/A001) :
+  // l'agent PROPOSE un lien vers une ADR EXISTANTE (`status='propose'`, non
+  // effectif) ; l'humain VALIDE en recette (`status='valide'` ⇒ effectif).
+  // Additif : aucune colonne existante n'est modifiée. Posé ici (migrate(),
+  // exécuté après schema.sql) — miroir `schema.sql` à prévoir en suivi.
+  await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'propose'");
+  await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS proposed_by TEXT");
+  await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS proposed_at TEXT");
+  await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS validated_by TEXT");
+  await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS validated_at TEXT");
+  await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS reason TEXT");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_task_adr_status ON task_adr(status)");
   await pool().query(`CREATE TABLE IF NOT EXISTS recette_sprints (
     recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
     sprint_id  TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
@@ -1202,6 +1214,720 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
   list("Recettes", sections.recettes, (r) => `\`${r.recetteId}\` — ${r.title || ""} (${r.status || "?"})`);
 
   return { sprint, stats, sections, markdown: md.join("\n") };
+}
+
+// ===========================================================================
+// FONCTIONNALITÉS / RÈGLES MÉTIER / LIAISONS (ADR-001, T5). CRUD MCP au-dessus
+// des tables T1 (`fonctionnalites`, `regles_metier`) + outils de LIAISON sur
+// les tables N:N T1. Règles structurantes :
+//   - PIÈCE SOURCE gardée par la garde T2 (`assertAttachablePiece`) ;
+//   - ÉMERGENCE réutilisant `classifyEmergence` (`hors_sprint`/`apres_cloture`),
+//     jamais bloquante ni rétroactive, rattachable à un sprint ULTÉRIEUR ;
+//   - LIEN ADR d'une tâche PROPOSÉ par l'agent → EFFECTIF après validation
+//     humaine (`task_adr.status` : `propose` → `valide`) ;
+//   - aucune création systématique d'ADR (liaison vers une ADR EXISTANTE).
+// NE TOUCHE PAS la famille ADR (`artifacts` doc_type='adr', `adr_*`).
+// ===========================================================================
+
+// Sérialise une ligne `fonctionnalites` → fonctionnalité (camelCase).
+function rowToFonctionnalite(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    project: r.project,
+    ref: r.ref,
+    role: r.role ?? null,
+    userStory: r.user_story,
+    sourcedPieceId: r.sourced_piece_id ?? null,
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at ?? null,
+    createdBy: r.created_by ?? null,
+  };
+}
+
+// Sérialise une ligne `regles_metier` → règle métier (camelCase).
+function rowToRegle(r) {
+  if (!r) return null;
+  return {
+    id: r.id,
+    project: r.project,
+    ref: r.ref,
+    content: r.content,
+    sourcedPieceId: r.sourced_piece_id ?? null,
+    emergent: !!r.emergent,
+    emergentOrigin: r.emergent_origin ?? null,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at ?? null,
+    createdBy: r.created_by ?? null,
+  };
+}
+
+// GARDE d'appartenance : la pièce SOURCE d'une fonctionnalité/règle doit
+// appartenir au PROJET (pièce `piece` : `content_id = projectId` ; doc ADR-12
+// requalifié : lien `artifact_projects`). Lève une erreur explicite sinon.
+async function assertPieceOwnedByProject(pieceId, projectId) {
+  const r = (await pool().query(
+    `SELECT 1 FROM artifacts a
+      WHERE a.artifact_id = $1
+        AND (a.content_id = $2
+             OR EXISTS (SELECT 1 FROM artifact_projects ap
+                         WHERE ap.artifact_id = a.artifact_id AND ap.project_id = $2))
+      LIMIT 1`, [String(pieceId), String(projectId)],
+  )).rows[0];
+  if (!r) throw new Error(`pièce source ${pieceId} non rattachée au projet ${projectId}`);
+  return true;
+}
+
+// CRÉATION d'une FONCTIONNALITÉ (`US-xxx`, ADR-001 §3). `projectId` + `ref` +
+// `userStory` requis ; `role` libre ; `sourcedPieceId` optionnel mais GARDÉ
+// (garde nature T2 `assertAttachablePiece` + appartenance au projet).
+// ÉMERGENCE (`classifyEmergence`, kind='element') : hors sprint → `hors_sprint`,
+// dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et
+// rattachée au sprint courant (`sprint_fonctionnalites`). `organization_id`
+// héritée du projet. `ref` déjà utilisée pour le projet → erreur explicite.
+export async function registerFeature({ projectId, ref, role, userStory, sourcedPieceId, createdBy } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  await assertProjectExists(pid);
+  const rf = ref ? String(ref).trim() : "";
+  if (!rf) throw new Error("ref requise (ex. US-xxx)");
+  const us = userStory ? String(userStory).trim() : "";
+  if (!us) throw new Error("userStory requise");
+
+  let pieceId = null;
+  if (sourcedPieceId !== undefined && sourcedPieceId !== null && String(sourcedPieceId).trim()) {
+    const id = String(sourcedPieceId).trim();
+    await assertAttachablePiece(id); // garde nature (T2)
+    await assertPieceOwnedByProject(id, pid); // appartenance au projet
+    pieceId = id;
+  }
+  const dup = (await pool().query(
+    "SELECT id FROM fonctionnalites WHERE project = $1 AND ref = $2", [pid, rf],
+  )).rows[0];
+  if (dup) throw new Error(`référence déjà utilisée pour le projet ${pid} : ${rf} (${dup.id})`);
+
+  const em = await classifyEmergence(pid, { kind: "element" });
+  const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
+  const id = `FEAT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const ts = nowIso();
+  await pool().query(
+    `INSERT INTO fonctionnalites
+       (id, project, ref, role, user_story, sourced_piece_id, emergent, emergent_origin, organization_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    [id, pid, rf, role ? String(role).trim() : null, us, pieceId, em.emergent ? 1 : 0, em.emergentOrigin, org, ts, createdBy ?? null],
+  );
+  // Non émergente (sprint ouvert) → rattachement au sprint courant.
+  if (!em.emergent && em.sprintId) {
+    await pool().query(
+      "INSERT INTO sprint_fonctionnalites (sprint_id, fonctionnalite_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+      [em.sprintId, id],
+    );
+  }
+  return getFeature(id);
+}
+
+// MODIFICATION partielle d'une FONCTIONNALITÉ (champs fournis uniquement).
+// Re-gardage de la pièce source si elle change (projet inchangé) ; `updated_at`.
+export async function updateFeature({ featureId, ref, role, userStory, sourcedPieceId, by } = {}) {
+  await ensureSchema();
+  if (!featureId) throw new Error("featureId requis");
+  const cur = (await pool().query("SELECT * FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
+  if (!cur) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const sets = [];
+  const params = [];
+  if (ref !== undefined) {
+    const rf = ref ? String(ref).trim() : "";
+    if (!rf) throw new Error("ref ne peut être vide");
+    if (rf !== cur.ref) {
+      const dup = (await pool().query(
+        "SELECT id FROM fonctionnalites WHERE project = $1 AND ref = $2 AND id <> $3", [cur.project, rf, cur.id],
+      )).rows[0];
+      if (dup) throw new Error(`référence déjà utilisée pour le projet ${cur.project} : ${rf} (${dup.id})`);
+      params.push(rf); sets.push(`ref = $${params.length}`);
+    }
+  }
+  if (role !== undefined) { params.push(role ? String(role).trim() : null); sets.push(`role = $${params.length}`); }
+  if (userStory !== undefined) {
+    const us = userStory ? String(userStory).trim() : "";
+    if (!us) throw new Error("userStory ne peut être vide");
+    params.push(us); sets.push(`user_story = $${params.length}`);
+  }
+  if (sourcedPieceId !== undefined) {
+    if (sourcedPieceId === null || sourcedPieceId === "" || !String(sourcedPieceId).trim()) {
+      params.push(null); sets.push(`sourced_piece_id = $${params.length}`);
+    } else {
+      const id = String(sourcedPieceId).trim();
+      await assertAttachablePiece(id);
+      await assertPieceOwnedByProject(id, cur.project);
+      params.push(id); sets.push(`sourced_piece_id = $${params.length}`);
+    }
+  }
+  if (!sets.length) return getFeature(cur.id);
+  const ts = nowIso();
+  params.push(ts); const tsIdx = params.length;
+  params.push(cur.id); const idIdx = params.length;
+  await pool().query(`UPDATE fonctionnalites SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
+  void by;
+  return getFeature(cur.id);
+}
+
+// LECTURE détaillée d'une FONCTIONNALITÉ + liens : règles, scénarios Gherkin
+// (`e2e_tests`), ADR, sprints, tâches, recettes. `null` si inconnue.
+export async function getFeature(featureId) {
+  await ensureSchema();
+  if (!featureId) return null;
+  const row = (await pool().query("SELECT * FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
+  if (!row) return null;
+  const feature = rowToFonctionnalite(row);
+  const [regleRows, gherkinRows, adrRows, sprintRows, taskRows, recetteRows] = await Promise.all([
+    pool().query(
+      `SELECT r.* FROM regles_metier r
+         JOIN fonctionnalite_regles fr ON fr.regle_id = r.id
+        WHERE fr.fonctionnalite_id = $1 ORDER BY r.ref ASC`, [feature.id]),
+    pool().query(
+      `SELECT e.id, e.project, e.spec_file, e.scenario, e.title, e.status, e.gherkin
+         FROM e2e_tests e JOIN fonctionnalite_gherkin fg ON fg.e2e_test_id = e.id
+        WHERE fg.fonctionnalite_id = $1 ORDER BY e.id ASC`, [feature.id]),
+    pool().query(
+      `SELECT a.artifact_id, a.title, a.doc_type, a.kind, a.path
+         FROM artifacts a JOIN fonctionnalite_adr fa ON fa.adr_id = a.artifact_id
+        WHERE fa.fonctionnalite_id = $1 ORDER BY a.artifact_id ASC`, [feature.id]),
+    pool().query(
+      `SELECT s.* FROM sprints s JOIN sprint_fonctionnalites sf ON sf.sprint_id = s.id
+        WHERE sf.fonctionnalite_id = $1 ORDER BY s.created_at ASC`, [feature.id]),
+    pool().query(
+      `SELECT t.id, t.title, t.request, t.project, t.emergent, t.emergent_origin
+         FROM tasks t JOIN task_fonctionnalites tf ON tf.task_id = t.id
+        WHERE tf.fonctionnalite_id = $1 ORDER BY t.created_at ASC, t.id ASC`, [feature.id]),
+    pool().query(
+      `SELECT r.recette_id, r.title, r.status FROM recettes r
+         JOIN recette_fonctionnalites rf ON rf.recette_id = r.recette_id
+        WHERE rf.fonctionnalite_id = $1 ORDER BY r.created_at ASC`, [feature.id]),
+  ]);
+  return {
+    ...feature,
+    regles: regleRows.rows.map(rowToRegle),
+    gherkin: gherkinRows.rows.map((g) => ({
+      e2eTestId: g.id, project: g.project, specFile: g.spec_file, scenario: g.scenario,
+      title: g.title ?? null, status: g.status, gherkin: g.gherkin ?? null,
+    })),
+    adrs: adrRows.rows.map((a) => ({ adrId: a.artifact_id, title: a.title ?? null, docType: a.doc_type, kind: a.kind ?? null, path: a.path ?? null })),
+    sprints: sprintRows.rows.map(rowToSprint),
+    tasks: taskRows.rows.map((t) => ({ id: t.id, title: t.title ?? null, request: t.request ?? null, project: t.project ?? null, emergent: !!t.emergent, emergentOrigin: t.emergent_origin ?? null })),
+    recettes: recetteRows.rows.map((r) => ({ recetteId: r.recette_id, title: r.title ?? null, status: r.status ?? null })),
+  };
+}
+
+// LISTE des fonctionnalités d'un projet. Filtres : `emergent`, recherche
+// (`ref`/`user_story`), `limit` (défaut 500). Tri stable (`ref`, `created_at`).
+export async function listFeatures({ projectId, emergent, search, limit } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const params = [String(projectId).trim()];
+  let where = "project = $1";
+  if (emergent !== undefined && emergent !== null) {
+    params.push(emergent ? 1 : 0);
+    where += ` AND emergent = $${params.length}`;
+  }
+  if (search && String(search).trim()) {
+    params.push(`%${String(search).trim()}%`);
+    where += ` AND (ref ILIKE $${params.length} OR user_story ILIKE $${params.length})`;
+  }
+  const lim = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : 500;
+  params.push(lim);
+  const rows = (await pool().query(
+    `SELECT * FROM fonctionnalites WHERE ${where} ORDER BY ref ASC, created_at ASC LIMIT $${params.length}`, params,
+  )).rows;
+  return rows.map(rowToFonctionnalite);
+}
+
+// CRÉATION d'une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3). Mêmes gardes que
+// `registerFeature` (projet, pièce source, émergence). Non émergente ⇒ lien
+// `sprint_regles` au sprint ouvert.
+export async function registerRule({ projectId, ref, content, sourcedPieceId, createdBy } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const pid = String(projectId).trim();
+  await assertProjectExists(pid);
+  const rf = ref ? String(ref).trim() : "";
+  if (!rf) throw new Error("ref requise (ex. RM-xxxx)");
+  const ct = content ? String(content).trim() : "";
+  if (!ct) throw new Error("content requis");
+
+  let pieceId = null;
+  if (sourcedPieceId !== undefined && sourcedPieceId !== null && String(sourcedPieceId).trim()) {
+    const id = String(sourcedPieceId).trim();
+    await assertAttachablePiece(id);
+    await assertPieceOwnedByProject(id, pid);
+    pieceId = id;
+  }
+  const dup = (await pool().query(
+    "SELECT id FROM regles_metier WHERE project = $1 AND ref = $2", [pid, rf],
+  )).rows[0];
+  if (dup) throw new Error(`référence déjà utilisée pour le projet ${pid} : ${rf} (${dup.id})`);
+
+  const em = await classifyEmergence(pid, { kind: "element" });
+  const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
+  const id = `RMET-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const ts = nowIso();
+  await pool().query(
+    `INSERT INTO regles_metier
+       (id, project, ref, content, sourced_piece_id, emergent, emergent_origin, organization_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [id, pid, rf, ct, pieceId, em.emergent ? 1 : 0, em.emergentOrigin, org, ts, createdBy ?? null],
+  );
+  if (!em.emergent && em.sprintId) {
+    await pool().query(
+      "INSERT INTO sprint_regles (sprint_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+      [em.sprintId, id],
+    );
+  }
+  return getRule(id);
+}
+
+// MODIFICATION partielle d'une RÈGLE MÉTIER ; re-gardage de la pièce source.
+export async function updateRule({ ruleId, ref, content, sourcedPieceId, by } = {}) {
+  await ensureSchema();
+  if (!ruleId) throw new Error("ruleId requis");
+  const cur = (await pool().query("SELECT * FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
+  if (!cur) throw new Error(`règle inconnue : ${ruleId}`);
+  const sets = [];
+  const params = [];
+  if (ref !== undefined) {
+    const rf = ref ? String(ref).trim() : "";
+    if (!rf) throw new Error("ref ne peut être vide");
+    if (rf !== cur.ref) {
+      const dup = (await pool().query(
+        "SELECT id FROM regles_metier WHERE project = $1 AND ref = $2 AND id <> $3", [cur.project, rf, cur.id],
+      )).rows[0];
+      if (dup) throw new Error(`référence déjà utilisée pour le projet ${cur.project} : ${rf} (${dup.id})`);
+      params.push(rf); sets.push(`ref = $${params.length}`);
+    }
+  }
+  if (content !== undefined) {
+    const ct = content ? String(content).trim() : "";
+    if (!ct) throw new Error("content ne peut être vide");
+    params.push(ct); sets.push(`content = $${params.length}`);
+  }
+  if (sourcedPieceId !== undefined) {
+    if (sourcedPieceId === null || sourcedPieceId === "" || !String(sourcedPieceId).trim()) {
+      params.push(null); sets.push(`sourced_piece_id = $${params.length}`);
+    } else {
+      const id = String(sourcedPieceId).trim();
+      await assertAttachablePiece(id);
+      await assertPieceOwnedByProject(id, cur.project);
+      params.push(id); sets.push(`sourced_piece_id = $${params.length}`);
+    }
+  }
+  if (!sets.length) return getRule(cur.id);
+  const ts = nowIso();
+  params.push(ts); const tsIdx = params.length;
+  params.push(cur.id); const idIdx = params.length;
+  await pool().query(`UPDATE regles_metier SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
+  void by;
+  return getRule(cur.id);
+}
+
+// LECTURE détaillée d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse),
+// sprints. `null` si inconnue.
+export async function getRule(ruleId) {
+  await ensureSchema();
+  if (!ruleId) return null;
+  const row = (await pool().query("SELECT * FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
+  if (!row) return null;
+  const regle = rowToRegle(row);
+  const [featRows, sprintRows] = await Promise.all([
+    pool().query(
+      `SELECT f.* FROM fonctionnalites f
+         JOIN fonctionnalite_regles fr ON fr.fonctionnalite_id = f.id
+        WHERE fr.regle_id = $1 ORDER BY f.ref ASC`, [regle.id]),
+    pool().query(
+      `SELECT s.* FROM sprints s JOIN sprint_regles sr ON sr.sprint_id = s.id
+        WHERE sr.regle_id = $1 ORDER BY s.created_at ASC`, [regle.id]),
+  ]);
+  return {
+    ...regle,
+    fonctionnalites: featRows.rows.map(rowToFonctionnalite),
+    sprints: sprintRows.rows.map(rowToSprint),
+  };
+}
+
+// LISTE des règles métier d'un projet. Filtres : `emergent`, recherche
+// (`ref`/`content`), `limit` (défaut 500).
+export async function listRules({ projectId, emergent, search, limit } = {}) {
+  await ensureSchema();
+  if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
+  const params = [String(projectId).trim()];
+  let where = "project = $1";
+  if (emergent !== undefined && emergent !== null) {
+    params.push(emergent ? 1 : 0);
+    where += ` AND emergent = $${params.length}`;
+  }
+  if (search && String(search).trim()) {
+    params.push(`%${String(search).trim()}%`);
+    where += ` AND (ref ILIKE $${params.length} OR content ILIKE $${params.length})`;
+  }
+  const lim = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.floor(Number(limit)) : 500;
+  params.push(lim);
+  const rows = (await pool().query(
+    `SELECT * FROM regles_metier WHERE ${where} ORDER BY ref ASC, created_at ASC LIMIT $${params.length}`, params,
+  )).rows;
+  return rows.map(rowToRegle);
+}
+
+// --- Liaisons N:N (T1) ------------------------------------------------------
+
+// Liaison FONCTIONNALITÉ ↔ RÈGLE MÉTIER (`fonctionnalite_regles`, idempotente).
+export async function linkFeatureRule({ featureId, regleId } = {}) {
+  await ensureSchema();
+  const f = await getFeature(featureId);
+  if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const r = await getRule(regleId);
+  if (!r) throw new Error(`règle inconnue : ${regleId}`);
+  const ins = await pool().query(
+    "INSERT INTO fonctionnalite_regles (fonctionnalite_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [f.id, r.id],
+  );
+  return { ok: true, featureId: f.id, regleId: r.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkFeatureRule({ featureId, regleId } = {}) {
+  await ensureSchema();
+  if (!featureId || !regleId) throw new Error("featureId et regleId requis");
+  const del = await pool().query(
+    "DELETE FROM fonctionnalite_regles WHERE fonctionnalite_id = $1 AND regle_id = $2",
+    [String(featureId), String(regleId)],
+  );
+  return { ok: true, featureId: String(featureId), regleId: String(regleId), unlinked: del.rowCount > 0 };
+}
+
+// Liaison FONCTIONNALITÉ ↔ SCÉNARIO GHERKIN EXISTANT (`fonctionnalite_gherkin`
+// → `e2e_tests`). AUCUNE création de test : le test doit EXISTER.
+export async function linkFeatureGherkin({ featureId, e2eTestId } = {}) {
+  await ensureSchema();
+  const f = await getFeature(featureId);
+  if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const t = await getE2ETestRow(String(e2eTestId ?? ""));
+  if (!t) throw new Error(`scénario Gherkin (test E2E) inconnu : ${e2eTestId}`);
+  const ins = await pool().query(
+    "INSERT INTO fonctionnalite_gherkin (fonctionnalite_id, e2e_test_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [f.id, t.id],
+  );
+  return { ok: true, featureId: f.id, e2eTestId: t.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkFeatureGherkin({ featureId, e2eTestId } = {}) {
+  await ensureSchema();
+  if (!featureId || !e2eTestId) throw new Error("featureId et e2eTestId requis");
+  const del = await pool().query(
+    "DELETE FROM fonctionnalite_gherkin WHERE fonctionnalite_id = $1 AND e2e_test_id = $2",
+    [String(featureId), String(e2eTestId)],
+  );
+  return { ok: true, featureId: String(featureId), e2eTestId: String(e2eTestId), unlinked: del.rowCount > 0 };
+}
+
+// Liaison FONCTIONNALITÉ ↔ ADR (`fonctionnalite_adr`). L'ADR doit EXISTER
+// (`getAdr`, kind='adr-tech'). `unlinkFeatureAdr` LAISSE REMONTER l'erreur du
+// trigger T1 `trg_fonctionnalite_adr_min` (une ADR garde ≥1 fonctionnalité).
+export async function linkFeatureAdr({ featureId, adrId } = {}) {
+  await ensureSchema();
+  const f = await getFeature(featureId);
+  if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const adr = await getAdr(adrId);
+  if (!adr) throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+  const ins = await pool().query(
+    "INSERT INTO fonctionnalite_adr (fonctionnalite_id, adr_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [f.id, adr.adrId],
+  );
+  return { ok: true, featureId: f.id, adrId: adr.adrId, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkFeatureAdr({ featureId, adrId } = {}) {
+  await ensureSchema();
+  if (!featureId || !adrId) throw new Error("featureId et adrId requis");
+  // Pas de contournement : si c'est la DERNIÈRE fonctionnalité de l'ADR, le
+  // trigger T1 lève une erreur explicite (remontée telle quelle).
+  const del = await pool().query(
+    "DELETE FROM fonctionnalite_adr WHERE fonctionnalite_id = $1 AND adr_id = $2",
+    [String(featureId), String(adrId)],
+  );
+  return { ok: true, featureId: String(featureId), adrId: String(adrId), unlinked: del.rowCount > 0 };
+}
+
+// Rattachement d'une FONCTIONNALITÉ (souvent émergente) à un SPRINT
+// (`sprint_fonctionnalites`, ADR-001 §5). N'EFFACE PAS le flag `emergent`.
+export async function linkFeatureSprint({ featureId, sprintId } = {}) {
+  await ensureSchema();
+  const f = await getFeature(featureId);
+  if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const s = await getSprint(sprintId);
+  if (!s) throw new Error(`sprint inconnu : ${sprintId}`);
+  const ins = await pool().query(
+    "INSERT INTO sprint_fonctionnalites (sprint_id, fonctionnalite_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [s.id, f.id],
+  );
+  return { ok: true, featureId: f.id, sprintId: s.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkFeatureSprint({ featureId, sprintId } = {}) {
+  await ensureSchema();
+  if (!featureId || !sprintId) throw new Error("featureId et sprintId requis");
+  const del = await pool().query(
+    "DELETE FROM sprint_fonctionnalites WHERE sprint_id = $1 AND fonctionnalite_id = $2",
+    [String(sprintId), String(featureId)],
+  );
+  return { ok: true, featureId: String(featureId), sprintId: String(sprintId), unlinked: del.rowCount > 0 };
+}
+
+// Rattachement d'une RÈGLE MÉTIER (souvent émergente) à un SPRINT
+// (`sprint_regles`). N'EFFACE PAS le flag `emergent`.
+export async function linkRuleSprint({ regleId, sprintId } = {}) {
+  await ensureSchema();
+  const r = await getRule(regleId);
+  if (!r) throw new Error(`règle inconnue : ${regleId}`);
+  const s = await getSprint(sprintId);
+  if (!s) throw new Error(`sprint inconnu : ${sprintId}`);
+  const ins = await pool().query(
+    "INSERT INTO sprint_regles (sprint_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [s.id, r.id],
+  );
+  return { ok: true, regleId: r.id, sprintId: s.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkRuleSprint({ regleId, sprintId } = {}) {
+  await ensureSchema();
+  if (!regleId || !sprintId) throw new Error("regleId et sprintId requis");
+  const del = await pool().query(
+    "DELETE FROM sprint_regles WHERE sprint_id = $1 AND regle_id = $2",
+    [String(sprintId), String(regleId)],
+  );
+  return { ok: true, regleId: String(regleId), sprintId: String(sprintId), unlinked: del.rowCount > 0 };
+}
+
+// Liaison TÂCHE ↔ SPRINT (`task_sprints`).
+export async function linkTaskSprint({ taskId, sprintId } = {}) {
+  await ensureSchema();
+  await assertTaskExists(taskId);
+  const s = await getSprint(sprintId);
+  if (!s) throw new Error(`sprint inconnu : ${sprintId}`);
+  const ins = await pool().query(
+    "INSERT INTO task_sprints (task_id, sprint_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [String(taskId), s.id],
+  );
+  return { ok: true, taskId: String(taskId), sprintId: s.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkTaskSprint({ taskId, sprintId } = {}) {
+  await ensureSchema();
+  if (!taskId || !sprintId) throw new Error("taskId et sprintId requis");
+  const del = await pool().query(
+    "DELETE FROM task_sprints WHERE task_id = $1 AND sprint_id = $2",
+    [String(taskId), String(sprintId)],
+  );
+  return { ok: true, taskId: String(taskId), sprintId: String(sprintId), unlinked: del.rowCount > 0 };
+}
+
+// Liaison TÂCHE ↔ FONCTIONNALITÉ (`task_fonctionnalites`) — alimente
+// `buildSprintReport` (fonctionnalités implémentées).
+export async function linkTaskFeature({ taskId, featureId } = {}) {
+  await ensureSchema();
+  await assertTaskExists(taskId);
+  const f = await getFeature(featureId);
+  if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const ins = await pool().query(
+    "INSERT INTO task_fonctionnalites (task_id, fonctionnalite_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [String(taskId), f.id],
+  );
+  return { ok: true, taskId: String(taskId), featureId: f.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkTaskFeature({ taskId, featureId } = {}) {
+  await ensureSchema();
+  if (!taskId || !featureId) throw new Error("taskId et featureId requis");
+  const del = await pool().query(
+    "DELETE FROM task_fonctionnalites WHERE task_id = $1 AND fonctionnalite_id = $2",
+    [String(taskId), String(featureId)],
+  );
+  return { ok: true, taskId: String(taskId), featureId: String(featureId), unlinked: del.rowCount > 0 };
+}
+
+// --- Lien ADR d'une TÂCHE — workflow PROPOSÉ → VALIDÉ (A001/A019) -----------
+
+// PROPOSITION (action AGENT) : upsert `task_adr.status='propose'` vers une ADR
+// EXISTANTE (`getAdr`). Idempotent ; NE RÉTROGRADE JAMAIS un lien déjà `valide`.
+// Aucune création d'ADR : si aucune ADR pertinente n'existe, utiliser
+// `adr_register` + `adr_report_missing` (hors périmètre T5).
+export async function proposeTaskAdr({ taskId, adrId, reason, by } = {}) {
+  await ensureSchema();
+  await assertTaskExists(taskId);
+  if (!adrId) throw new Error("adrId requis");
+  const adr = await getAdr(adrId);
+  if (!adr) throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+  const tid = String(taskId);
+  const aid = adr.adrId;
+  const ts = nowIso();
+  const existing = (await pool().query(
+    "SELECT * FROM task_adr WHERE task_id = $1 AND adr_id = $2", [tid, aid],
+  )).rows[0];
+  if (existing) {
+    if (existing.status === "valide") {
+      return { ok: true, taskId: tid, adrId: aid, status: "valide", effective: true, unchanged: true };
+    }
+    await pool().query(
+      `UPDATE task_adr
+          SET status = 'propose',
+              proposed_by = COALESCE($3, proposed_by),
+              proposed_at = COALESCE(proposed_at, $4),
+              reason = COALESCE($5, reason)
+        WHERE task_id = $1 AND adr_id = $2`,
+      [tid, aid, by ?? null, ts, reason ?? null],
+    );
+    return { ok: true, taskId: tid, adrId: aid, status: "propose", effective: false, updated: true };
+  }
+  await pool().query(
+    `INSERT INTO task_adr (task_id, adr_id, status, proposed_by, proposed_at, reason)
+     VALUES ($1,$2,'propose',$3,$4,$5)`,
+    [tid, aid, by ?? null, ts, reason ?? null],
+  );
+  return { ok: true, taskId: tid, adrId: aid, status: "propose", effective: false, created: true };
+}
+
+// VALIDATION (action HUMAINE, en recette) : `status='valide'` + `validated_by`
+// / `validated_at` ⇒ lien EFFECTIF. Erreur si AUCUNE proposition n'existe.
+// Idempotent si le lien est déjà validé.
+export async function validateTaskAdr({ taskId, adrId, by } = {}) {
+  await ensureSchema();
+  await assertTaskExists(taskId);
+  if (!adrId) throw new Error("adrId requis");
+  const tid = String(taskId);
+  const aid = String(adrId);
+  const row = (await pool().query(
+    "SELECT * FROM task_adr WHERE task_id = $1 AND adr_id = $2", [tid, aid],
+  )).rows[0];
+  if (!row) {
+    throw new Error(`aucune proposition de lien ADR en attente pour la tâche ${tid} et l'ADR ${aid} (utiliser task_adr_propose d'abord)`);
+  }
+  if (row.status === "valide") {
+    return { ok: true, taskId: tid, adrId: aid, status: "valide", effective: true, alreadyValidated: true };
+  }
+  const ts = nowIso();
+  await pool().query(
+    "UPDATE task_adr SET status = 'valide', validated_by = $3, validated_at = $4 WHERE task_id = $1 AND adr_id = $2",
+    [tid, aid, by ?? null, ts],
+  );
+  return { ok: true, taskId: tid, adrId: aid, status: "valide", effective: true, validatedBy: by ?? null, validatedAt: ts };
+}
+
+export async function unlinkTaskAdr({ taskId, adrId } = {}) {
+  await ensureSchema();
+  if (!taskId || !adrId) throw new Error("taskId et adrId requis");
+  const del = await pool().query(
+    "DELETE FROM task_adr WHERE task_id = $1 AND adr_id = $2", [String(taskId), String(adrId)],
+  );
+  return { ok: true, taskId: String(taskId), adrId: String(adrId), unlinked: del.rowCount > 0 };
+}
+
+// LISTE des liens ADR d'une tâche, filtrable par statut ; `effective` = validé.
+export async function listTaskAdrs({ taskId, status } = {}) {
+  await ensureSchema();
+  if (!taskId) throw new Error("taskId requis");
+  const params = [String(taskId)];
+  let where = "ta.task_id = $1";
+  if (status) { params.push(String(status)); where += ` AND ta.status = $${params.length}`; }
+  const rows = (await pool().query(
+    `SELECT ta.task_id, ta.adr_id, ta.status, ta.proposed_by, ta.proposed_at,
+            ta.validated_by, ta.validated_at, ta.reason,
+            a.title AS adr_title, a.doc_type, a.kind, a.path
+       FROM task_adr ta
+       LEFT JOIN artifacts a ON a.artifact_id = ta.adr_id
+      WHERE ${where} ORDER BY ta.adr_id ASC`, params,
+  )).rows;
+  return rows.map((r) => ({
+    taskId: r.task_id,
+    adrId: r.adr_id,
+    status: r.status,
+    effective: r.status === "valide",
+    reason: r.reason ?? null,
+    proposedBy: r.proposed_by ?? null,
+    proposedAt: r.proposed_at ?? null,
+    validatedBy: r.validated_by ?? null,
+    validatedAt: r.validated_at ?? null,
+    adr: { adrId: r.adr_id, title: r.adr_title ?? null, docType: r.doc_type ?? null, kind: r.kind ?? null, path: r.path ?? null },
+  }));
+}
+
+// --- Liaisons RECETTE ↔ sprint / fonctionnalité(s) / ADR(s) -----------------
+
+export async function linkRecetteSprint({ recetteId, sprintId } = {}) {
+  await ensureSchema();
+  const rec = await getRecetteById(recetteId);
+  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const s = await getSprint(sprintId);
+  if (!s) throw new Error(`sprint inconnu : ${sprintId}`);
+  const ins = await pool().query(
+    "INSERT INTO recette_sprints (recette_id, sprint_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.recetteId, s.id],
+  );
+  return { ok: true, recetteId: rec.recetteId, sprintId: s.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkRecetteSprint({ recetteId, sprintId } = {}) {
+  await ensureSchema();
+  if (!recetteId || !sprintId) throw new Error("recetteId et sprintId requis");
+  const del = await pool().query(
+    "DELETE FROM recette_sprints WHERE recette_id = $1 AND sprint_id = $2",
+    [String(recetteId), String(sprintId)],
+  );
+  return { ok: true, recetteId: String(recetteId), sprintId: String(sprintId), unlinked: del.rowCount > 0 };
+}
+
+export async function linkRecetteFeature({ recetteId, featureId } = {}) {
+  await ensureSchema();
+  const rec = await getRecetteById(recetteId);
+  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const f = await getFeature(featureId);
+  if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const ins = await pool().query(
+    "INSERT INTO recette_fonctionnalites (recette_id, fonctionnalite_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.recetteId, f.id],
+  );
+  return { ok: true, recetteId: rec.recetteId, featureId: f.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkRecetteFeature({ recetteId, featureId } = {}) {
+  await ensureSchema();
+  if (!recetteId || !featureId) throw new Error("recetteId et featureId requis");
+  const del = await pool().query(
+    "DELETE FROM recette_fonctionnalites WHERE recette_id = $1 AND fonctionnalite_id = $2",
+    [String(recetteId), String(featureId)],
+  );
+  return { ok: true, recetteId: String(recetteId), featureId: String(featureId), unlinked: del.rowCount > 0 };
+}
+
+export async function linkRecetteAdr({ recetteId, adrId } = {}) {
+  await ensureSchema();
+  const rec = await getRecetteById(recetteId);
+  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const adr = await getAdr(adrId);
+  if (!adr) throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
+  const ins = await pool().query(
+    "INSERT INTO recette_adr (recette_id, adr_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.recetteId, adr.adrId],
+  );
+  return { ok: true, recetteId: rec.recetteId, adrId: adr.adrId, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkRecetteAdr({ recetteId, adrId } = {}) {
+  await ensureSchema();
+  if (!recetteId || !adrId) throw new Error("recetteId et adrId requis");
+  const del = await pool().query(
+    "DELETE FROM recette_adr WHERE recette_id = $1 AND adr_id = $2",
+    [String(recetteId), String(adrId)],
+  );
+  return { ok: true, recetteId: String(recetteId), adrId: String(adrId), unlinked: del.rowCount > 0 };
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -3779,6 +4505,24 @@ export async function getRecetteById(recetteId) {
   // Points de vigilance ADR (item 126) — historique append-only de la recette
   // (+ sous-ensemble OUVERT qui BLOQUE la terminaison).
   const adrVigilances = await listAdrVigilances({ recetteId });
+  // Liens N:N recette↔sprint / fonctionnalité(s) / ADR(s) (T5/A023) — lecture
+  // ADDITIVE des tables T1 (`recette_sprints`, `recette_fonctionnalites`,
+  // `recette_adr`). N'altère ni `recette_start` ni `recette_item_*`.
+  const [sprintRows, featureRows, adrRows] = await Promise.all([
+    pool().query(
+      `SELECT s.* FROM sprints s JOIN recette_sprints rs ON rs.sprint_id = s.id
+        WHERE rs.recette_id = $1 ORDER BY s.created_at ASC`, [recetteId]),
+    pool().query(
+      `SELECT f.* FROM fonctionnalites f JOIN recette_fonctionnalites rf ON rf.fonctionnalite_id = f.id
+        WHERE rf.recette_id = $1 ORDER BY f.ref ASC`, [recetteId]),
+    pool().query(
+      `SELECT a.artifact_id, a.title, a.doc_type, a.kind, a.path FROM artifacts a
+         JOIN recette_adr ra ON ra.adr_id = a.artifact_id
+        WHERE ra.recette_id = $1 ORDER BY a.artifact_id ASC`, [recetteId]),
+  ]);
+  const sprints = sprintRows.rows.map(rowToSprint);
+  const fonctionnalites = featureRows.rows.map(rowToFonctionnalite);
+  const adrs = adrRows.rows.map((a) => ({ adrId: a.artifact_id, title: a.title ?? null, docType: a.doc_type, kind: a.kind ?? null, path: a.path ?? null }));
   return {
     recetteId: r.recette_id,
     project: r.project,
@@ -3793,6 +4537,9 @@ export async function getRecetteById(recetteId) {
     tasks,
     items,
     documents,
+    sprints,
+    fonctionnalites,
+    adrs,
     adrVigilances,
     adrVigilancesOpen: adrVigilances.filter((v) => v.status === "open"),
   };
