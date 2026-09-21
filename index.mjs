@@ -118,6 +118,10 @@ import {
   registerAdr,
   setAdrStatus,
   attachAdr,
+  // CONVERSION D'ADR (ADR-001 §6) — A003/A004.
+  linkAdrConversion,
+  listAdrConversions,
+  convertAdr,
   reportAdrConflict,
   listAdrConflicts,
   reportAdrMissing,
@@ -146,6 +150,14 @@ import {
   reopenSprint,
   setSprintSession,
   classifyEmergence,
+  // SESSION DE MIGRATION DES ANCIENS SPRINTS (ADR-001 §6) — A005/A006/A007.
+  MIGRATION_STATUS,
+  startMigration,
+  getMigration,
+  listMigrations,
+  setMigrationSession,
+  finishMigration,
+  migrateProjectElementsToDefaultSprint,
   // CARDINALITÉS HEURISTIQUES + GOUVERNANCE DE L'ÉMERGENCE (T6, ADR-001 §5).
   EMERGENT_ORIGINS,
   CARDINALITY_RULES,
@@ -790,6 +802,99 @@ server.registerTool("sprint_session_set", {
 });
 
 // ===========================================================================
+// Famille « SESSION DE MIGRATION DES ANCIENS SPRINTS » (ADR-001 §6) — T9.
+// Entité `migrations` d'un PROJET (type dédié), ANCRÉE sur le sprint par défaut
+// (= l'ancien sprint). Les éléments migrés (pièces/fonctionnalités/règles) et
+// les anciennes tâches sont rattachés à l'ancien sprint par INSERT DIRECTS —
+// AUCUN FAUX ÉMERGENT (jamais `attachPiecesToSprint`, jamais `emergent`).
+// ===========================================================================
+
+server.registerTool("migration_start", {
+  description: "DÉMARRE (ou résout) la SESSION DE MIGRATION des anciens sprints d'un projet (ADR-001 §6). IDEMPOTENT : une seule migration par projet. Le sprint cible est le SPRINT PAR DÉFAUT du projet (= l'ANCIEN sprint, ex. myxmax 14/09, madatalk 07/09), créé au besoin (`ensureDefaultSprint`). Retourne `{ ok, migration, sprint }`. `migration.session_id` porte la session IA dédiée (agent-migration).",
+  inputSchema: {
+    projectId: z.string().describe("Projet (produit) dont on migre les anciens sprints."),
+    title: z.string().optional().describe("Titre de la session de migration (défaut dérivé du projet)."),
+    startDate: z.string().optional().describe("Début du sprint par défaut (ISO 8601)."),
+    endDate: z.string().optional().describe("Échéance du sprint par défaut (ISO 8601)."),
+    createdBy: z.string().optional().describe("Acteur créateur."),
+  },
+}, async ({ projectId, title, startDate, endDate, createdBy }) => {
+  try {
+    const r = await startMigration({ projectId, title, startDate, endDate, createdBy });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("migration_get", {
+  description: "DÉTAIL d'une session de migration (statut, session IA, sprint cible résolu). `err` si la migration est inconnue.",
+  inputSchema: {
+    migrationId: z.string().describe("Identifiant de la migration (MIG-<ts>-<rand>)."),
+  },
+}, async ({ migrationId }) => {
+  try {
+    const migration = await getMigration(migrationId);
+    if (!migration) return err(`migration inconnue : ${migrationId}`);
+    return text(JSON.stringify({ ok: true, migration }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("migration_list", {
+  description: "LISTE les sessions de migration (toutes, ou celles d'un projet), plus récentes d'abord. Retourne `{ count, migrations }`.",
+  inputSchema: {
+    project: z.string().optional().describe("Filtre par projet."),
+    limit: z.number().int().optional().describe("Max (défaut 500)."),
+  },
+}, async ({ project, limit }) => {
+  try {
+    const migrations = await listMigrations({ project, limit });
+    return text(JSON.stringify({ count: migrations.length, migrations }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("migration_session_set", {
+  description: "RATTACHE (ou REPREND) la SESSION IA dédiée (agent-migration) à une migration existante. Miroir de `sprint_session_set` : NE TOUCHE PAS au statut du sprint (open/close et garde d'émergence inchangés). Une migration `open` passe `in_progress` ; `sessionId` null détache. Retourne `{ ok, migration }`.",
+  inputSchema: {
+    migrationId: z.string().describe("Migration cible (MIG-<ts>-<rand>)."),
+    sessionId: z.string().nullable().describe("Session opencode (ses_…) à rattacher, ou null pour détacher."),
+  },
+}, async ({ migrationId, sessionId }) => {
+  try {
+    const migration = await setMigrationSession({ migrationId, sessionId });
+    return text(JSON.stringify({ ok: true, migration }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("migration_finish", {
+  description: "CLÔTURE une session de migration : `done` (migrée) ou `aborted` (abandonnée). Pose `finished_at`. Idempotent. Retourne `{ ok, migration }`.",
+  inputSchema: {
+    migrationId: z.string().describe("Migration à clôturer."),
+    status: z.enum(["done", "aborted"]).optional().describe("done (défaut) | aborted."),
+    by: z.string().optional().describe("Acteur de la clôture."),
+  },
+}, async ({ migrationId, status, by }) => {
+  try {
+    const migration = await finishMigration({ migrationId, status, by });
+    return text(JSON.stringify({ ok: true, migration }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("sprint_migrate_elements", {
+  description: "RATTACHE à l'ANCIEN SPRINT (sprint par défaut du projet) tous les éléments EXISTANTS sans lien sprint : fonctionnalités, règles métier, pièces client, anciennes tâches et recettes. INSERT DIRECTS et IDEMPOTENTS — AUCUN FAUX ÉMERGENT : n'appelle JAMAIS `attachPiecesToSprint` et n'écrit AUCUN marqueur `emergent`/`emergent_origin` (l'émergence n'est pas rétroactive, ADR-001 §5). Retourne `{ ok, sprintId, sprint, fonctionnalites, regles, pieces, tasks, recettes }` (compteurs des liens créés).",
+  inputSchema: {
+    projectId: z.string().describe("Projet (produit) à migrer."),
+    title: z.string().optional().describe("Titre du sprint par défaut (si création)."),
+    startDate: z.string().optional().describe("Début du sprint par défaut (ISO 8601)."),
+    endDate: z.string().optional().describe("Échéance du sprint par défaut (ISO 8601)."),
+    createdBy: z.string().optional().describe("Acteur du rattachement."),
+  },
+}, async ({ projectId, title, startDate, endDate, createdBy }) => {
+  try {
+    const r = await migrateProjectElementsToDefaultSprint({ projectId, title, startDate, endDate, createdBy });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// ===========================================================================
 // Famille « FONCTIONNALITÉS / RÈGLES / LIAISONS » (ADR-001, T5). CRUD MCP
 // `feature_*` / `rule_*` au-dessus des tables T1 (`fonctionnalites`,
 // `regles_metier`) + outils de LIAISON sur les tables N:N T1. Règles :
@@ -1335,6 +1440,73 @@ server.registerTool("adr_attach", {
   try {
     const adr = await attachAdr({ adrId, repoId, docId, path, title, kind, nature, source, meta });
     return text(JSON.stringify({ ok: true, adr }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// CONVERSION D'ADR MONOLITHIQUE → ADR ATOMIQUE (ADR-001 §6) — A009.
+// L'ADR d'origine reste INTACTE ; la convertie porte les colonnes structurées
+// (titre/statut/contexte/décision/conséquences) et les grands détails passent en
+// PIÈCES JOINTES (`adr_file`). Le lien historique est écrit dans `adr_conversions`.
+server.registerTool("adr_convert", {
+  description: "CONVERTIT une ADR MONOLITHIQUE en UNE ADR ATOMIQUE (ADR-001 §6) : crée une NOUVELLE ADR structurée (titre/statut/contexte/décision/conséquences), rattache les grands détails en PIÈCES JOINTES (`attachments[]` → `adr_file`), et écrit le LIEN HISTORIQUE dans `adr_conversions` (+ `meta.converted_from_adr_id`). L'ADR D'ORIGINE RESTE INTACTE (aucune réécriture doc_type/content_id/path/meta). Le projet est résolu depuis l'origine (erreur explicite si aucun projet rattaché). Retourne `{ ok, adr, conversion, original }`. Chaque ADR convertie doit ensuite être associée à 1..N fonctionnalités (`feature_adr_link`).",
+  inputSchema: {
+    originalAdrId: z.string().describe("ADR monolithique d'origine (kind='adr-tech')."),
+    title: z.string().describe("Titre de l'ADR atomique."),
+    status: z.enum(ADR_STATUS).optional().describe("Statut (défaut : hérité de l'origine, sinon 'Proposé')."),
+    context: z.string().optional().describe("Contexte (colonne structurée)."),
+    decision: z.string().optional().describe("Décision (colonne structurée)."),
+    consequences: z.string().optional().describe("Conséquences (colonne structurée)."),
+    description: z.string().optional().describe("Description libre de l'ADR atomique."),
+    path: z.string().optional().describe("Chemin du fichier de l'ADR atomique (défaut : celui de l'origine)."),
+    repoIds: z.array(z.string()).optional().describe("Repos rattachés (défaut : ceux de l'origine)."),
+    global: z.boolean().optional().describe("true : ADR globale (tous les repos du projet)."),
+    attachments: z.array(z.object({
+      docId: z.string().optional().describe("Pièce jointe = document du registre (source registry)."),
+      path: z.string().optional().describe("Pièce jointe = fichier (source import/ref)."),
+      title: z.string().optional(),
+      kind: z.string().optional().describe("Libellé libre (annexe, spec, détail…)."),
+      nature: z.string().optional().describe("document | fichier | lien."),
+      source: z.enum(DOC_ATTACHMENT_SOURCES).optional().describe("registry | import | ref (défaut selon docId/path)."),
+      repoId: z.string().optional().describe("Repo à rattacher."),
+      meta: z.record(z.string(), z.any()).optional(),
+    })).optional().describe("Pièces jointes portant les grands détails (adr_file)."),
+    createdBy: z.string().optional().describe("Acteur de la conversion."),
+  },
+}, async ({ originalAdrId, title, status, context, decision, consequences, description, path, repoIds, global, attachments, createdBy }) => {
+  try {
+    const r = await convertAdr({
+      originalAdrId, title, status, context, decision, consequences, description,
+      path, repoIds, global, attachments, createdBy, by: "agent",
+    });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_conversion_link", {
+  description: "ÉCRIT le LIEN HISTORIQUE ADR monolithique d'origine ↔ ADR atomique convertie (`adr_conversions`). GARDES : les deux ADR doivent exister et différer. IDEMPOTENT (un couple = une ligne). Retourne `{ ok, conversion }`. Utile pour rattacher une ADR créée hors `adr_convert`.",
+  inputSchema: {
+    originalAdrId: z.string().describe("ADR d'origine (kind='adr-tech')."),
+    convertedAdrId: z.string().describe("ADR convertie (kind='adr-tech')."),
+    createdBy: z.string().optional().describe("Acteur."),
+  },
+}, async ({ originalAdrId, convertedAdrId, createdBy }) => {
+  try {
+    const conversion = await linkAdrConversion({ originalAdrId, convertedAdrId, createdBy });
+    return text(JSON.stringify({ ok: true, conversion }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("adr_conversion_list", {
+  description: "LISTE les liens de conversion ADR (par ADR d'origine et/ou par ADR convertie) — historique de la conversion sans perte. Retourne `{ count, conversions }`.",
+  inputSchema: {
+    originalAdrId: z.string().optional().describe("Filtre par ADR d'origine."),
+    convertedAdrId: z.string().optional().describe("Filtre par ADR convertie."),
+    limit: z.number().int().optional().describe("Max (défaut 500)."),
+  },
+}, async ({ originalAdrId, convertedAdrId, limit }) => {
+  try {
+    const conversions = await listAdrConversions({ originalAdrId, convertedAdrId, limit });
+    return text(JSON.stringify({ count: conversions.length, conversions }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
