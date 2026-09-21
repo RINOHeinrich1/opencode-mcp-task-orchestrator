@@ -1999,9 +1999,9 @@ export async function listDocs({ kind, status, projectId, repoId, includeRepoDoc
     if (!DOC_KINDS.includes(kind)) throw new Error(`kind invalide : ${kind}`);
     params.push(DOC_TYPE_BY_DOC_KIND[kind]); conds.push(`d.doc_type = $${params.length}`);
   }
-  // Filtre ADR par statut (ajoute une condition — le SQL `includeRepoDocs` et
-  // `repoId` ci-dessous restent inchangés : rétrocompat + ⚠️ INC-011 PRÉSERVÉ,
-  // la précédence SQL d'origine n'est PAS corrigée ici).
+  // Filtre ADR par statut (ajoute une condition). La branche `includeRepoDocs`
+  // parenthèse l'expression `OR` pour que ce filtre s'applique aux docs du
+  // PROJET comme à ceux des repos (INC-011 : `AND` prime sur `OR`).
   if (status) {
     const s = assertAdrStatus(status);
     params.push(s); conds.push(`d.status = $${params.length}`);
@@ -2014,8 +2014,8 @@ export async function listDocs({ kind, status, projectId, repoId, includeRepoDoc
       params.push(prj, prj);
       rows = (await pool().query(
         `SELECT DISTINCT d.* FROM artifacts d
-         WHERE d.artifact_id IN (SELECT artifact_id FROM artifact_projects WHERE project_id = $${params.length - 1})
-            OR d.artifact_id IN (SELECT ar.artifact_id FROM artifact_repos ar JOIN project_repos pr ON pr.repo_id = ar.repo_id WHERE pr.project_id = $${params.length})
+         WHERE ( d.artifact_id IN (SELECT artifact_id FROM artifact_projects WHERE project_id = $${params.length - 1})
+            OR d.artifact_id IN (SELECT ar.artifact_id FROM artifact_repos ar JOIN project_repos pr ON pr.repo_id = ar.repo_id WHERE pr.project_id = $${params.length}) )
          ${conds.length ? "AND " + conds.join(" AND ") : ""} ORDER BY d.doc_type, d.title NULLS LAST, d.created_at DESC`,
         params,
       )).rows;
