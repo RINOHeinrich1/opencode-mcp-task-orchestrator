@@ -172,10 +172,12 @@ import {
   // FONCTIONNALITÉS / RÈGLES / LIAISONS (T5) — CRUD + liens N:N + workflow ADR.
   registerFeature,
   updateFeature,
+  markFeatureImplemented,
   getFeature,
   listFeatures,
   registerRule,
   updateRule,
+  markRuleImplemented,
   getRule,
   listRules,
   linkFeatureRule,
@@ -668,7 +670,7 @@ server.registerTool("piece_delete", {
 // ===========================================================================
 
 server.registerTool("sprint_report", {
-  description: "RAPPORT DE SPRINT (lecture seule, téléchargeable) — agrégation du registre : fonctionnalités implémentées (≥1 tâche liée dont la dernière exécution est `done`) et émergentes, tâches effectuées et émergentes, règles métier (émergentes), pièces client (émergentes), recettes. `format='markdown'` (défaut) renvoie le rapport rédigé ; `format='json'` renvoie `{ sprint, stats, sections, markdown }`.",
+  description: "RAPPORT DE SPRINT (lecture seule, téléchargeable) — agrégation du registre : fonctionnalités implémentées (`implemented=1` **ou** ≥1 tâche liée `done`), **ventilées** écosystème / hors écosystème, et émergentes ; tâches effectuées et émergentes ; **règles métier implémentées** (section dédiée, `implemented=1` **ou** signal écosystème dérivé) et émergentes ; pièces client (émergentes), recettes. `format='markdown'` (défaut) renvoie le rapport rédigé ; `format='json'` renvoie `{ sprint, stats, sections, markdown }` (stats ventilées `implementeesEcosystem`/`implementeesHorsEcosystem`).",
   inputSchema: {
     sprintId: z.string().describe("Identifiant du sprint (SPRINT-<ts>-<rand>)."),
     format: z.enum(["markdown", "json"]).optional().describe("Format de sortie : markdown (défaut) | json."),
@@ -926,24 +928,42 @@ server.registerTool("feature_register", {
 });
 
 server.registerTool("feature_update", {
-  description: "MODIFIE partiellement une FONCTIONNALITÉ (champs fournis uniquement) : `ref`, `role`, `userStory`, `sourcedPieceId` (re-gardée). `updated_at` posé. Retourne le détail.",
+  description: "MODIFIE partiellement une FONCTIONNALITÉ (champs fournis uniquement) : `ref`, `role`, `userStory`, `sourcedPieceId` (re-gardée), et l'ÉTAT D'IMPLÉMENTATION `implemented`/`implementedOrigin`/`implementedNote`. `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `updated_at` posé. L'émergence reste un axe distinct (inchangée). Retourne le détail.",
   inputSchema: {
     featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
     ref: z.string().optional().describe("Nouvelle référence (US-xxx)."),
     role: z.string().optional().describe("Nouveau rôle."),
     userStory: z.string().optional().describe("Nouvelle user story."),
     sourcedPieceId: z.string().optional().describe("Nouvelle pièce source (gardée) ; vide pour détacher."),
+    implemented: z.boolean().optional().describe("État d'implémentation explicite (true/false) ; false ⇒ reset de l'origine et de la traçabilité."),
+    implementedOrigin: z.enum(["ecosystem", "hors_ecosystem"]).optional().describe("Origine de l'implémentation — ecosystem (par une tâche de l'écosystème) | hors_ecosystem. Fournie ⇒ implémentée."),
+    implementedNote: z.string().optional().describe("Motif/note libre de la qualification."),
     by: z.string().optional().describe("Acteur de la modification."),
   },
-}, async ({ featureId, ref, role, userStory, sourcedPieceId, by }) => {
+}, async ({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, by }) => {
   try {
-    const feature = await updateFeature({ featureId, ref, role, userStory, sourcedPieceId, by });
+    const feature = await updateFeature({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, by });
+    return text(JSON.stringify({ ok: true, feature }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_mark_implemented", {
+  description: "MARQUE une FONCTIONNALITÉ comme IMPLÉMENTÉE avec son ORIGINE (intention explicite pour agents/panneau) : `origin` REQUIS (`ecosystem` = implémentée par une/des tâche(s) de l'écosystème | `hors_ecosystem` = implémentée EN DEHORS de l'écosystème, sans tâche liée). Idempotent (re-qualifier écrase proprement). N'écrit JAMAIS l'émergence. Retourne le détail.",
+  inputSchema: {
+    featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
+    origin: z.enum(["ecosystem", "hors_ecosystem"]).describe("Origine de l'implémentation (requise)."),
+    note: z.string().optional().describe("Motif/note libre."),
+    by: z.string().optional().describe("Acteur de la qualification."),
+  },
+}, async ({ featureId, origin, note, by }) => {
+  try {
+    const feature = await markFeatureImplemented({ featureId, origin, note, by });
     return text(JSON.stringify({ ok: true, feature }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("feature_get", {
-  description: "DÉTAIL d'une FONCTIONNALITÉ + liens : règles métier, scénarios Gherkin (`e2e_tests`), ADR, sprints, tâches, recettes. `err` si inconnue.",
+  description: "DÉTAIL d'une FONCTIONNALITÉ + liens : règles métier, scénarios Gherkin (`e2e_tests`), ADR, sprints, tâches, recettes. Expose l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote` (et l'émergence, axe distinct). `err` si inconnue.",
   inputSchema: { featureId: z.string().describe("Identifiant de la fonctionnalité.") },
 }, async ({ featureId }) => {
   try {
@@ -954,7 +974,7 @@ server.registerTool("feature_get", {
 });
 
 server.registerTool("feature_list", {
-  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Retourne `{ count, features }`.",
+  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. Retourne `{ count, features }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les fonctionnalités."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
@@ -986,23 +1006,41 @@ server.registerTool("rule_register", {
 });
 
 server.registerTool("rule_update", {
-  description: "MODIFIE partiellement une RÈGLE MÉTIER (champs fournis uniquement) : `ref`, `content`, `sourcedPieceId` (re-gardée). `updated_at` posé. Retourne le détail.",
+  description: "MODIFIE partiellement une RÈGLE MÉTIER (champs fournis uniquement) : `ref`, `content`, `sourcedPieceId` (re-gardée), et l'ÉTAT D'IMPLÉMENTATION `implemented`/`implementedOrigin`/`implementedNote`. `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `updated_at` posé. L'émergence reste un axe distinct. Retourne le détail.",
   inputSchema: {
     ruleId: z.string().describe("Identifiant de la règle (RMET-<ts>-<rand>)."),
     ref: z.string().optional().describe("Nouvelle référence (RM-xxxx)."),
     content: z.string().optional().describe("Nouveau contenu."),
     sourcedPieceId: z.string().optional().describe("Nouvelle pièce source (gardée) ; vide pour détacher."),
+    implemented: z.boolean().optional().describe("État d'implémentation explicite (true/false) ; false ⇒ reset de l'origine et de la traçabilité."),
+    implementedOrigin: z.enum(["ecosystem", "hors_ecosystem"]).optional().describe("Origine de l'implémentation — ecosystem | hors_ecosystem. Fournie ⇒ implémentée."),
+    implementedNote: z.string().optional().describe("Motif/note libre de la qualification."),
     by: z.string().optional().describe("Acteur de la modification."),
   },
-}, async ({ ruleId, ref, content, sourcedPieceId, by }) => {
+}, async ({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, by }) => {
   try {
-    const rule = await updateRule({ ruleId, ref, content, sourcedPieceId, by });
+    const rule = await updateRule({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, by });
+    return text(JSON.stringify({ ok: true, rule }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_mark_implemented", {
+  description: "MARQUE une RÈGLE MÉTIER comme IMPLÉMENTÉE avec son ORIGINE (intention explicite) : `origin` REQUIS (`ecosystem` | `hors_ecosystem`). Idempotent. N'écrit JAMAIS l'émergence. Retourne le détail.",
+  inputSchema: {
+    ruleId: z.string().describe("Identifiant de la règle (RMET-<ts>-<rand>)."),
+    origin: z.enum(["ecosystem", "hors_ecosystem"]).describe("Origine de l'implémentation (requise)."),
+    note: z.string().optional().describe("Motif/note libre."),
+    by: z.string().optional().describe("Acteur de la qualification."),
+  },
+}, async ({ ruleId, origin, note, by }) => {
+  try {
+    const rule = await markRuleImplemented({ ruleId, origin, note, by });
     return text(JSON.stringify({ ok: true, rule }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("rule_get", {
-  description: "DÉTAIL d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse), sprints. `err` si inconnue.",
+  description: "DÉTAIL d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse), sprints. Expose l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. `err` si inconnue.",
   inputSchema: { ruleId: z.string().describe("Identifiant de la règle.") },
 }, async ({ ruleId }) => {
   try {
@@ -1013,7 +1051,7 @@ server.registerTool("rule_get", {
 });
 
 server.registerTool("rule_list", {
-  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Retourne `{ count, rules }`.",
+  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. Retourne `{ count, rules }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les règles."),
     emergent: z.boolean().optional().describe("Filtre émergence."),

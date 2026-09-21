@@ -519,6 +519,21 @@ async function migrate() {
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS emergent INTEGER NOT NULL DEFAULT 0");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS emergent_origin TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_tasks_emergent ON tasks(project) WHERE emergent = 1");
+  // FONCTIONNALITÉ — ÉTAT D'IMPLÉMENTATION + ORIGINE (T-20260921-133134-yz2i).
+  // Additif et idempotent : `implemented_origin` ∈ {ecosystem, hors_ecosystem} ;
+  // champs absents ⇒ implemented=0 ⇒ comportement historique (repli `done_tasks`).
+  // NE TOUCHE PAS l'émergence (`emergent`/`emergent_origin`) : axe DISTINCT.
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented INTEGER NOT NULL DEFAULT 0");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_origin TEXT");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_at TEXT");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_by TEXT");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_note TEXT");
+  // RÈGLE MÉTIER — mêmes 5 colonnes (modèle symétrique).
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented INTEGER NOT NULL DEFAULT 0");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_origin TEXT");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_at TEXT");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_by TEXT");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_note TEXT");
   await pool().query(`CREATE TABLE IF NOT EXISTS fonctionnalite_regles (
     fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
     regle_id          TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
@@ -1401,7 +1416,10 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
   const sid = sprint.id;
 
   // Fonctionnalités du sprint : `done_tasks` = nb de tâches liées dont la
-  // dernière exécution est `done` (définition explicite « implémentée »).
+  // dernière exécution est `done` (définition historique « implémentée »).
+  // T-20260921-133134-yz2i : « implémentée » = état EXPLICITE (`implemented=1`)
+  // **OU** signal écosystème (`done_tasks >= 1`) ; l'origine est alors explicite
+  // (`implemented_origin`) ou dérivée (`ecosystem`). L'émergence reste distincte.
   const feats = (await pool().query(
     `SELECT f.*,
             (SELECT COUNT(DISTINCT tf.task_id) FROM task_fonctionnalites tf
@@ -1415,17 +1433,29 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
        JOIN sprint_fonctionnalites sf ON sf.fonctionnalite_id = f.id
       WHERE sf.sprint_id = $1
       ORDER BY f.ref ASC`, [sid],
-  )).rows.map((r) => ({
-    id: r.id,
-    ref: r.ref,
-    role: r.role ?? null,
-    userStory: r.user_story,
-    emergent: !!r.emergent,
-    emergentOrigin: r.emergent_origin ?? null,
-    doneTasks: Number(r.done_tasks) || 0,
-    totalTasks: Number(r.total_tasks) || 0,
-    implemented: (Number(r.done_tasks) || 0) >= 1,
-  }));
+  )).rows.map((r) => {
+    const doneTasks = Number(r.done_tasks) || 0;
+    const explicit = !!r.implemented;
+    const implemented = explicit || doneTasks >= 1;
+    const implementedOrigin = explicit
+      ? (r.implemented_origin || (doneTasks >= 1 ? "ecosystem" : null))
+      : (doneTasks >= 1 ? "ecosystem" : null);
+    return {
+      id: r.id,
+      ref: r.ref,
+      role: r.role ?? null,
+      userStory: r.user_story,
+      emergent: !!r.emergent,
+      emergentOrigin: r.emergent_origin ?? null,
+      doneTasks,
+      totalTasks: Number(r.total_tasks) || 0,
+      implemented,
+      implementedOrigin,
+      implementedAt: r.implemented_at ?? null,
+      implementedBy: r.implemented_by ?? null,
+      implementedNote: r.implemented_note ?? null,
+    };
+  });
 
   const tasks = (await pool().query(
     `SELECT t.id, t.title, t.request, t.emergent, t.emergent_origin, t.created_at,
@@ -1444,18 +1474,48 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
     createdAt: r.created_at,
   }));
 
+  // Règles métier du sprint. T-20260921-133134-yz2i : aucune table `task_regles`
+  // n'existe → le signal écosystème d'une règle est DÉRIVÉ par transitivité
+  // (`task_fonctionnalites` ⨝ `fonctionnalite_regles`) : nb de tâches DISTINCTES
+  // `done` liées à une fonctionnalité qui PORTE cette règle. Une qualification
+  // explicite (`implemented=1`) prime (origine explicite). Conséquence assumée :
+  // une règle rattachée à une fonctionnalité `hors_ecosystem` n'est pas marquée
+  // implémentée « par ricochet » (elle doit être qualifiée elle-même).
   const regles = (await pool().query(
-    `SELECT r.* FROM regles_metier r
+    `SELECT r.*,
+            (SELECT COUNT(DISTINCT tf.task_id)
+               FROM fonctionnalite_regles fr
+               JOIN task_fonctionnalites tf ON tf.fonctionnalite_id = fr.fonctionnalite_id
+              WHERE fr.regle_id = r.id
+                AND EXISTS (SELECT 1 FROM executions e
+                             WHERE e.task_id = tf.task_id AND e.status = 'done'
+                               AND e.attempt = (SELECT MAX(x.attempt) FROM executions x WHERE x.task_id = tf.task_id))
+            ) AS done_tasks
+       FROM regles_metier r
        JOIN sprint_regles sr ON sr.regle_id = r.id
       WHERE sr.sprint_id = $1
       ORDER BY r.ref ASC`, [sid],
-  )).rows.map((r) => ({
-    id: r.id,
-    ref: r.ref,
-    content: r.content,
-    emergent: !!r.emergent,
-    emergentOrigin: r.emergent_origin ?? null,
-  }));
+  )).rows.map((r) => {
+    const doneTasks = Number(r.done_tasks) || 0;
+    const explicit = !!r.implemented;
+    const implemented = explicit || doneTasks >= 1;
+    const implementedOrigin = explicit
+      ? (r.implemented_origin || (doneTasks >= 1 ? "ecosystem" : null))
+      : (doneTasks >= 1 ? "ecosystem" : null);
+    return {
+      id: r.id,
+      ref: r.ref,
+      content: r.content,
+      emergent: !!r.emergent,
+      emergentOrigin: r.emergent_origin ?? null,
+      doneTasks,
+      implemented,
+      implementedOrigin,
+      implementedAt: r.implemented_at ?? null,
+      implementedBy: r.implemented_by ?? null,
+      implementedNote: r.implemented_note ?? null,
+    };
+  });
 
   const pieces = (await pool().query(
     `SELECT a.* FROM artifacts a
@@ -1480,16 +1540,34 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
     tachesEffectuees: tasks.filter((t) => t.done),
     tachesEmergentes: tasks.filter((t) => t.emergent),
     regles: regles,
+    // Section « Règles métier implémentées » (T-20260921-133134-yz2i) — les
+    // règles n'étaient comptées que par émergence.
+    reglesImplementees: regles.filter((r) => r.implemented),
     reglesEmergentes: regles.filter((r) => r.emergent),
     pieces: pieces,
     piecesEmergentes: pieces.filter((p) => p.emergent),
     recettes: recettes,
   };
 
+  // Ventilation E/H (T-20260921-133134-yz2i) : « dont E dans l'écosystème,
+  // H hors écosystème ». Additif (les consommateurs existants ne cassent pas).
+  const countByOrigin = (arr, origin) => arr.filter((x) => x.implementedOrigin === origin).length;
   const stats = {
-    fonctionnalites: { total: feats.length, implementees: sections.fonctionnalitesImplementees.length, emergentes: sections.fonctionnalitesEmergentes.length },
+    fonctionnalites: {
+      total: feats.length,
+      implementees: sections.fonctionnalitesImplementees.length,
+      implementeesEcosystem: countByOrigin(sections.fonctionnalitesImplementees, "ecosystem"),
+      implementeesHorsEcosystem: countByOrigin(sections.fonctionnalitesImplementees, "hors_ecosystem"),
+      emergentes: sections.fonctionnalitesEmergentes.length,
+    },
     taches: { total: tasks.length, effectuees: sections.tachesEffectuees.length, emergentes: sections.tachesEmergentes.length },
-    regles: { total: regles.length, emergentes: sections.reglesEmergentes.length },
+    regles: {
+      total: regles.length,
+      implementees: sections.reglesImplementees.length,
+      implementeesEcosystem: countByOrigin(sections.reglesImplementees, "ecosystem"),
+      implementeesHorsEcosystem: countByOrigin(sections.reglesImplementees, "hors_ecosystem"),
+      emergentes: sections.reglesEmergentes.length,
+    },
     pieces: { total: pieces.length, emergentes: sections.piecesEmergentes.length },
     recettes: { total: recettes.length },
   };
@@ -1507,9 +1585,9 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
   md.push("");
   md.push("| Élément | Total | Détail |");
   md.push("|---|---|---|");
-  md.push(`| Fonctionnalités | ${stats.fonctionnalites.total} | ${stats.fonctionnalites.implementees} implémentée(s), ${stats.fonctionnalites.emergentes} émergente(s) |`);
+  md.push(`| Fonctionnalités | ${stats.fonctionnalites.total} | ${stats.fonctionnalites.implementees} implémentée(s) — dont ${stats.fonctionnalites.implementeesEcosystem} dans l'écosystème, ${stats.fonctionnalites.implementeesHorsEcosystem} hors écosystème ; ${stats.fonctionnalites.emergentes} émergente(s) |`);
   md.push(`| Tâches | ${stats.taches.total} | ${stats.taches.effectuees} effectuée(s), ${stats.taches.emergentes} émergente(s) |`);
-  md.push(`| Règles métier | ${stats.regles.total} | ${stats.regles.emergentes} émergente(s) |`);
+  md.push(`| Règles métier | ${stats.regles.total} | ${stats.regles.implementees} implémentée(s) — dont ${stats.regles.implementeesEcosystem} dans l'écosystème, ${stats.regles.implementeesHorsEcosystem} hors écosystème ; ${stats.regles.emergentes} émergente(s) |`);
   md.push(`| Pièces client | ${stats.pieces.total} | ${stats.pieces.emergentes} émergente(s) |`);
   md.push(`| Recettes | ${stats.recettes.total} | — |`);
   md.push("");
@@ -1520,11 +1598,14 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
     for (const it of arr) md.push(`- ${fmt(it)}`);
     md.push("");
   };
-  list("Fonctionnalités implémentées", sections.fonctionnalitesImplementees, (f) => `**${f.ref}** — ${f.userStory} (${f.doneTasks}/${f.totalTasks} tâche(s) done)`);
+  // Libellé d'origine d'une implémentation (ventilation lisible).
+  const originLabel = (x) => (x.implementedOrigin === "hors_ecosystem" ? "hors écosystème" : "écosystème");
+  list("Fonctionnalités implémentées", sections.fonctionnalitesImplementees, (f) => `**${f.ref}** — ${f.userStory} — implémentée (${originLabel(f)})${f.implementedNote ? ` — ${f.implementedNote}` : ""} (${f.doneTasks}/${f.totalTasks} tâche(s) done)`);
   list("Fonctionnalités émergentes", sections.fonctionnalitesEmergentes, (f) => `**${f.ref}** — ${f.userStory} _(origine : ${f.emergentOrigin || "?"})_`);
   list("Tâches effectuées", sections.tachesEffectuees, (t) => `\`${t.id}\` — ${t.title || t.request}`);
   list("Tâches émergentes", sections.tachesEmergentes, (t) => `\`${t.id}\` — ${t.title || t.request} _(origine : ${t.emergentOrigin || "?"}, statut : ${t.status})_`);
-  list("Règles métier", sections.regles, (r) => `**${r.ref}** — ${r.content}${r.emergent ? ` _(émergente : ${r.emergentOrigin || "?"})_` : ""}`);
+  list("Règles métier implémentées", sections.reglesImplementees, (r) => `**${r.ref}** — ${r.content} — implémentée (${originLabel(r)})${r.implementedNote ? ` — ${r.implementedNote}` : ""}`);
+  list("Règles métier", sections.regles, (r) => `**${r.ref}** — ${r.content}${r.implemented ? ` — implémentée (${originLabel(r)})${r.implementedNote ? ` — ${r.implementedNote}` : ""}` : ""}${r.emergent ? ` _(émergente : ${r.emergentOrigin || "?"})_` : ""}`);
   list("Pièces client", sections.pieces, (p) => `[${p.nature || "?"}] ${p.title || p.pieceId}${p.url ? ` — ${p.url}` : ""}${p.emergent ? ` _(émergente : ${p.emergentOrigin || "?"})_` : ""}`);
   list("Recettes", sections.recettes, (r) => `\`${r.recetteId}\` — ${r.title || ""} (${r.status || "?"})`);
 
@@ -1556,6 +1637,12 @@ function rowToFonctionnalite(r) {
     sourcedPieceId: r.sourced_piece_id ?? null,
     emergent: !!r.emergent,
     emergentOrigin: r.emergent_origin ?? null,
+    // État d'implémentation explicite + origine (T-20260921-133134-yz2i).
+    implemented: !!r.implemented,
+    implementedOrigin: r.implemented_origin ?? null,
+    implementedAt: r.implemented_at ?? null,
+    implementedBy: r.implemented_by ?? null,
+    implementedNote: r.implemented_note ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at ?? null,
     createdBy: r.created_by ?? null,
@@ -1573,6 +1660,12 @@ function rowToRegle(r) {
     sourcedPieceId: r.sourced_piece_id ?? null,
     emergent: !!r.emergent,
     emergentOrigin: r.emergent_origin ?? null,
+    // État d'implémentation explicite + origine (T-20260921-133134-yz2i).
+    implemented: !!r.implemented,
+    implementedOrigin: r.implemented_origin ?? null,
+    implementedAt: r.implemented_at ?? null,
+    implementedBy: r.implemented_by ?? null,
+    implementedNote: r.implemented_note ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at ?? null,
     createdBy: r.created_by ?? null,
@@ -1647,11 +1740,16 @@ export async function registerFeature({ projectId, ref, role, userStory, sourced
 
 // MODIFICATION partielle d'une FONCTIONNALITÉ (champs fournis uniquement).
 // Re-gardage de la pièce source si elle change (projet inchangé) ; `updated_at`.
-export async function updateFeature({ featureId, ref, role, userStory, sourcedPieceId, by } = {}) {
+// Étendue (T-20260921-133134-yz2i) : `implemented`/`implementedOrigin`/
+// `implementedNote` qualifient l'état d'implémentation via le helper UNIQUE
+// `applyImplementationQualification`. Si SEULS ces champs sont fournis, le
+// helper pose `updated_at` et on retourne sans second UPDATE (anti double écriture).
+export async function updateFeature({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, by } = {}) {
   await ensureSchema();
   if (!featureId) throw new Error("featureId requis");
   const cur = (await pool().query("SELECT * FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
   if (!cur) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const hasImplFields = implemented !== undefined || implementedOrigin !== undefined || implementedNote !== undefined;
   const sets = [];
   const params = [];
   if (ref !== undefined) {
@@ -1681,12 +1779,130 @@ export async function updateFeature({ featureId, ref, role, userStory, sourcedPi
       params.push(id); sets.push(`sourced_piece_id = $${params.length}`);
     }
   }
-  if (!sets.length) return getFeature(cur.id);
+  if (!sets.length) {
+    // Seuls les champs d'implémentation (ou aucun) : le helper écrit `updated_at`.
+    if (hasImplFields) {
+      await applyImplementationQualification({ table: "fonctionnalites", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
+    }
+    return getFeature(cur.id);
+  }
   const ts = nowIso();
   params.push(ts); const tsIdx = params.length;
   params.push(cur.id); const idIdx = params.length;
   await pool().query(`UPDATE fonctionnalites SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
-  void by;
+  if (hasImplFields) {
+    await applyImplementationQualification({ table: "fonctionnalites", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
+  }
+  return getFeature(cur.id);
+}
+
+// ===========================================================================
+// ÉTAT D'IMPLÉMENTATION + ORIGINE (T-20260921-133134-yz2i) — modèle ADDITIF.
+// Une fonctionnalité/règle peut être QUALIFIÉE « implémentée » avec son ORIGINE :
+//   - `ecosystem`      : implémentée par une/des tâche(s) de l'écosystème
+//                        (le signal historique `done_tasks >= 1` reste la
+//                        définition de repli, cf. buildSprintReport) ;
+//   - `hors_ecosystem` : implémentée EN DEHORS de l'écosystème (IDE/agents des
+//                        devs), SANS tâche écosystème liée.
+// L'ÉMERGENCE reste un axe DISTINCT : ces helpers n'écrivent JAMAIS
+// `emergent`/`emergent_origin`.
+// ===========================================================================
+
+// Origines d'implémentation admises (validation stricte).
+export const IMPLEMENTED_ORIGINS = ["ecosystem", "hors_ecosystem"];
+
+// QUALIFICATION D'IMPLÉMENTATION — helper interne UNIQUE, partagé par les deux
+// tables (`fonctionnalites`, `regles_metier`) et les quatre points d'entrée
+// (updateFeature/updateRule + markFeatureImplemented/markRuleImplemented).
+// Règles (décision §2.6 du plan) :
+//   - `origin` fourni ⇒ `implemented` FORCÉ à 1, origine REQUISE ∈
+//     {ecosystem, hors_ecosystem} (toute autre valeur ⇒ erreur) ;
+//   - `implemented === false` ⇒ RESET des 4 champs de traçabilité ;
+//   - `implemented === true` sans origine ⇒ conserve l'origine existante si
+//     valide, sinon erreur (« origine requise ») ;
+//   - `note` seule (ni implemented ni origin) ⇒ met à jour le motif sans
+//     toucher à l'état ; rien à qualifier ⇒ aucun écrit.
+// Idempotent : re-qualifier écrase proprement (`implemented_at` re-stampé).
+// Retourne `true` si une écriture a eu lieu, `false` sinon.
+async function applyImplementationQualification({ table, id, implemented, origin, note, by } = {}) {
+  const TABLES = { fonctionnalites: "fonctionnalites", regles_metier: "regles_metier" };
+  const tbl = TABLES[table];
+  if (!tbl) throw new Error(`table inconnue pour la qualification d'implémentation : ${table}`);
+  if (!id) throw new Error("identifiant requis pour la qualification d'implémentation");
+
+  const hasImpl = implemented !== undefined && implemented !== null;
+  const hasOrigin = origin !== undefined && origin !== null && String(origin).trim() !== "";
+  const hasNote = note !== undefined;
+  if (!hasImpl && !hasOrigin && !hasNote) return false; // rien à qualifier
+
+  const cur = (await pool().query(`SELECT implemented, implemented_origin FROM ${tbl} WHERE id = $1`, [String(id)])).rows[0];
+  if (!cur) throw new Error(`élément inconnu : ${id}`);
+
+  // `note` seule : mise à jour du motif, état conservé.
+  if (!hasImpl && !hasOrigin) {
+    const ts = nowIso();
+    await pool().query(
+      `UPDATE ${tbl} SET implemented_note = $1, updated_at = $2 WHERE id = $3`,
+      [note != null && String(note).trim() ? String(note).trim() : null, ts, String(id)],
+    );
+    return true;
+  }
+
+  let impl = hasImpl ? !!implemented : false;
+  let org = null;
+  if (hasOrigin) {
+    org = String(origin).trim();
+    if (!IMPLEMENTED_ORIGINS.includes(org)) {
+      throw new Error(`implementedOrigin invalide : ${org} (attendu : ecosystem | hors_ecosystem)`);
+    }
+    impl = true; // origine fournie ⇒ implémentée (décision §2.6)
+  } else if (impl) {
+    const prev = cur.implemented_origin;
+    if (!IMPLEMENTED_ORIGINS.includes(prev)) {
+      throw new Error("implementedOrigin requis pour marquer implémentée (ecosystem | hors_ecosystem)");
+    }
+    org = prev;
+  }
+
+  const ts = nowIso();
+  if (impl) {
+    const sets = [
+      "implemented = 1",
+      "implemented_origin = $1",
+      "implemented_at = $2",
+      "implemented_by = $3",
+    ];
+    const params = [org, ts, by ? String(by) : null];
+    if (hasNote) {
+      params.push(note != null && String(note).trim() ? String(note).trim() : null);
+      sets.push(`implemented_note = $${params.length}`);
+    }
+    params.push(ts); const tsIdx = params.length;
+    params.push(String(id)); const idIdx = params.length;
+    await pool().query(`UPDATE ${tbl} SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
+    return true;
+  }
+  // Déqualification : reset complet de l'état et de la traçabilité.
+  await pool().query(
+    `UPDATE ${tbl} SET implemented = 0, implemented_origin = NULL, implemented_at = NULL,
+            implemented_by = NULL, implemented_note = NULL, updated_at = $1 WHERE id = $2`,
+    [ts, String(id)],
+  );
+  return true;
+}
+
+// MARQUE une FONCTIONNALITÉ comme implémentée avec son ORIGINE (intention
+// explicite, wrappers des agents/du panneau). `origin` REQUIS. Idempotent.
+export async function markFeatureImplemented({ featureId, origin, note, by } = {}) {
+  await ensureSchema();
+  if (!featureId) throw new Error("featureId requis");
+  const org = origin != null ? String(origin).trim() : "";
+  if (!IMPLEMENTED_ORIGINS.includes(org)) {
+    throw new Error("origin requis (ecosystem | hors_ecosystem)");
+  }
+  const cur = (await pool().query("SELECT id FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
+  if (!cur) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  await applyImplementationQualification({ table: "fonctionnalites", id: cur.id, implemented: true, origin: org, note, by });
   return getFeature(cur.id);
 }
 
@@ -1806,11 +2022,14 @@ export async function registerRule({ projectId, ref, content, sourcedPieceId, re
 }
 
 // MODIFICATION partielle d'une RÈGLE MÉTIER ; re-gardage de la pièce source.
-export async function updateRule({ ruleId, ref, content, sourcedPieceId, by } = {}) {
+// Étendue (T-20260921-133134-yz2i) : `implemented`/`implementedOrigin`/
+// `implementedNote` qualifient l'état d'implémentation (même helper unique).
+export async function updateRule({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, by } = {}) {
   await ensureSchema();
   if (!ruleId) throw new Error("ruleId requis");
   const cur = (await pool().query("SELECT * FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
   if (!cur) throw new Error(`règle inconnue : ${ruleId}`);
+  const hasImplFields = implemented !== undefined || implementedOrigin !== undefined || implementedNote !== undefined;
   const sets = [];
   const params = [];
   if (ref !== undefined) {
@@ -1839,12 +2058,34 @@ export async function updateRule({ ruleId, ref, content, sourcedPieceId, by } = 
       params.push(id); sets.push(`sourced_piece_id = $${params.length}`);
     }
   }
-  if (!sets.length) return getRule(cur.id);
+  if (!sets.length) {
+    if (hasImplFields) {
+      await applyImplementationQualification({ table: "regles_metier", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
+    }
+    return getRule(cur.id);
+  }
   const ts = nowIso();
   params.push(ts); const tsIdx = params.length;
   params.push(cur.id); const idIdx = params.length;
   await pool().query(`UPDATE regles_metier SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
-  void by;
+  if (hasImplFields) {
+    await applyImplementationQualification({ table: "regles_metier", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
+  }
+  return getRule(cur.id);
+}
+
+// MARQUE une RÈGLE MÉTIER comme implémentée avec son ORIGINE (`origin` REQUIS).
+// Idempotent (re-qualifier écrase proprement).
+export async function markRuleImplemented({ ruleId, origin, note, by } = {}) {
+  await ensureSchema();
+  if (!ruleId) throw new Error("ruleId requis");
+  const org = origin != null ? String(origin).trim() : "";
+  if (!IMPLEMENTED_ORIGINS.includes(org)) {
+    throw new Error("origin requis (ecosystem | hors_ecosystem)");
+  }
+  const cur = (await pool().query("SELECT id FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
+  if (!cur) throw new Error(`règle inconnue : ${ruleId}`);
+  await applyImplementationQualification({ table: "regles_metier", id: cur.id, implemented: true, origin: org, note, by });
   return getRule(cur.id);
 }
 

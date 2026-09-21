@@ -686,6 +686,11 @@ CREATE TABLE IF NOT EXISTS fonctionnalites (
   sourced_piece_id TEXT,                           -- pièce client source (artifacts.artifact_id)
   emergent         INTEGER NOT NULL DEFAULT 0,     -- 1 = émergente (hors sprint / après clôture)
   emergent_origin  TEXT,                           -- hors_sprint | apres_cloture | sans_piece | recette
+  implemented      INTEGER NOT NULL DEFAULT 0,     -- 1 = implémentée (état explicite, T-20260921-133134-yz2i)
+  implemented_origin TEXT,                         -- ecosystem | hors_ecosystem (origine de l'implémentation)
+  implemented_at   TEXT,                           -- horodatage de la qualification
+  implemented_by   TEXT,                           -- acteur de la qualification
+  implemented_note TEXT,                           -- motif/note libre
   organization_id  TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT,
@@ -693,6 +698,14 @@ CREATE TABLE IF NOT EXISTS fonctionnalites (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_fonctionnalites_project_ref ON fonctionnalites(project, ref);
 CREATE INDEX IF NOT EXISTS idx_fonctionnalites_project ON fonctionnalites(project);
+-- État d'implémentation + origine sur une base EXISTANTE (CREATE TABLE IF NOT
+-- EXISTS ne modifie pas une table déjà créée) — miroir idempotent de migrate().
+-- Champs absents ⇒ implemented=0 ⇒ comportement historique inchangé.
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_origin TEXT;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_at TEXT;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_by TEXT;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_note TEXT;
 
 CREATE TABLE IF NOT EXISTS regles_metier (
   id               TEXT PRIMARY KEY,               -- RMET-<ts>-<rand>
@@ -702,6 +715,11 @@ CREATE TABLE IF NOT EXISTS regles_metier (
   sourced_piece_id TEXT,                           -- pièce client source (artifacts.artifact_id)
   emergent         INTEGER NOT NULL DEFAULT 0,
   emergent_origin  TEXT,
+  implemented      INTEGER NOT NULL DEFAULT 0,     -- 1 = implémentée (état explicite, T-20260921-133134-yz2i)
+  implemented_origin TEXT,                         -- ecosystem | hors_ecosystem
+  implemented_at   TEXT,
+  implemented_by   TEXT,
+  implemented_note TEXT,
   organization_id  TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT,
@@ -709,6 +727,12 @@ CREATE TABLE IF NOT EXISTS regles_metier (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_regles_metier_project_ref ON regles_metier(project, ref);
 CREATE INDEX IF NOT EXISTS idx_regles_metier_project ON regles_metier(project);
+-- État d'implémentation + origine sur une base EXISTANTE — miroir idempotent de migrate().
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_origin TEXT;
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_at TEXT;
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_by TEXT;
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_note TEXT;
 
 CREATE TABLE IF NOT EXISTS sprints (
   id              TEXT PRIMARY KEY,                -- SPRINT-<ts>-<rand>
