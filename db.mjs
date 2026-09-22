@@ -1887,9 +1887,14 @@ async function assertPieceOwnedByProject(pieceId, projectId) {
 // ÉMERGENCE (`classifyEmergence`, kind='element') : hors sprint → `hors_sprint`,
 // dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et
 // rattachée au sprint courant (`sprint_fonctionnalites`). `recetteId` optionnel
-// (T6) → origine `recette` (élément apparu en recette). `organization_id`
+// (T6) → origine `recette` (élément apparu en recette). `fromRecette` optionnel
+// (T6) → signal EXPLICITE d'origine recette, pour une création déclenchée
+// DEPUIS une recette/cadrage sans identifiant de recette encore disponible
+// (ex. modale de création) ou depuis une recette évaluateur (`evaluation`).
+// `fromRecette` est un paramètre d'APPEL : jamais persisté ; seule la colonne
+// existante `emergent_origin` est écrite (valeur `recette`). `organization_id`
 // héritée du projet. `ref` déjà utilisée pour le projet → erreur explicite.
-export async function registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, createdBy } = {}) {
+export async function registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, fromRecette, createdBy } = {}) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
   const pid = String(projectId).trim();
@@ -1911,7 +1916,7 @@ export async function registerFeature({ projectId, ref, role, userStory, sourced
   )).rows[0];
   if (dup) throw new Error(`référence déjà utilisée pour le projet ${pid} : ${rf} (${dup.id})`);
 
-  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!recetteId });
+  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!(recetteId || fromRecette) });
   const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
   const id = `FEAT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();
@@ -2345,8 +2350,10 @@ function normalizeRuleRoles({ roles, roleGlobal } = {}) {
 // CRÉATION d'une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3). Mêmes gardes que
 // `registerFeature` (projet, pièce source, émergence). Non émergente ⇒ lien
 // `sprint_regles` au sprint ouvert. `recetteId` optionnel (T6) → origine
-// `recette` (règle métier apparue en recette).
-export async function registerRule({ projectId, ref, content, sourcedPieceId, recetteId, roles, roleGlobal, createdBy } = {}) {
+// `recette` (règle métier apparue en recette). `fromRecette` optionnel (T6) →
+// signal EXPLICITE d'origine recette (miroir exact de `registerFeature`) ;
+// paramètre d'appel, jamais persisté.
+export async function registerRule({ projectId, ref, content, sourcedPieceId, recetteId, fromRecette, roles, roleGlobal, createdBy } = {}) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
   const pid = String(projectId).trim();
@@ -2371,7 +2378,7 @@ export async function registerRule({ projectId, ref, content, sourcedPieceId, re
   // Association EXPLICITE de rôles : garde « ≥1 rôle OU global » (T-20260922-064200-e0yw).
   const { roles: roleList, roleGlobal: isGlobal } = normalizeRuleRoles({ roles, roleGlobal });
 
-  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!recetteId });
+  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!(recetteId || fromRecette) });
   const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
   const id = `RMET-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();

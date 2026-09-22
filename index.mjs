@@ -961,7 +961,7 @@ server.registerTool("sprint_migrate_elements", {
 // ===========================================================================
 
 server.registerTool("feature_register", {
-  description: "CRÉE une FONCTIONNALITÉ (`US-xxx`, ADR-001 §3) : `projectId` + `ref` + `userStory` requis ; `role` libre ; `sourcedPieceId` = pièce client SOURCE (optionnelle) GARDÉE (garde nature T2 + appartenance au projet). ÉMERGENCE : hors sprint → `hors_sprint` ; dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et rattachée au sprint courant. `ref` dupliquée pour le projet → erreur. Retourne le détail (liens inclus).",
+  description: "CRÉE une FONCTIONNALITÉ (`US-xxx`, ADR-001 §3) : `projectId` + `ref` + `userStory` requis ; `role` libre ; `sourcedPieceId` = pièce client SOURCE (optionnelle) GARDÉE (garde nature T2 + appartenance au projet). ÉMERGENCE : hors sprint → `hors_sprint` ; dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et rattachée au sprint courant, SAUF `recetteId`/`fromRecette` fourni (→ émergente origine `recette`). `ref` dupliquée pour le projet → erreur. Retourne le détail (liens inclus).",
   inputSchema: {
     projectId: z.string().describe("Projet de la fonctionnalité."),
     ref: z.string().describe("Référence de la fonctionnalité (ex. US-xxx)."),
@@ -969,11 +969,12 @@ server.registerTool("feature_register", {
     userStory: z.string().describe("User story (formulation du besoin)."),
     sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
     recetteId: z.string().optional().describe("Recette d'origine (optionnel, T6) — marque l'élément émergent d'origine `recette`."),
+    fromRecette: z.boolean().optional().describe("Signal EXPLICITE d'origine recette (optionnel, T6) : `true` marque l'élément émergent d'origine `recette` même sans `recetteId` (création depuis une recette évaluateur ou un cadrage en cours). Paramètre d'appel, jamais persisté."),
     createdBy: z.string().optional().describe("Acteur créateur."),
   },
-}, async ({ projectId, ref, role, userStory, sourcedPieceId, recetteId, createdBy }) => {
+}, async ({ projectId, ref, role, userStory, sourcedPieceId, recetteId, fromRecette, createdBy }) => {
   try {
-    const feature = await registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, createdBy });
+    const feature = await registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, fromRecette, createdBy });
     return text(JSON.stringify({ ok: true, feature }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1055,20 +1056,21 @@ server.registerTool("feature_delete", {
 });
 
 server.registerTool("rule_register", {
-  description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Association EXPLICITE de rôles OBLIGATOIRE : `roles` (1..N) OU `roleGlobal=true` (s'applique à TOUS les rôles) — sinon l'appel est REFUSÉ. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
+  description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Association EXPLICITE de rôles OBLIGATOIRE : `roles` (1..N) OU `roleGlobal=true` (s'applique à TOUS les rôles) — sinon l'appel est REFUSÉ. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`), SAUF `recetteId`/`fromRecette` fourni (→ émergente origine `recette`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
   inputSchema: {
     projectId: z.string().describe("Projet de la règle."),
     ref: z.string().describe("Référence de la règle (ex. RM-xxxx)."),
     content: z.string().describe("Contenu de la règle métier."),
     sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
     recetteId: z.string().optional().describe("Recette d'origine (optionnel, T6) — marque la règle émergente d'origine `recette`."),
+    fromRecette: z.boolean().optional().describe("Signal EXPLICITE d'origine recette (optionnel, T6) : `true` marque la règle émergente d'origine `recette` même sans `recetteId` (création depuis une recette évaluateur ou un cadrage en cours). Paramètre d'appel, jamais persisté."),
     roles: z.array(z.string()).optional().describe("Rôles EXPLICITES associés (1..N). Requis si `roleGlobal` n'est pas vrai."),
     roleGlobal: z.boolean().optional().describe("true = la règle s'applique à TOUS les rôles (dispense de `roles`)."),
     createdBy: z.string().optional().describe("Acteur créateur."),
   },
-}, async ({ projectId, ref, content, sourcedPieceId, recetteId, roles, roleGlobal, createdBy }) => {
+}, async ({ projectId, ref, content, sourcedPieceId, recetteId, fromRecette, roles, roleGlobal, createdBy }) => {
   try {
-    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, recetteId, roles, roleGlobal, createdBy });
+    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, recetteId, fromRecette, roles, roleGlobal, createdBy });
     return text(JSON.stringify({ ok: true, rule }, null, 2));
   } catch (e) { return err(e.message); }
 });
