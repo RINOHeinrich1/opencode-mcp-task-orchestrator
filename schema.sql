@@ -869,6 +869,17 @@ CREATE TABLE IF NOT EXISTS task_adr (
 );
 CREATE INDEX IF NOT EXISTS idx_task_adr_adr ON task_adr(adr_id);
 
+-- Lien ADR d'une TÂCHE — workflow PROPOSÉ → VALIDÉ (ADR-001 §5, T5/A001).
+-- Miroir EXACT de la DDL posée dans `migrate()` (db.mjs) : colonnes d'état
+-- additivement ajoutées à `task_adr` (idempotent via ADD COLUMN IF NOT EXISTS).
+ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'propose';
+ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS proposed_by TEXT;
+ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS proposed_at TEXT;
+ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS validated_by TEXT;
+ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS validated_at TEXT;
+ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS reason TEXT;
+CREATE INDEX IF NOT EXISTS idx_task_adr_status ON task_adr(status);
+
 CREATE TABLE IF NOT EXISTS recette_sprints (
   recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
   sprint_id  TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
@@ -898,6 +909,34 @@ CREATE TABLE IF NOT EXISTS recette_regles (
   PRIMARY KEY (recette_id, regle_id)
 );
 CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id);
+
+-- ===========================================================================
+-- CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques de
+-- cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
+-- bloquant. Miroir EXACT de la DDL posée dans `migrate()` (db.mjs). L'index
+-- partiel unique garantit UN SEUL signal OPEN par entité.
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS cardinality_signals (
+  signal_id    TEXT PRIMARY KEY,
+  project      TEXT NOT NULL,
+  entity_type  TEXT NOT NULL,
+  entity_id    TEXT NOT NULL,
+  missing      TEXT NOT NULL,
+  detail       TEXT,
+  status       TEXT NOT NULL DEFAULT 'open',
+  origin       TEXT,
+  created_at   TEXT NOT NULL,
+  created_by   TEXT,
+  updated_at   TEXT,
+  resolved_at  TEXT,
+  resolved_by  TEXT,
+  resolution   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cardinality_signals_project ON cardinality_signals(project);
+CREATE INDEX IF NOT EXISTS idx_cardinality_signals_entity ON cardinality_signals(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_cardinality_signals_status ON cardinality_signals(status);
+-- UN SEUL signal OPEN par entité (les signaux résolus restent en historique).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cardinality_signals_open_entity ON cardinality_signals(entity_type, entity_id) WHERE status = 'open';
 
 -- ===========================================================================
 -- SESSION DE MIGRATION DES ANCIENS SPRINTS (ADR-001 §6) — DDL ADDITIVE.
