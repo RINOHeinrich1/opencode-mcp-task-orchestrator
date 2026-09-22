@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-schema-sql-align-migrate";
+const SCHEMA_VERSION = "2026-09-22-recette-evaluateur";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -708,6 +708,50 @@ $$ LANGUAGE plpgsql`);
     PRIMARY KEY (recette_id, regle_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id)");
+  // =========================================================================
+  // ÉVALUATIONS — « Recette » de l'ÉVALUATEUR PRODUIT (T-20260922-100650-sbc1).
+  // Objet de PREMIER NIVEAU DISTINCT de `recettes` (Cadrage technique exécuteur).
+  // Miroir EXACT de la DDL `schema.sql` (A001). AUCUNE conversion en tâches.
+  // =========================================================================
+  await pool().query(`CREATE TABLE IF NOT EXISTS evaluations (
+    evaluation_id   TEXT PRIMARY KEY,
+    project         TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    description     TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      TEXT NOT NULL,
+    confirmed_at    TEXT,
+    confirmed_by    TEXT,
+    organization_id TEXT,
+    created_by      TEXT
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluations_project ON evaluations(project)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluations_created_by ON evaluations(created_by)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS evaluation_fonctionnalites (
+    evaluation_id     TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+    fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+    verdict           TEXT,
+    verdict_comment   TEXT,
+    PRIMARY KEY (evaluation_id, fonctionnalite_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluation_fonctionnalites_feat ON evaluation_fonctionnalites(fonctionnalite_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS evaluation_regles (
+    evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+    regle_id      TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
+    PRIMARY KEY (evaluation_id, regle_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluation_regles_regle ON evaluation_regles(regle_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS evaluation_items (
+    id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+    content       TEXT NOT NULL,
+    category      TEXT NOT NULL DEFAULT 'recommandation',
+    severity      TEXT NOT NULL DEFAULT 'medium',
+    discussion    TEXT,
+    status        TEXT NOT NULL DEFAULT 'open',
+    created_at    TEXT NOT NULL
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluation_items_evaluation ON evaluation_items(evaluation_id)");
   // =========================================================================
   // CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques
   // de cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
@@ -4584,6 +4628,10 @@ export const DOCS_DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_fi
 export const TASK_DOC_TYPES = ["plan", "task_synthese", "task_report", "audit_report", "autre"];
 // Famille « recette » : documents d'appui et rapports de recette.
 export const RECETTE_DOC_TYPES = ["recette_report", "recette_doc"];
+// Pièces jointes d'une ÉVALUATION (recette évaluateur) — artefacts
+// `doc_type='evaluation_doc'`, `content_id` = evaluationId. Famille ISOLÉE des
+// pièces client (la garde photo/vidéo des pièces client ne s'applique pas ici).
+export const EVALUATION_DOC_TYPES = ["evaluation_doc"];
 // Nature d'un artefact (`kind`) — distincte de `doc_type`.
 export const ARTIFACT_KINDS = ["plan", "audit", "report", "autre"];
 // Domaine d'origine d'un artefact (`source`).
@@ -6428,6 +6476,323 @@ export async function confirmRecette({ recetteId, confirmedBy }) {
     );
   }
   return getRecetteById(recetteId);
+}
+
+// ===========================================================================
+// ÉVALUATIONS — « Recette » de l'ÉVALUATEUR PRODUIT (T-20260922-100650-sbc1).
+// Objet de PREMIER NIVEAU DISTINCT de `recettes` (Cadrage technique exécuteur).
+// L'évaluateur décrit le PARCOURS ÉVALUÉ, rattache 1..N fonctionnalités (verdict
+// porté par le lien) + 1..N règles métier, enregistre des ÉLÉMENTS
+// (recommandation | problème) et joint des PIÈCES. Cycle de vie :
+// pending → in_progress → done. AUCUNE conversion en tâches.
+// ===========================================================================
+
+// Catégories / sévérités / statuts de suivi d'un élément d'évaluation.
+export const EVALUATION_ITEM_CATEGORIES = ["recommandation", "probleme"];
+export const EVALUATION_ITEM_SEVERITIES = ["low", "medium", "high", "critical"];
+export const EVALUATION_ITEM_STATUSES = ["open", "treated", "dismissed"];
+// Verdicts possibles d'une fonctionnalité évaluée.
+export const EVALUATION_VERDICTS = ["conforme", "non_conforme", "a_ameliorer"];
+
+function normalizeVerdict(v) {
+  return EVALUATION_VERDICTS.includes(v) ? v : null;
+}
+
+// Crée une recette évaluateur (EVAL-*, status 'pending'). `created_by` est
+// renseigné (indispensable au filtre propriétaire côté panneau). Les liens
+// fonctionnalités/règles sont OPTIONNELS et NON bloquants (comme `startRecette`).
+export async function startEvaluation({ project, title, description, featureIds, ruleIds, organizationId, createdBy }) {
+  await ensureSchema();
+  const p = project && String(project).trim();
+  if (!p) throw new Error("un projet requis pour une évaluation");
+  await assertProjectExists(p);
+  const org = organizationId || await orgIdOfProject(p) || await defaultOrganizationId();
+  const evaluationId = `EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO evaluations (evaluation_id, project, title, description, status, created_at, organization_id, created_by)
+     VALUES ($1,$2,$3,$4,'pending',$5,$6,$7)`,
+    [evaluationId, p, title || `Recette ${p}`, description ?? null, nowIso(), org, createdBy ?? null],
+  );
+  for (const fid of Array.isArray(featureIds) ? featureIds : []) {
+    if (!fid) continue;
+    try { await linkEvaluationFeature({ evaluationId, featureId: fid }); } catch {}
+  }
+  for (const rid of Array.isArray(ruleIds) ? ruleIds : []) {
+    if (!rid) continue;
+    try { await linkEvaluationRule({ evaluationId, ruleId: rid }); } catch {}
+  }
+  return getEvaluationById(evaluationId);
+}
+
+// Liste les évaluations d'un projet (ou toutes).
+export async function listProjectEvaluations(project) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT e.*,
+            (SELECT COUNT(*) FROM evaluation_items i WHERE i.evaluation_id = e.evaluation_id) AS items_count,
+            (SELECT COUNT(*) FROM evaluation_fonctionnalites ef WHERE ef.evaluation_id = e.evaluation_id) AS features_count,
+            (SELECT COUNT(*) FROM evaluation_regles er WHERE er.evaluation_id = e.evaluation_id) AS rules_count
+     FROM evaluations e
+     ${project ? "WHERE e.project = $1" : ""}
+     ORDER BY e.created_at DESC`,
+    project ? [project] : [],
+  )).rows;
+  return Promise.all(rows.map(rowToEvaluationSummary));
+}
+
+async function rowToEvaluationSummary(r) {
+  const repos = await reposOfProject(r.project);
+  return {
+    evaluationId: r.evaluation_id,
+    project: r.project,
+    repos,
+    title: r.title,
+    description: r.description ?? null,
+    status: r.status,
+    createdAt: r.created_at,
+    confirmedAt: r.confirmed_at,
+    confirmedBy: r.confirmed_by,
+    createdBy: r.created_by ?? null,
+    itemsCount: Number(r.items_count),
+    featuresCount: Number(r.features_count),
+    rulesCount: Number(r.rules_count),
+  };
+}
+
+// Détail complet : éléments + verdicts (fonctionnalités) + règles + pièces.
+export async function getEvaluationById(evaluationId) {
+  await ensureSchema();
+  const r = (await pool().query("SELECT * FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  if (!r) return null;
+  const items = (await pool().query(
+    "SELECT id, content, category, severity, discussion, status, created_at FROM evaluation_items WHERE evaluation_id = $1 ORDER BY id ASC",
+    [evaluationId],
+  )).rows.map((i) => ({
+    itemId: Number(i.id),
+    content: i.content,
+    category: i.category,
+    severity: i.severity,
+    discussion: i.discussion,
+    status: i.status,
+    createdAt: i.created_at,
+  }));
+  const documents = await listEvaluationDocuments(evaluationId);
+  const repos = await reposOfProject(r.project);
+  const [featureRows, ruleRows] = await Promise.all([
+    pool().query(
+      `SELECT f.*, ef.verdict, ef.verdict_comment FROM fonctionnalites f
+         JOIN evaluation_fonctionnalites ef ON ef.fonctionnalite_id = f.id
+        WHERE ef.evaluation_id = $1 ORDER BY f.ref ASC`, [evaluationId]),
+    pool().query(
+      `SELECT rm.* FROM regles_metier rm JOIN evaluation_regles er ON er.regle_id = rm.id
+        WHERE er.evaluation_id = $1 ORDER BY rm.ref ASC`, [evaluationId]),
+  ]);
+  const fonctionnalites = featureRows.rows.map((x) => ({
+    ...rowToFonctionnalite(x),
+    verdict: x.verdict ?? null,
+    verdictComment: x.verdict_comment ?? null,
+  }));
+  const regles = ruleRows.rows.map(rowToRegle);
+  return {
+    evaluationId: r.evaluation_id,
+    project: r.project,
+    repos,
+    title: r.title,
+    description: r.description ?? null,
+    status: r.status,
+    createdAt: r.created_at,
+    confirmedAt: r.confirmed_at,
+    confirmedBy: r.confirmed_by,
+    createdBy: r.created_by ?? null,
+    organizationId: r.organization_id ?? null,
+    items,
+    documents,
+    fonctionnalites,
+    regles,
+  };
+}
+
+// --- Éléments (recommandation | problème) ----------------------------------
+export async function addEvaluationItem({ evaluationId, content, category, severity, discussion }) {
+  await ensureSchema();
+  if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément d'évaluation");
+  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const cat = EVALUATION_ITEM_CATEGORIES.includes(category) ? category : "recommandation";
+  const sev = EVALUATION_ITEM_SEVERITIES.includes(severity) ? severity : "medium";
+  const r = (await pool().query(
+    `INSERT INTO evaluation_items (evaluation_id, content, category, severity, discussion, status, created_at)
+     VALUES ($1,$2,$3,$4,$5,'open',$6) RETURNING id`,
+    [evaluationId, String(content).trim(), cat, sev, discussion ?? null, nowIso()],
+  )).rows[0];
+  return getEvaluationItem(Number(r.id));
+}
+
+export async function updateEvaluationItem({ itemId, content, category, severity, discussion, status }) {
+  await ensureSchema();
+  const sets = [];
+  const params = [];
+  if (content !== undefined) {
+    if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément d'évaluation");
+    params.push(String(content).trim()); sets.push(`content = $${params.length}`);
+  }
+  if (category !== undefined) { params.push(EVALUATION_ITEM_CATEGORIES.includes(category) ? category : "recommandation"); sets.push(`category = $${params.length}`); }
+  if (severity !== undefined) { params.push(EVALUATION_ITEM_SEVERITIES.includes(severity) ? severity : "medium"); sets.push(`severity = $${params.length}`); }
+  if (discussion !== undefined) { params.push(discussion); sets.push(`discussion = $${params.length}`); }
+  if (status !== undefined) { params.push(EVALUATION_ITEM_STATUSES.includes(status) ? status : "open"); sets.push(`status = $${params.length}`); }
+  if (!sets.length) return getEvaluationItem(itemId);
+  params.push(Number(itemId));
+  const r = await pool().query(`UPDATE evaluation_items SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING id`, params);
+  if (!r.rows[0]) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
+  return getEvaluationItem(Number(itemId));
+}
+
+export async function deleteEvaluationItem({ itemId }) {
+  await ensureSchema();
+  const r = await pool().query("DELETE FROM evaluation_items WHERE id = $1 RETURNING id", [Number(itemId)]);
+  if (!r.rows[0]) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
+  return { ok: true, itemId: Number(itemId) };
+}
+
+async function getEvaluationItem(itemId) {
+  const r = (await pool().query(
+    "SELECT id, evaluation_id, content, category, severity, discussion, status, created_at FROM evaluation_items WHERE id = $1",
+    [itemId],
+  )).rows[0];
+  return r ? {
+    itemId: Number(r.id),
+    evaluationId: r.evaluation_id,
+    content: r.content,
+    category: r.category,
+    severity: r.severity,
+    discussion: r.discussion,
+    status: r.status,
+    createdAt: r.created_at,
+  } : null;
+}
+
+// --- Liens fonctionnalités (verdict porté par le lien) ---------------------
+export async function linkEvaluationFeature({ evaluationId, featureId, verdict, verdictComment } = {}) {
+  await ensureSchema();
+  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const f = await getFeature(featureId);
+  if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  const v = normalizeVerdict(verdict);
+  const ins = await pool().query(
+    `INSERT INTO evaluation_fonctionnalites (evaluation_id, fonctionnalite_id, verdict, verdict_comment)
+     VALUES ($1,$2,$3,$4)
+     ON CONFLICT (evaluation_id, fonctionnalite_id) DO UPDATE
+       SET verdict = COALESCE(EXCLUDED.verdict, evaluation_fonctionnalites.verdict),
+           verdict_comment = COALESCE(EXCLUDED.verdict_comment, evaluation_fonctionnalites.verdict_comment)`,
+    [evaluationId, f.id, v, verdictComment ?? null],
+  );
+  return { ok: true, evaluationId, featureId: f.id, verdict: v, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkEvaluationFeature({ evaluationId, featureId } = {}) {
+  await ensureSchema();
+  if (!evaluationId || !featureId) throw new Error("evaluationId et featureId requis");
+  const del = await pool().query(
+    "DELETE FROM evaluation_fonctionnalites WHERE evaluation_id = $1 AND fonctionnalite_id = $2",
+    [String(evaluationId), String(featureId)],
+  );
+  return { ok: true, evaluationId: String(evaluationId), featureId: String(featureId), unlinked: del.rowCount > 0 };
+}
+
+// --- Liens règles métier ----------------------------------------------------
+export async function linkEvaluationRule({ evaluationId, ruleId } = {}) {
+  await ensureSchema();
+  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const rule = await getRule(ruleId);
+  if (!rule) throw new Error(`règle métier inconnue : ${ruleId}`);
+  const ins = await pool().query(
+    "INSERT INTO evaluation_regles (evaluation_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [evaluationId, rule.id],
+  );
+  return { ok: true, evaluationId, ruleId: rule.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkEvaluationRule({ evaluationId, ruleId } = {}) {
+  await ensureSchema();
+  if (!evaluationId || !ruleId) throw new Error("evaluationId et ruleId requis");
+  const del = await pool().query(
+    "DELETE FROM evaluation_regles WHERE evaluation_id = $1 AND regle_id = $2",
+    [String(evaluationId), String(ruleId)],
+  );
+  return { ok: true, evaluationId: String(evaluationId), ruleId: String(ruleId), unlinked: del.rowCount > 0 };
+}
+
+// Positionne le VERDICT d'une fonctionnalité DÉJÀ rattachée à l'évaluation.
+export async function setEvaluationVerdict({ evaluationId, fonctionnaliteId, verdict, verdictComment } = {}) {
+  await ensureSchema();
+  const v = normalizeVerdict(verdict);
+  const r = await pool().query(
+    `UPDATE evaluation_fonctionnalites SET verdict = $1, verdict_comment = $2
+      WHERE evaluation_id = $3 AND fonctionnalite_id = $4 RETURNING fonctionnalite_id`,
+    [v, verdictComment ?? null, evaluationId, fonctionnaliteId],
+  );
+  if (!r.rows[0]) throw new Error(`fonctionnalité ${fonctionnaliteId} non rattachée à l'évaluation ${evaluationId}`);
+  return { ok: true, evaluationId, fonctionnaliteId, verdict: v };
+}
+
+// --- Pièces jointes (lien / document / photo / vidéo) -----------------------
+export async function addEvaluationDocument({ evaluationId, title, nature, source, path, artifactId }) {
+  await ensureSchema();
+  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  await pool().query(
+    `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
+     VALUES ($1,'evaluation_doc',$2,'autre',$3,$4,$5,$6,$7,$8)`,
+    [id, String(evaluationId), title ?? null, nature ?? null, source || "import", path ?? null,
+     artifactId ? { artifactId } : null, nowIso()],
+  );
+  return listEvaluationDocuments(evaluationId);
+}
+
+export async function listEvaluationDocuments(evaluationId) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT d.id, d.artifact_id, d.content_id, d.title, d.nature, d.source, d.path, d.meta, d.created_at,
+            a.title AS artifact_title
+     FROM artifacts d
+     LEFT JOIN artifacts a ON a.artifact_id = (d.meta->>'artifactId')
+     WHERE d.content_id = $1 AND d.doc_type = ANY($2) ORDER BY d.id ASC`,
+    [String(evaluationId), EVALUATION_DOC_TYPES],
+  )).rows;
+  return rows.map((r) => ({
+    documentId: Number(r.id),
+    evaluationId: r.content_id,
+    title: r.title || r.artifact_title || (r.path ? r.path.split("/").pop() : null) || null,
+    nature: r.nature,
+    source: r.source,
+    path: r.path,
+    meta: r.meta ?? null,
+    artifactId: r.artifact_id ?? null,
+    createdAt: r.created_at,
+  }));
+}
+
+export async function removeEvaluationDocument(documentId) {
+  await ensureSchema();
+  const r = (await pool().query(
+    "DELETE FROM artifacts WHERE id = $1 AND doc_type = ANY($2) RETURNING content_id",
+    [documentId, EVALUATION_DOC_TYPES],
+  )).rows[0];
+  return r ? r.content_id : null;
+}
+
+// Clôture (`pending→in_progress→done`) SANS créer de tâche (ADR-001).
+export async function confirmEvaluation({ evaluationId, confirmedBy } = {}) {
+  await ensureSchema();
+  const r = (await pool().query(
+    "UPDATE evaluations SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE evaluation_id = $3 RETURNING evaluation_id",
+    [nowIso(), confirmedBy ?? "human", evaluationId],
+  )).rows[0];
+  if (!r) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  return getEvaluationById(evaluationId);
 }
 
 // ===========================================================================

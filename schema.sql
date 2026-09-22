@@ -911,6 +911,64 @@ CREATE TABLE IF NOT EXISTS recette_regles (
 CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id);
 
 -- ===========================================================================
+-- ÉVALUATIONS — « Recette » de l'ÉVALUATEUR PRODUIT (T-20260922-100650-sbc1).
+-- Objet de PREMIER NIVEAU, DISTINCT de `recettes` (qui porte désormais le
+-- CADRAGE TECHNIQUE côté exécuteur). L'évaluateur décrit le PARCOURS ÉVALUÉ
+-- (`description`), rattache 1..N FONCTIONNALITÉS (le VERDICT est porté par le
+-- lien) + 1..N RÈGLES MÉTIER, enregistre des ÉLÉMENTS (recommandation |
+-- problème, catégorie + sévérité + suivi) et joint des PIÈCES (lien / document
+-- / photo / vidéo via `artifacts`, `doc_type='evaluation_doc'`).
+-- Cycle de vie : pending | in_progress | done. AUCUNE conversion en tâches.
+-- `created_by` est indispensable au filtre propriétaire (l'évaluateur ne voit
+-- que SES recettes : `recetteOwnerScope`). Miroir DDL dans `migrate()` (db.mjs).
+-- ===========================================================================
+CREATE TABLE IF NOT EXISTS evaluations (
+  evaluation_id   TEXT PRIMARY KEY,                 -- EVAL-<ts>-<rand>
+  project         TEXT NOT NULL,                    -- projet (produit) rattaché
+  title           TEXT NOT NULL,                    -- titre court
+  description     TEXT,                             -- PARCOURS ÉVALUÉ (description longue)
+  status          TEXT NOT NULL DEFAULT 'pending',  -- pending | in_progress | done
+  created_at      TEXT NOT NULL,
+  confirmed_at    TEXT,
+  confirmed_by    TEXT,
+  organization_id TEXT,
+  created_by      TEXT                              -- propriétaire (filtre évaluateur)
+);
+CREATE INDEX IF NOT EXISTS idx_evaluations_project ON evaluations(project);
+CREATE INDEX IF NOT EXISTS idx_evaluations_created_by ON evaluations(created_by);
+
+-- Fonctionnalités évaluées (1..N). Le VERDICT est porté par le LIEN.
+CREATE TABLE IF NOT EXISTS evaluation_fonctionnalites (
+  evaluation_id     TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+  fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
+  verdict           TEXT,                           -- conforme | non_conforme | a_ameliorer | NULL
+  verdict_comment   TEXT,
+  PRIMARY KEY (evaluation_id, fonctionnalite_id)
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_fonctionnalites_feat ON evaluation_fonctionnalites(fonctionnalite_id);
+
+-- Règles métier évaluées (1..N). Miroir de `evaluation_fonctionnalites`.
+CREATE TABLE IF NOT EXISTS evaluation_regles (
+  evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+  regle_id      TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
+  PRIMARY KEY (evaluation_id, regle_id)
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_regles_regle ON evaluation_regles(regle_id);
+
+-- Éléments évalués : RECOMMANDATION ou PROBLÈME (catégorie + sévérité + suivi).
+CREATE TABLE IF NOT EXISTS evaluation_items (
+  id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+  content       TEXT NOT NULL,                      -- la recommandation / le problème
+  category      TEXT NOT NULL DEFAULT 'recommandation', -- recommandation | probleme
+  severity      TEXT NOT NULL DEFAULT 'medium',     -- low | medium | high | critical
+  discussion    TEXT,                               -- échanges liés
+  status        TEXT NOT NULL DEFAULT 'open',       -- open | treated | dismissed
+  created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_evaluation_items_evaluation ON evaluation_items(evaluation_id);
+
+-- ===========================================================================
 -- CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques de
 -- cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
 -- bloquant. Miroir EXACT de la DDL posée dans `migrate()` (db.mjs). L'index
