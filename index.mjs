@@ -178,12 +178,14 @@ import {
   registerFeature,
   updateFeature,
   markFeatureImplemented,
+  markFeatureDevStatus,
   getFeature,
   listFeatures,
   deleteFeature,
   registerRule,
   updateRule,
   markRuleImplemented,
+  markRuleRespectStatus,
   getRule,
   listRules,
   deleteRule,
@@ -980,7 +982,7 @@ server.registerTool("feature_register", {
 });
 
 server.registerTool("feature_update", {
-  description: "MODIFIE partiellement une FONCTIONNALITÉ (champs fournis uniquement) : `ref`, `role`, `userStory`, `sourcedPieceId` (re-gardée), et l'ÉTAT D'IMPLÉMENTATION `implemented`/`implementedOrigin`/`implementedNote`. `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `updated_at` posé. L'émergence reste un axe distinct (inchangée). Retourne le détail.",
+  description: "MODIFIE partiellement une FONCTIONNALITÉ (champs fournis uniquement) : `ref`, `role`, `userStory`, `sourcedPieceId` (re-gardée), l'ÉTAT D'IMPLÉMENTATION (= axe INTÉGRATION) `implemented`/`implementedOrigin`/`implementedNote`, et le STATUT DE DÉVELOPPEMENT `devStatus`/`devStatusSource`/`devStatusNote` (axe DISTINCT, issu de l'analyse du code). `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `devStatus` ∈ complet | non_demarre | partiel | incoherent ; `devStatusSource` ∈ analyse_code | evaluateur | agent | humain (OBLIGATOIRE pour poser un statut) ; `devStatus` vide ⇒ déqualification. `updated_at` posé. L'émergence reste un axe distinct (inchangée). Retourne le détail.",
   inputSchema: {
     featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
     ref: z.string().optional().describe("Nouvelle référence (US-xxx)."),
@@ -990,17 +992,20 @@ server.registerTool("feature_update", {
     implemented: z.boolean().optional().describe("État d'implémentation explicite (true/false) ; false ⇒ reset de l'origine et de la traçabilité."),
     implementedOrigin: z.enum(["ecosystem", "hors_ecosystem"]).optional().describe("Origine de l'implémentation — ecosystem (par une tâche de l'écosystème) | hors_ecosystem. Fournie ⇒ implémentée."),
     implementedNote: z.string().optional().describe("Motif/note libre de la qualification."),
+    devStatus: z.enum(["complet", "non_demarre", "partiel", "incoherent"]).optional().describe("Statut de DÉVELOPPEMENT (analyse du code) : complet | non_demarre | partiel | incoherent. Vide ⇒ déqualification."),
+    devStatusSource: z.enum(["analyse_code", "evaluateur", "agent", "humain"]).optional().describe("Source du statut de développement (obligatoire pour poser un statut) : qui alimente le statut."),
+    devStatusNote: z.string().optional().describe("Motif/note libre du statut de développement."),
     by: z.string().optional().describe("Acteur de la modification."),
   },
-}, async ({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, by }) => {
+}, async ({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, devStatus, devStatusSource, devStatusNote, by }) => {
   try {
-    const feature = await updateFeature({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, by });
+    const feature = await updateFeature({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, devStatus, devStatusSource, devStatusNote, by });
     return text(JSON.stringify({ ok: true, feature }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("feature_mark_implemented", {
-  description: "MARQUE une FONCTIONNALITÉ comme IMPLÉMENTÉE avec son ORIGINE (intention explicite pour agents/panneau) : `origin` REQUIS (`ecosystem` = implémentée par une/des tâche(s) de l'écosystème | `hors_ecosystem` = implémentée EN DEHORS de l'écosystème, sans tâche liée). Idempotent (re-qualifier écrase proprement). N'écrit JAMAIS l'émergence. Retourne le détail.",
+  description: "MARQUE une FONCTIONNALITÉ comme IMPLÉMENTÉE avec son ORIGINE (= axe INTÉGRATION, intention explicite pour agents/panneau) : `origin` REQUIS (`ecosystem` = implémentée par une/des tâche(s) de l'écosystème | `hors_ecosystem` = implémentée EN DEHORS de l'écosystème, sans tâche liée). Idempotent (re-qualifier écrase proprement). N'écrit JAMAIS l'émergence. Retourne le détail.",
   inputSchema: {
     featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
     origin: z.enum(["ecosystem", "hors_ecosystem"]).describe("Origine de l'implémentation (requise)."),
@@ -1014,8 +1019,24 @@ server.registerTool("feature_mark_implemented", {
   } catch (e) { return err(e.message); }
 });
 
+server.registerTool("feature_dev_status_set", {
+  description: "MARQUE le STATUT DE DÉVELOPPEMENT d'une FONCTIONNALITÉ (intention explicite pour agents/panneau) : `devStatus` REQUIS ∈ `complet` | `non_demarre` | `partiel` | `incoherent` (issu de l'ANALYSE DU CODE) ; `source` REQUISE ∈ `analyse_code` | `evaluateur` | `agent` | `humain` (traçabilité « qui alimente le statut »). AXE DISTINCT de l'intégration (`implemented`) et du verdict d'évaluation (lecture seule). Idempotent. Retourne le détail.",
+  inputSchema: {
+    featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
+    devStatus: z.enum(["complet", "non_demarre", "partiel", "incoherent"]).describe("Statut de développement (analyse du code)."),
+    source: z.enum(["analyse_code", "evaluateur", "agent", "humain"]).describe("Source du statut (qui alimente) — requise."),
+    note: z.string().optional().describe("Motif/note libre."),
+    by: z.string().optional().describe("Acteur de la qualification."),
+  },
+}, async ({ featureId, devStatus, source, note, by }) => {
+  try {
+    const feature = await markFeatureDevStatus({ featureId, devStatus, source, note, by });
+    return text(JSON.stringify({ ok: true, feature }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
 server.registerTool("feature_get", {
-  description: "DÉTAIL d'une FONCTIONNALITÉ + liens : règles métier, scénarios Gherkin (`e2e_tests`), ADR, sprints, tâches, recettes. Expose l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote` (et l'émergence, axe distinct). `err` si inconnue.",
+  description: "DÉTAIL d'une FONCTIONNALITÉ + liens : règles métier, scénarios Gherkin (`e2e_tests`), ADR, sprints, tâches, recettes. Expose l'axe INTÉGRATION (`implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`), l'axe STATUT DE DÉVELOPPEMENT (`devStatus`/`devStatusSource`/`devStatusNote`/`devStatusAt`/`devStatusBy`, distinct) ET les VERDICTS D'ÉVALUATION (`evaluationVerdicts`, LECTURE SEULE, axe distinct). L'émergence reste un axe distinct. `err` si inconnue.",
   inputSchema: { featureId: z.string().describe("Identifiant de la fonctionnalité.") },
 }, async ({ featureId }) => {
   try {
@@ -1026,7 +1047,7 @@ server.registerTool("feature_get", {
 });
 
 server.registerTool("feature_list", {
-  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`, le champ additif `links` (compteurs de liens `{rules,gherkin,adrs,sprints,tasks,recettes}`, calculés en UNE requête bulk — plus de N+1 côté panneau) ET le champ additif `sprintIds` (ids des sprints liés via `sprint_fonctionnalites` ; `[]` = « Sans sprint »), issu de la MÊME requête bulk. Retourne `{ count, features }`.",
+  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose l'axe INTÉGRATION (`implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`), l'axe STATUT DE DÉVELOPPEMENT (`devStatus`/`devStatusSource`/`devStatusNote`/`devStatusAt`/`devStatusBy`), le champ additif `gherkinTests` (TESTS E2E liés 1..N : `[{e2eTestId,title,status}]`, liens cliquables, calculés en UNE requête bulk), le champ additif `links` (compteurs `{rules,gherkin,adrs,sprints,tasks,recettes}`) ET le champ additif `sprintIds` — le tout en requêtes bulk (0 N+1). Retourne `{ count, features }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les fonctionnalités."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
@@ -1076,7 +1097,7 @@ server.registerTool("rule_register", {
 });
 
 server.registerTool("rule_update", {
-  description: "MODIFIE partiellement une RÈGLE MÉTIER (champs fournis uniquement) : `ref`, `content`, `sourcedPieceId` (re-gardée), l'ASSOCIATION DE RÔLES `roles` (1..N) / `roleGlobal` (tous les rôles), et l'ÉTAT D'IMPLÉMENTATION `implemented`/`implementedOrigin`/`implementedNote`. Pour l'association, l'état EFFECTIF est évalué (champ non fourni ⇒ valeur courante) puis la garde « ≥1 rôle OU global » s'applique. `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `updated_at` posé. L'émergence reste un axe distinct. Retourne le détail.",
+  description: "MODIFIE partiellement une RÈGLE MÉTIER (champs fournis uniquement) : `ref`, `content`, `sourcedPieceId` (re-gardée), l'ASSOCIATION DE RÔLES `roles` (1..N) / `roleGlobal` (tous les rôles), l'ÉTAT D'IMPLÉMENTATION `implemented`/`implementedOrigin`/`implementedNote` et le STATUT DE RESPECT `respectStatus`/`respectStatusNote` (axe dédié, DISTINCT du développement). Pour l'association, l'état EFFECTIF est évalué (champ non fourni ⇒ valeur courante) puis la garde « ≥1 rôle OU global » s'applique. `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `respectStatus` ∈ respectee | non_respectee ; vide ⇒ déqualification. `updated_at` posé. L'émergence reste un axe distinct. Retourne le détail.",
   inputSchema: {
     ruleId: z.string().describe("Identifiant de la règle (RMET-<ts>-<rand>)."),
     ref: z.string().optional().describe("Nouvelle référence (RM-xxxx)."),
@@ -1087,11 +1108,13 @@ server.registerTool("rule_update", {
     implemented: z.boolean().optional().describe("État d'implémentation explicite (true/false) ; false ⇒ reset de l'origine et de la traçabilité."),
     implementedOrigin: z.enum(["ecosystem", "hors_ecosystem"]).optional().describe("Origine de l'implémentation — ecosystem | hors_ecosystem. Fournie ⇒ implémentée."),
     implementedNote: z.string().optional().describe("Motif/note libre de la qualification."),
+    respectStatus: z.enum(["respectee", "non_respectee"]).optional().describe("Statut de RESPECT de la règle (axe dédié, distinct du développement) : respectee | non_respectee. Vide ⇒ déqualification."),
+    respectStatusNote: z.string().optional().describe("Motif/note libre du statut de respect."),
     by: z.string().optional().describe("Acteur de la modification."),
   },
-}, async ({ ruleId, ref, content, sourcedPieceId, roles, roleGlobal, implemented, implementedOrigin, implementedNote, by }) => {
+}, async ({ ruleId, ref, content, sourcedPieceId, roles, roleGlobal, implemented, implementedOrigin, implementedNote, respectStatus, respectStatusNote, by }) => {
   try {
-    const rule = await updateRule({ ruleId, ref, content, sourcedPieceId, roles, roleGlobal, implemented, implementedOrigin, implementedNote, by });
+    const rule = await updateRule({ ruleId, ref, content, sourcedPieceId, roles, roleGlobal, implemented, implementedOrigin, implementedNote, respectStatus, respectStatusNote, by });
     return text(JSON.stringify({ ok: true, rule }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1111,8 +1134,23 @@ server.registerTool("rule_mark_implemented", {
   } catch (e) { return err(e.message); }
 });
 
+server.registerTool("rule_respect_status_set", {
+  description: "MARQUE le STATUT DE RESPECT d'une RÈGLE MÉTIER (intention explicite pour agents/panneau) : `respectStatus` REQUIS ∈ `respectee` | `non_respectee` — le RESPECT de la règle, PAS un statut de développement (axe DISTINCT). Idempotent. Retourne le détail.",
+  inputSchema: {
+    ruleId: z.string().describe("Identifiant de la règle (RMET-<ts>-<rand>)."),
+    respectStatus: z.enum(["respectee", "non_respectee"]).describe("Statut de respect de la règle (requis)."),
+    note: z.string().optional().describe("Motif/note libre."),
+    by: z.string().optional().describe("Acteur de la qualification."),
+  },
+}, async ({ ruleId, respectStatus, note, by }) => {
+  try {
+    const rule = await markRuleRespectStatus({ ruleId, respectStatus, note, by });
+    return text(JSON.stringify({ ok: true, rule }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
 server.registerTool("rule_get", {
-  description: "DÉTAIL d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse), sprints. Expose l'ASSOCIATION EXPLICITE de rôles `roles` (1..N) / `roleGlobal` (true = tous les rôles) — plus de dérivation depuis les fonctionnalités liées — et l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. `err` si inconnue.",
+  description: "DÉTAIL d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse), sprints. Expose l'ASSOCIATION EXPLICITE de rôles `roles` (1..N) / `roleGlobal` (true = tous les rôles), l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote` ET le STATUT DE RESPECT `respectStatus`/`respectStatusNote`/`respectStatusAt`/`respectStatusBy` (axe dédié, distinct du développement). `err` si inconnue.",
   inputSchema: { ruleId: z.string().describe("Identifiant de la règle.") },
 }, async ({ ruleId }) => {
   try {
@@ -1123,7 +1161,7 @@ server.registerTool("rule_get", {
 });
 
 server.registerTool("rule_list", {
-  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`, le champ additif `links` (compteurs de liens `{features,sprints}`, calculés en UNE requête bulk — plus de N+1 côté panneau), le champ additif `sprintIds` (ids des sprints liés via `sprint_regles` ; `[]` = « Sans sprint ») ET l'ASSOCIATION EXPLICITE de rôles `roles` (1..N) / `roleGlobal` (true = tous les rôles), lue sur la règle (plus de dérivation depuis les fonctionnalités liées). `links`/`sprintIds` proviennent de la MÊME requête bulk (0 N+1). Retourne `{ count, rules }`.",
+  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`, le STATUT DE RESPECT `respectStatus`/`respectStatusNote`/`respectStatusAt`/`respectStatusBy` (axe dédié), le champ additif `links` (compteurs `{features,sprints}`, calculés en UNE requête bulk), le champ additif `sprintIds` ET l'ASSOCIATION EXPLICITE de rôles `roles` (1..N) / `roleGlobal`. `links`/`sprintIds` proviennent de la MÊME requête bulk (0 N+1). Retourne `{ count, rules }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les règles."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
