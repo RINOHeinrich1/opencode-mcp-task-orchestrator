@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-evaluation-items-workflow";
+const SCHEMA_VERSION = "2026-09-22-e2e-incoherent";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -151,6 +151,10 @@ async function migrate() {
   await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS description TEXT");
   await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS gherkin TEXT");
   await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS session_id TEXT");
+  // Signal « comportement réel ≠ scénario » (évaluateur) : remarques + auteur + date.
+  await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS incoherent_remarks TEXT");
+  await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS incoherent_by TEXT");
+  await pool().query("ALTER TABLE e2e_tests ADD COLUMN IF NOT EXISTS incoherent_at TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_e2e_tests_project ON e2e_tests(project)");
   // Projets couverts par le comportement (N:N) — inclut le repo source.
   await pool().query(`CREATE TABLE IF NOT EXISTS e2e_test_projects (
@@ -7224,6 +7228,23 @@ export async function markE2ETestObsolete(e2eTestId) {
   return getE2ETest(e2eTestId);
 }
 
+// Signal ÉVALUATEUR : le comportement réel ne correspond pas au scénario / à la règle.
+// UNIQUE écriture E2E permise à l'évaluateur : statut INCOHERENT + remarques (auteur + date).
+// Aucune modification du code de test : c'est un signal, pas une édition du spec.
+export async function markE2ETestIncoherent({ e2eTestId, remarks, by }) {
+  await ensureSchema();
+  const txt = String(remarks || "").trim();
+  if (!txt) throw new Error("remarks requis : décrivez l'incohérence constatée (comportement réel ≠ scénario).");
+  const now = nowIso();
+  const r = await pool().query(
+    `UPDATE e2e_tests SET status = 'INCOHERENT', incoherent_remarks = $1, incoherent_by = $2,
+       incoherent_at = $3, updated_at = $3 WHERE id = $4 RETURNING id`,
+    [txt, by ? String(by) : null, now, e2eTestId],
+  );
+  if (!r.rows[0]) throw new Error(`test inconnu : ${e2eTestId}`);
+  return getE2ETest(e2eTestId);
+}
+
 // Passe un test en DRAFT (entité en cours de création via une session test-agent).
 export async function draftE2ETest(e2eTestId) {
   await ensureSchema();
@@ -7336,6 +7357,10 @@ export async function getE2ETest(e2eTestId) {
     version: t.version,
     firstSeenAt: t.first_seen_at,
     updatedAt: t.updated_at,
+    // Signal évaluateur « comportement réel ≠ scénario » (statut INCOHERENT).
+    incoherentRemarks: t.incoherent_remarks,
+    incoherentBy: t.incoherent_by,
+    incoherentAt: t.incoherent_at,
     repos,          // ADR 11 : repos traversés (détail) — le spec vit dans l'un d'eux
     projects,       // rétrocompat ADR 08 : projets couverts (obsolète, gardé)
     params,
@@ -7398,6 +7423,9 @@ export async function listE2ETests({ project, taskId, status, search, limit = 50
     gherkin: r.gherkin,
     status: r.status,
     sessionId: r.session_id,
+    incoherentRemarks: r.incoherent_remarks,
+    incoherentBy: r.incoherent_by,
+    incoherentAt: r.incoherent_at,
     projects: r.projects || [],
     repos: r.repos || [],
     taskCount: r.task_count || 0,

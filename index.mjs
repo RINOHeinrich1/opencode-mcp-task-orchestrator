@@ -54,6 +54,7 @@ import {
   upsertE2ETest,
   reactivateE2ETest,
   markE2ETestObsolete,
+  markE2ETestIncoherent,
   draftE2ETest,
   setE2ETestSession,
   updateE2ETestMeta,
@@ -3731,6 +3732,20 @@ server.registerTool("e2e_test_obsolete", {
   } catch (e) { return err(e.message); }
 });
 
+server.registerTool("e2e_test_incoherent", {
+  description: "Marque un test E2E INCOHERENT (signal ÉVALUATEUR : le comportement réel ne correspond pas au scénario / à la règle) avec des remarques OBLIGATOIRES. Unique écriture E2E permise à l'évaluateur — ne modifie ni le spec ni la formalisation. Persiste incoherent_remarks/incoherent_by/incoherent_at.",
+  inputSchema: {
+    e2eTestId: z.string(),
+    remarks: z.string().describe("Remarques obligatoires décrivant l'incohérence constatée (comportement réel ≠ scénario)."),
+    by: z.string().optional().describe("Auteur du marquage (ex. évaluateur / recette)."),
+  },
+}, async ({ e2eTestId, remarks, by }) => {
+  try {
+    const t = await markE2ETestIncoherent({ e2eTestId, remarks, by });
+    return text(JSON.stringify({ ok: true, test: t }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
 server.registerTool("e2e_test_draft", {
   description: "Passe un test E2E en DRAFT (entité créée, spec en cours de rédaction via une session test-agent).",
   inputSchema: { e2eTestId: z.string() },
@@ -3779,7 +3794,7 @@ server.registerTool("e2e_list", {
   inputSchema: {
     taskId: z.string().optional().describe("Si fourni : tests associés à cette tâche (relation + dernière exécution sur la tâche)."),
     project: z.string().optional().describe("Filtre : projet couvert par le comportement."),
-    status: z.string().optional().describe("Filtre statut : ACTIVE | OBSOLETE | QUARANTINE | DRAFT."),
+    status: z.string().optional().describe("Filtre statut : ACTIVE | OBSOLETE | QUARANTINE | DRAFT | INCOHERENT."),
     search: z.string().optional().describe("Recherche texte (titre / scénario / spec file)."),
     limit: z.number().int().optional(),
   },

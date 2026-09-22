@@ -550,8 +550,11 @@ CREATE TABLE IF NOT EXISTS e2e_tests (
   title          TEXT,
   description    TEXT,
   gherkin        TEXT,                         -- formalisation Gherkin du comportement (test-agent)
-  status         TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | OBSOLETE | QUARANTINE | DRAFT
-  session_id     TEXT,                         -- session de création/mise à jour du test
+  status             TEXT NOT NULL DEFAULT 'ACTIVE',  -- ACTIVE | OBSOLETE | QUARANTINE | DRAFT | INCOHERENT
+  session_id         TEXT,                         -- session de création/mise à jour du test
+  incoherent_remarks TEXT,                         -- signal évaluateur : comportement réel ≠ scénario
+  incoherent_by      TEXT,                         -- auteur du marquage « incohérent »
+  incoherent_at      TEXT,                         -- date du marquage « incohérent »
   version        INTEGER NOT NULL DEFAULT 1,
   meta           JSONB,
   first_seen_at  TEXT NOT NULL,
