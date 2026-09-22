@@ -1321,7 +1321,7 @@ server.registerTool("task_adr_list", {
 });
 
 server.registerTool("recette_sprint_link", {
-  description: "LIE une RECETTE à un SPRINT (`recette_sprints`, idempotent). Valide la recette et le sprint.",
+  description: "Alias legacy de `cadrage_sprint_link`. LIE une RECETTE à un SPRINT (`recette_sprints`, idempotent). Valide la recette et le sprint.",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     sprintId: z.string().describe("Sprint."),
@@ -1332,7 +1332,7 @@ server.registerTool("recette_sprint_link", {
 });
 
 server.registerTool("recette_sprint_unlink", {
-  description: "DÉLIE une RECETTE d'un SPRINT (`recette_sprints`).",
+  description: "Alias legacy de `cadrage_sprint_unlink`. DÉLIE une RECETTE d'un SPRINT (`recette_sprints`).",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     sprintId: z.string().describe("Sprint."),
@@ -1343,7 +1343,7 @@ server.registerTool("recette_sprint_unlink", {
 });
 
 server.registerTool("recette_feature_link", {
-  description: "LIE une RECETTE à une FONCTIONNALITÉ (`recette_fonctionnalites`, idempotent).",
+  description: "Alias legacy de `cadrage_feature_link`. LIE une RECETTE à une FONCTIONNALITÉ (`recette_fonctionnalites`, idempotent).",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     featureId: z.string().describe("Fonctionnalité."),
@@ -1354,7 +1354,7 @@ server.registerTool("recette_feature_link", {
 });
 
 server.registerTool("recette_feature_unlink", {
-  description: "DÉLIE une RECETTE d'une FONCTIONNALITÉ (`recette_fonctionnalites`).",
+  description: "Alias legacy de `cadrage_feature_unlink`. DÉLIE une RECETTE d'une FONCTIONNALITÉ (`recette_fonctionnalites`).",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     featureId: z.string().describe("Fonctionnalité."),
@@ -1365,7 +1365,7 @@ server.registerTool("recette_feature_unlink", {
 });
 
 server.registerTool("recette_adr_link", {
-  description: "LIE une RECETTE à une ADR EXISTANTE (`recette_adr`, idempotent).",
+  description: "Alias legacy de `cadrage_adr_link`. LIE une RECETTE à une ADR EXISTANTE (`recette_adr`, idempotent).",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     adrId: z.string().describe("docId de l'ADR (kind='adr-tech')."),
@@ -1376,7 +1376,7 @@ server.registerTool("recette_adr_link", {
 });
 
 server.registerTool("recette_adr_unlink", {
-  description: "DÉLIE une RECETTE d'une ADR (`recette_adr`).",
+  description: "Alias legacy de `cadrage_adr_unlink`. DÉLIE une RECETTE d'une ADR (`recette_adr`).",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     adrId: z.string().describe("docId de l'ADR."),
@@ -1387,7 +1387,7 @@ server.registerTool("recette_adr_unlink", {
 });
 
 server.registerTool("recette_rule_link", {
-  description: "LIE une RECETTE à une RÈGLE MÉTIER EXISTANTE (`recette_regles`, idempotent).",
+  description: "Alias legacy de `cadrage_rule_link`. LIE une RECETTE à une RÈGLE MÉTIER EXISTANTE (`recette_regles`, idempotent).",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     ruleId: z.string().describe("Règle métier."),
@@ -1398,7 +1398,7 @@ server.registerTool("recette_rule_link", {
 });
 
 server.registerTool("recette_rule_unlink", {
-  description: "DÉLIE une RECETTE d'une RÈGLE MÉTIER (`recette_regles`).",
+  description: "Alias legacy de `cadrage_rule_unlink`. DÉLIE une RECETTE d'une RÈGLE MÉTIER (`recette_regles`).",
   inputSchema: {
     recetteId: z.string().describe("Recette."),
     ruleId: z.string().describe("Règle métier."),
@@ -1853,9 +1853,363 @@ server.registerTool("task_link_remove", {
   }
 });
 
-// === recette_start ===
+// ===========================================================================
+// Famille `cadrage_*` (CANONIQUE) — « Cadrage technique » (ADR-001,
+// doc-muchlzn8-acon). L'entité actuelle « recette » devient le « Cadrage
+// technique » de l'exécuteur : mêmes capacités (contexte de mission, lecture du
+// code, analyse, production de tâches techniques) et mêmes fonctions `db.mjs`
+// (tables `recettes`/`recette_*` et historique CONSERVÉS — aucun renommage de
+// schéma). Les éléments convertibles en tâches sont les « ÉLÉMENTS DE CADRAGE ».
+// Les tools `recette_*` restent des ALIAS LEGACY (voir la section suivante) pour
+// la rétrocompatibilité (`pilot.mjs` hors périmètre + historique).
+// ===========================================================================
+
+// === cadrage_start ===
+server.registerTool("cadrage_start", {
+  description: "Crée une opération de CADRAGE TECHNIQUE de PROJET : 1 cadrage = 1 PROJET unique (produit). Les REPOS TRANSVERSES du projet (project_repos, ex: mada-talk traverse le repo oniria) couvrent la portée — pas d'ajout de projets supplémentaires. + titre + 0..N tâches couvertes (du projet) + session dédiée.",
+  inputSchema: {
+    project: z.string().describe("Projet (produit) unique du cadrage — ses repos transverses sont la portée."),
+    title: z.string().optional().describe("Titre court compréhensible (ex: 'Cadrage du module chatbot'). Dérivé si absent."),
+    description: z.string().optional().describe("Description longue (détail du périmètre analysé)."),
+    taskIds: z.array(z.string()).optional().describe("Tâches couvertes par le cadrage (0..N — doivent appartenir au projet du cadrage)."),
+    sprintId: z.string().optional().describe("Sprint du cadrage (optionnel, T6) ; sinon sprint par défaut SI le projet n'a aucun sprint."),
+    featureIds: z.array(z.string()).optional().describe("Fonctionnalités du cadrage (optionnel, T6)."),
+    ruleIds: z.array(z.string()).optional().describe("Règles métier du cadrage (optionnel, T6 — NON bloquant)."),
+    adrIds: z.array(z.string()).optional().describe("ADR du cadrage (optionnel, T6)."),
+    status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
+    sessionId: z.string().optional().describe("Session dédiée de l'agent de cadrage (si lancée)."),
+    createdBy: z.string().optional().describe("Utilisateur (username) qui crée le cadrage."),
+    organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
+  },
+}, async ({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status, sessionId, createdBy, organizationId }) => {
+  try {
+    const recette = await startRecette({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
+    // CARDINALITÉ (T6, lecture seule, NON bloquante) : cadrage → ≥1 ADR +
+    // ≥1 fonctionnalité + 1 sprint.
+    const cardinalite = await checkCardinality({ entityType: "recette", entityId: recette.recetteId }).catch(() => null);
+    return text(JSON.stringify({ ok: true, cadrage: recette, cardinalite }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_list ===
+server.registerTool("cadrage_list", {
+  description: "Liste les cadrages techniques (tous ou filtrés par projet) avec nb de tâches couvertes et nb d'éléments de cadrage.",
+  inputSchema: { project: z.string().optional() },
+}, async ({ project }) => {
+  try {
+    const cadrages = await listProjectRecettes(project);
+    return text(JSON.stringify({ count: cadrages.length, cadrages }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_get ===
+server.registerTool("cadrage_get", {
+  description: "Détail d'un cadrage technique (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments de cadrage). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`. Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
+  inputSchema: { cadrageId: z.string() },
+}, async ({ cadrageId }) => {
+  try {
+    const cadrage = await getRecetteById(cadrageId);
+    if (!cadrage) return err(`cadrage inconnu : ${cadrageId}`);
+    // CARDINALITÉ (T6, lecture seule, NON bloquante) — à côté de `adrVigilances`.
+    cadrage.cardinalite = await checkCardinality({ entityType: "recette", entityId: cadrageId }).catch(() => null);
+    return text(JSON.stringify({ cadrage }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_session_set ===
+server.registerTool("cadrage_session_set", {
+  description: "Associe la session dédiée lancée à un cadrage technique et le passe en cours (in_progress).",
+  inputSchema: { cadrageId: z.string(), sessionId: z.string() },
+}, async ({ cadrageId, sessionId }) => {
+  try {
+    const cadrage = await setRecetteSession({ recetteId: cadrageId, sessionId });
+    return text(JSON.stringify({ ok: true, cadrage }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_doc_add ===
+server.registerTool("cadrage_doc_add", {
+  description: "Rattache un document à un cadrage technique (importé ou artefact existant) avec la nature de la liaison (à quoi sert / comment l'exploiter).",
+  inputSchema: {
+    cadrageId: z.string(),
+    title: z.string().optional(),
+    nature: z.string().optional().describe("Nature de la liaison : à quoi sert le document et comment l'exploiter."),
+    source: z.enum(["import", "artifact"]).default("import"),
+    path: z.string().optional().describe("Chemin du fichier (mode import)."),
+    artifactId: z.string().optional().describe("Artefact existant à lier (mode artifact)."),
+  },
+}, async ({ cadrageId, title, nature, source, path, artifactId }) => {
+  try {
+    let finalPath = path;
+    if (source === "artifact") {
+      if (!artifactId) return err("artifactId requis en mode artifact");
+      const a = await getArtifact(artifactId);
+      if (!a) return err(`artefact inconnu : ${artifactId}`);
+      finalPath = a.path;
+    }
+    const docs = await addRecetteDocument({ recetteId: cadrageId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null });
+    return text(JSON.stringify({ ok: true, documents: docs }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_doc_remove ===
+server.registerTool("cadrage_doc_remove", {
+  description: "Retire un document d'un cadrage technique.",
+  inputSchema: { documentId: z.number().int() },
+}, async ({ documentId }) => {
+  try {
+    const cadrageId = await removeRecetteDocument(documentId);
+    if (!cadrageId) return err(`document inconnu : ${documentId}`);
+    return text(JSON.stringify({ ok: true, cadrageId, documents: await listRecetteDocuments(cadrageId) }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_link_task ===
+server.registerTool("cadrage_link_task", {
+  description: "Rattache une tâche à un cadrage technique (tâche couverte). Garde : la tâche doit appartenir au PROJET du cadrage (1 cadrage = 1 projet ; les repos transverses du projet sont la portée).",
+  inputSchema: { cadrageId: z.string(), taskId: z.string() },
+}, async ({ cadrageId, taskId }) => {
+  try {
+    if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
+    await linkRecetteTask(cadrageId, taskId);
+    return text(JSON.stringify({ ok: true, cadrage: await getRecetteById(cadrageId) }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_unlink_task ===
+server.registerTool("cadrage_unlink_task", {
+  description: "Détache une tâche d'un cadrage technique (la tâche reste historiquement intacte, juste plus couverte).",
+  inputSchema: { cadrageId: z.string(), taskId: z.string() },
+}, async ({ cadrageId, taskId }) => {
+  try {
+    const cadrage = await unlinkRecetteTask(cadrageId, taskId);
+    if (!cadrage) return err(`cadrage inconnu : ${cadrageId}`);
+    return text(JSON.stringify({ ok: true, cadrage }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_item_add ===
+server.registerTool("cadrage_item_add", {
+  description: "Enregistre un ÉLÉMENT DE CADRAGE détecté pendant le cadrage technique (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature), son projet cible (= projet unique du cadrage — les repos transverses sont des repos, pas des projets), le périmètre (scope) suggéré et, si le constat implique de faire évoluer des TESTS et/ou des DOCUMENTS de référence du projet, une intention structurée (testIntent / docIntent).",
+  inputSchema: {
+    cadrageId: z.string(),
+    content: z.string().describe("La remarque / demande / constat."),
+    classification: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Nature de l'élément de cadrage (défaut rework)."),
+    project: z.string().optional().describe("Projet cible de l'élément (= projet unique du cadrage ; fourni par défaut, ignoré sinon). Les repos transverses du projet ne sont pas des projets."),
+    discussion: z.string().optional().describe("Échanges associés."),
+    scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins) — transmis à la tâche créée à la confirmation."),
+    title: z.string().optional().describe("Titre court de la tâche qui sera créée à la confirmation."),
+    acceptance: z.string().optional().describe("Critère d'acceptation / livrable attendu de la tâche qui sera créée."),
+    execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = exécutable en parallèle)."),
+    vigilance: z.string().optional().describe("Point de vigilance / écart sémantique détecté pour cet élément."),
+    testIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]).describe("Action sur le(s) test(s) : create (nouveau test pour le comportement voulu/bug) | update (adapter un test existant) | obsolete (test devenu obsolète)."),
+      testType: z.enum(["unit", "e2e"]).optional().describe("Type de test concerné : unit (unitaire, dans le repo) | e2e (entité E2E Playwright). Défaut unit."),
+      target: z.string().optional().describe("Cible : e2eTestId, specFile (E2E) ou chemin du test unitaire (ex. tests/mon-test.spec.ts)."),
+      scenario: z.string().optional().describe("Scénario / comportement à couvrir ou à vérifier."),
+      reason: z.string().optional().describe("Pourquoi ce besoin test (bug non couvert, comportement changé, test obsolète…)."),
+    }).optional().describe("Intention test structurée — à renseigner quand le constat requiert d'ajouter/modifier/obsoléter un test du projet pour couvrir le comportement voulu ou le bug détecté."),
+    docIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]).describe("Action sur le(s) document(s) de référence : update (mettre à jour) | create (documenter une règle nouvelle) | obsolete (document devenu obsolète)."),
+      docType: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional().describe("Type de document concerné (ADR-12) : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin (scénarios BDD)."),
+      target: z.string().optional().describe("Cible : docId ou chemin du document à faire évoluer."),
+      summary: z.string().optional().describe("Ce que le document doit refléter après le cadrage."),
+      reason: z.string().optional().describe("Pourquoi ce besoin doc (le cadrage rend un document inexact/obsolète, ou une règle doit être documentée)."),
+    }).optional().describe("Intention document structurée — à renseigner quand une décision de cadrage impose de mettre à jour/créer/obsoléter un document de référence du projet (ADR technique, specs fonctionnelles, scénarios Gherkin)."),
+  },
+}, async ({ cadrageId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent }) => {
+  try {
+    const item = await addRecetteItem({ recetteId: cadrageId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent });
+    return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_item_update ===
+server.registerTool("cadrage_item_update", {
+  description: "Met à jour un élément de cadrage (contenu, classification, discussion, scope, projet cible, titre, critère d'acceptation, ordre, vigilance, intentions test/document, statut, tâche créée).",
+  inputSchema: {
+    itemId: z.number().int(),
+    content: z.string().optional().describe("Contenu de l'élément (remarque/demande/constat) — non vide si fourni."),
+    classification: z.enum(["rework", "bug", "improvement", "feature"]).optional(),
+    discussion: z.string().optional(),
+    scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins)."),
+    project: z.string().optional().describe("Projet cible de l'élément."),
+    title: z.string().optional(),
+    acceptance: z.string().optional(),
+    execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = parallèle)."),
+    vigilance: z.string().optional().describe("Point de vigilance / écart sémantique."),
+    testIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]),
+      testType: z.enum(["unit", "e2e"]).optional(),
+      target: z.string().optional(),
+      scenario: z.string().optional(),
+      reason: z.string().optional(),
+    }).optional().describe("Intention test structurée (remplace l'existante ; null/absent ne la change pas)."),
+    docIntent: z.object({
+      action: z.enum(["create", "update", "obsolete"]),
+      docType: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
+      target: z.string().optional(),
+      summary: z.string().optional(),
+      reason: z.string().optional(),
+    }).optional().describe("Intention document structurée (remplace l'existante ; null/absent ne la change pas)."),
+    status: z.enum(["open", "task_created"]).optional(),
+    createdTaskId: z.string().optional(),
+  },
+}, async ({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId }) => {
+  try {
+    const item = await updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId });
+    return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === cadrage_item_delete ===
+server.registerTool("cadrage_item_delete", {
+  description: "Supprime un élément de cadrage (remarque/demande/constat). Refus si une tâche a déjà été créée depuis cet élément (task_created).",
+  inputSchema: { itemId: z.number().int() },
+}, async ({ itemId }) => {
+  try {
+    const r = await deleteRecetteItem({ itemId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === cadrage_confirm ===
+server.registerTool("cadrage_confirm", {
+  description: "Clôt le CADRAGE TECHNIQUE (statut 'done' = fait) après confirmation de la liste consolidée des éléments de cadrage. La tâche initiale reste done et close ; les travaux issus sont de nouvelles tâches. GARDE ADR : REFUSÉ avec raison explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] ») tant qu'un point de vigilance ADR (ADR manquante / conflit) est OUVERT sur le cadrage — levez-le via `adr_vigilance_resolve` (raison tracée).",
+  inputSchema: {
+    cadrageId: z.string(),
+    confirmedBy: z.string().optional(),
+  },
+}, async ({ cadrageId, confirmedBy }) => {
+  try {
+    const cadrage = await confirmRecette({ recetteId: cadrageId, confirmedBy });
+    return text(JSON.stringify({ ok: true, cadrage }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// --- Liens de contexte du cadrage (sprint / fonctionnalité / ADR / règle) ---
+
+// === cadrage_sprint_link ===
+server.registerTool("cadrage_sprint_link", {
+  description: "LIE un CADRAGE TECHNIQUE à un SPRINT (`recette_sprints`, idempotent). Valide le cadrage et le sprint.",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ cadrageId, sprintId }) => {
+  try { return text(JSON.stringify(await linkRecetteSprint({ recetteId: cadrageId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === cadrage_sprint_unlink ===
+server.registerTool("cadrage_sprint_unlink", {
+  description: "DÉLIE un CADRAGE TECHNIQUE d'un SPRINT (`recette_sprints`).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    sprintId: z.string().describe("Sprint."),
+  },
+}, async ({ cadrageId, sprintId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteSprint({ recetteId: cadrageId, sprintId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === cadrage_feature_link ===
+server.registerTool("cadrage_feature_link", {
+  description: "LIE un CADRAGE TECHNIQUE à une FONCTIONNALITÉ (`recette_fonctionnalites`, idempotent).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    featureId: z.string().describe("Fonctionnalité."),
+  },
+}, async ({ cadrageId, featureId }) => {
+  try { return text(JSON.stringify(await linkRecetteFeature({ recetteId: cadrageId, featureId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === cadrage_feature_unlink ===
+server.registerTool("cadrage_feature_unlink", {
+  description: "DÉLIE un CADRAGE TECHNIQUE d'une FONCTIONNALITÉ (`recette_fonctionnalites`).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    featureId: z.string().describe("Fonctionnalité."),
+  },
+}, async ({ cadrageId, featureId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteFeature({ recetteId: cadrageId, featureId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === cadrage_adr_link ===
+server.registerTool("cadrage_adr_link", {
+  description: "LIE un CADRAGE TECHNIQUE à une ADR EXISTANTE (`recette_adr`, idempotent).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    adrId: z.string().describe("docId de l'ADR (kind='adr-tech')."),
+  },
+}, async ({ cadrageId, adrId }) => {
+  try { return text(JSON.stringify(await linkRecetteAdr({ recetteId: cadrageId, adrId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === cadrage_adr_unlink ===
+server.registerTool("cadrage_adr_unlink", {
+  description: "DÉLIE un CADRAGE TECHNIQUE d'une ADR (`recette_adr`).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    adrId: z.string().describe("docId de l'ADR."),
+  },
+}, async ({ cadrageId, adrId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteAdr({ recetteId: cadrageId, adrId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === cadrage_rule_link ===
+server.registerTool("cadrage_rule_link", {
+  description: "LIE un CADRAGE TECHNIQUE à une RÈGLE MÉTIER EXISTANTE (`recette_regles`, idempotent).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    ruleId: z.string().describe("Règle métier."),
+  },
+}, async ({ cadrageId, ruleId }) => {
+  try { return text(JSON.stringify(await linkRecetteRule({ recetteId: cadrageId, ruleId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === cadrage_rule_unlink ===
+server.registerTool("cadrage_rule_unlink", {
+  description: "DÉLIE un CADRAGE TECHNIQUE d'une RÈGLE MÉTIER (`recette_regles`).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique."),
+    ruleId: z.string().describe("Règle métier."),
+  },
+}, async ({ cadrageId, ruleId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteRule({ recetteId: cadrageId, ruleId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+// === recette_start (alias legacy de cadrage_start) ===
   server.registerTool("recette_start", {
-   description: "Crée une opération de recette de PROJET : 1 recette = 1 PROJET unique (produit). Les REPOS TRANSVERSES du projet (project_repos, ex: mada-talk traverse le repo oniria) couvrent la portée — pas d'ajout de projets supplémentaires. + titre + 0..N tâches couvertes (du projet) + session dédiée.",
+   description: "Alias legacy de `cadrage_start`. Crée une opération de recette de PROJET : 1 recette = 1 PROJET unique (produit). Les REPOS TRANSVERSES du projet (project_repos, ex: mada-talk traverse le repo oniria) couvrent la portée — pas d'ajout de projets supplémentaires. + titre + 0..N tâches couvertes (du projet) + session dédiée.",
    inputSchema: {
      project: z.string().describe("Projet (produit) unique de la recette — ses repos transverses sont la portée."),
      title: z.string().optional().describe("Titre court compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
@@ -1882,9 +2236,9 @@ server.registerTool("task_link_remove", {
   }
 });
 
-// === recette_list ===
+// === recette_list (alias legacy de cadrage_list) ===
 server.registerTool("recette_list", {
-  description: "Liste les recettes (toutes ou filtrées par projet) avec nb de tâches couvertes et nb d'éléments.",
+  description: "Alias legacy de `cadrage_list`. Liste les recettes (toutes ou filtrées par projet) avec nb de tâches couvertes et nb d'éléments.",
   inputSchema: { project: z.string().optional() },
 }, async ({ project }) => {
   try {
@@ -1895,9 +2249,9 @@ server.registerTool("recette_list", {
   }
 });
 
-// === recette_get ===
+// === recette_get (alias legacy de cadrage_get) ===
 server.registerTool("recette_get", {
-  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`. Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
+  description: "Alias legacy de `cadrage_get`. Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`. Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
   inputSchema: { recetteId: z.string() },
 }, async ({ recetteId }) => {
   try {
@@ -1911,9 +2265,9 @@ server.registerTool("recette_get", {
   }
 });
 
-// === recette_session_set ===
+// === recette_session_set (alias legacy de cadrage_session_set) ===
 server.registerTool("recette_session_set", {
-  description: "Associe la session dédiée lancée à une recette et la passe en cours (in_progress).",
+  description: "Alias legacy de `cadrage_session_set`. Associe la session dédiée lancée à une recette et la passe en cours (in_progress).",
   inputSchema: { recetteId: z.string(), sessionId: z.string() },
 }, async ({ recetteId, sessionId }) => {
   try {
@@ -1924,9 +2278,9 @@ server.registerTool("recette_session_set", {
   }
 });
 
-// === recette_doc_add ===
+// === recette_doc_add (alias legacy de cadrage_doc_add) ===
 server.registerTool("recette_doc_add", {
-  description: "Rattache un document à une recette (importé ou artefact existant) avec la nature de la liaison (à quoi sert / comment l'exploiter).",
+  description: "Alias legacy de `cadrage_doc_add`. Rattache un document à une recette (importé ou artefact existant) avec la nature de la liaison (à quoi sert / comment l'exploiter).",
   inputSchema: {
     recetteId: z.string(),
     title: z.string().optional(),
@@ -1951,9 +2305,9 @@ server.registerTool("recette_doc_add", {
   }
 });
 
-// === recette_doc_remove ===
+// === recette_doc_remove (alias legacy de cadrage_doc_remove) ===
 server.registerTool("recette_doc_remove", {
-  description: "Retire un document d'une recette.",
+  description: "Alias legacy de `cadrage_doc_remove`. Retire un document d'une recette.",
   inputSchema: { documentId: z.number().int() },
 }, async ({ documentId }) => {
   try {
@@ -1965,9 +2319,9 @@ server.registerTool("recette_doc_remove", {
   }
 });
 
-// === recette_link_task ===
+// === recette_link_task (alias legacy de cadrage_link_task) ===
 server.registerTool("recette_link_task", {
-  description: "Rattache une tâche à une recette (tâche couverte). Garde : la tâche doit appartenir au PROJET de la recette (1 recette = 1 projet ; les repos transverses du projet sont la portée).",
+  description: "Alias legacy de `cadrage_link_task`. Rattache une tâche à une recette (tâche couverte). Garde : la tâche doit appartenir au PROJET de la recette (1 recette = 1 projet ; les repos transverses du projet sont la portée).",
   inputSchema: { recetteId: z.string(), taskId: z.string() },
 }, async ({ recetteId, taskId }) => {
   try {
@@ -1979,9 +2333,9 @@ server.registerTool("recette_link_task", {
   }
 });
 
-// === recette_unlink_task ===
+// === recette_unlink_task (alias legacy de cadrage_unlink_task) ===
 server.registerTool("recette_unlink_task", {
-  description: "Détache une tâche d'une recette (la tâche reste historiquement intacte, juste plus couverte).",
+  description: "Alias legacy de `cadrage_unlink_task`. Détache une tâche d'une recette (la tâche reste historiquement intacte, juste plus couverte).",
   inputSchema: { recetteId: z.string(), taskId: z.string() },
 }, async ({ recetteId, taskId }) => {
   try {
@@ -1993,9 +2347,9 @@ server.registerTool("recette_unlink_task", {
   }
 });
 
-// === recette_item_add ===
+// === recette_item_add (alias legacy de cadrage_item_add) ===
 server.registerTool("recette_item_add", {
-  description: "Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature), son projet cible (= projet unique de la recette — les repos transverses sont des repos, pas des projets), le périmètre (scope) suggéré et, si le constat implique de faire évoluer des TESTS et/ou des DOCUMENTS de référence du projet, une intention structurée (testIntent / docIntent).",
+  description: "Alias legacy de `cadrage_item_add`. Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature), son projet cible (= projet unique de la recette — les repos transverses sont des repos, pas des projets), le périmètre (scope) suggéré et, si le constat implique de faire évoluer des TESTS et/ou des DOCUMENTS de référence du projet, une intention structurée (testIntent / docIntent).",
   inputSchema: {
     recetteId: z.string(),
     content: z.string().describe("La remarque / demande / constat."),
@@ -2031,9 +2385,9 @@ server.registerTool("recette_item_add", {
   }
 });
 
-// === recette_item_update ===
+// === recette_item_update (alias legacy de cadrage_item_update) ===
 server.registerTool("recette_item_update", {
-  description: "Met à jour un élément de recette (contenu, classification, discussion, scope, projet cible, titre, critère d'acceptation, ordre, vigilance, intentions test/document, statut, tâche créée).",
+  description: "Alias legacy de `cadrage_item_update`. Met à jour un élément de recette (contenu, classification, discussion, scope, projet cible, titre, critère d'acceptation, ordre, vigilance, intentions test/document, statut, tâche créée).",
   inputSchema: {
     itemId: z.number().int(),
     content: z.string().optional().describe("Contenu de l'élément (remarque/demande/constat) — non vide si fourni."),
@@ -2072,9 +2426,9 @@ server.registerTool("recette_item_update", {
 });
 
 
-// === recette_item_delete ===
+// === recette_item_delete (alias legacy de cadrage_item_delete) ===
 server.registerTool("recette_item_delete", {
-  description: "Supprime un élément de recette (remarque/demande/constat). Refus si une tâche a déjà été créée depuis cet élément (task_created).",
+  description: "Alias legacy de `cadrage_item_delete`. Supprime un élément de recette (remarque/demande/constat). Refus si une tâche a déjà été créée depuis cet élément (task_created).",
   inputSchema: { itemId: z.number().int() },
 }, async ({ itemId }) => {
   try {
@@ -2083,9 +2437,9 @@ server.registerTool("recette_item_delete", {
   } catch (e) { return err(e.message); }
 });
 
-// === recette_confirm ===
+// === recette_confirm (alias legacy de cadrage_confirm) ===
 server.registerTool("recette_confirm", {
-  description: "Clôt la recette (statut 'done' = faite) après confirmation de la liste consolidée. La tâche initiale reste done et close ; les travaux issus sont de nouvelles tâches. GARDE ADR : REFUSÉ avec raison explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] ») tant qu'un point de vigilance ADR (ADR manquante / conflit) est OUVERT sur la recette — levez-le via `adr_vigilance_resolve` (raison tracée).",
+  description: "Alias legacy de `cadrage_confirm`. Clôt la recette (statut 'done' = faite) après confirmation de la liste consolidée. La tâche initiale reste done et close ; les travaux issus sont de nouvelles tâches. GARDE ADR : REFUSÉ avec raison explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] ») tant qu'un point de vigilance ADR (ADR manquante / conflit) est OUVERT sur la recette — levez-le via `adr_vigilance_resolve` (raison tracée).",
   inputSchema: {
     recetteId: z.string(),
     confirmedBy: z.string().optional(),
