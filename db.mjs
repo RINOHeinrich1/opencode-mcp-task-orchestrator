@@ -4992,7 +4992,7 @@ export const RECETTE_DOC_NATURE_BY_EXT = {
 // `recette_maquette_add` écrit ici, et le panneau sert ces fichiers via
 // `GET /api/recettes/:id/maquette/*`. Surchargeable par env (worktree / test).
 export const RECETTE_MAQUETTE_DIR =
-  process.env.EVALUATION_MAQUETTE_DIR || "/root/orchestrator-panel/storage/evaluation-maquettes";
+  process.env.RECETTE_MAQUETTE_DIR || process.env.EVALUATION_MAQUETTE_DIR || "/root/orchestrator-panel/storage/recette-maquettes";
 // Garde d'un chemin RELATIF de fichier de maquette : refuse l'absolu et toute
 // remontée (`..`) — les fichiers restent confinés au dossier de la maquette.
 function assertSafeMaquettePath(rel) {

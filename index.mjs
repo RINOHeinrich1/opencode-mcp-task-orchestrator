@@ -2494,7 +2494,7 @@ registerEvalTool("recette_maquette_add", {
 // `recette_doc`). BORNÉ volontairement (pages ≤ 10, routes ≤ 20,
 // concurrency ≤ 10, requests ≤ 200) pour ne pas dégrader la préprod. Peut être
 // rattaché à un test Playwright (`e2eTestId`).
-const RECETTE_PERF_DIR = process.env.EVALUATION_PERF_DIR || "/root/orchestrator-panel/storage/evaluation-perf";
+const RECETTE_PERF_DIR = process.env.RECETTE_PERF_DIR || process.env.EVALUATION_PERF_DIR || "/root/orchestrator-panel/storage/recette-perf";
 const RECETTE_PERF_RUNNER = process.env.RECETTE_PERF_RUNNER || "/root/orchestrator-panel/perf-runner.mjs";
 const PERF_MAX_CONCURRENCY = 10;
 const PERF_MAX_REQUESTS = 200;
