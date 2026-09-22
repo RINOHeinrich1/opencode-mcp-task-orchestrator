@@ -2739,34 +2739,43 @@ server.registerTool("evaluation_maquette_add", {
   } catch (e) { return err(e.message); }
 });
 
-// === evaluation_perf_run (TEST DE PERFORMANCE préprod) =====================
-// Lance un test de performance web sur une cible PRÉPROD : durées de requêtes
-// réseau (type onglet Network), timings (TTFB/DCL/load), Core Web Vitals
-// (LCP/CLS) et STRESS TEST (accès parallèles bornés). Le moteur est le runner
-// `perf-runner.mjs` du panneau (Playwright résolu depuis `repoDir`) ; le rapport
-// est enregistré comme pièce `performance` (famille `evaluation_doc`).
-// BORNÉ volontairement (concurrency ≤ 10, requests ≤ 200) pour ne pas dégrader
-// la préprod. Peut être rattaché à un test Playwright (`e2eTestId`).
+// === evaluation_perf_run (TESTS STANDARD préprod) ==========================
+// Lance des TESTS STANDARD (distincts des tests E2E Playwright) sur une cible
+// PRÉPROD : parcours de pages avec informations réseau (durées/requêtes/types/
+// tailles/compression) + CAPTURE DES ERREURS CONSOLE (warnings, exceptions JS)
+// et RÉSEAU (4xx/5xx, DNS, timeouts), timings (TTFB/DCL/load), Core Web Vitals
+// (LCP/INP/CLS + long tasks > 50 ms) et STRESS TEST DES ROUTES D'API (accès
+// parallèles bornés : débit, latence moy/p95/p99, taux d'erreurs, par route).
+// Le moteur est le runner `perf-runner.mjs` du panneau (Playwright résolu depuis
+// `repoDir`) ; le rapport est enregistré comme pièce `performance` (famille
+// `evaluation_doc`). BORNÉ volontairement (pages ≤ 10, routes ≤ 20,
+// concurrency ≤ 10, requests ≤ 200) pour ne pas dégrader la préprod. Peut être
+// rattaché à un test Playwright (`e2eTestId`).
 const EVALUATION_PERF_DIR = process.env.EVALUATION_PERF_DIR || "/root/orchestrator-panel/storage/evaluation-perf";
 const EVALUATION_PERF_RUNNER = process.env.EVALUATION_PERF_RUNNER || "/root/orchestrator-panel/perf-runner.mjs";
 const PERF_MAX_CONCURRENCY = 10;
 const PERF_MAX_REQUESTS = 200;
 
 server.registerTool("evaluation_perf_run", {
-  description: "Lance un TEST DE PERFORMANCE sur une cible PRÉPROD : mesure des durées de requêtes réseau (type onglet Network), timings (TTFB/DCL/load), Core Web Vitals (LCP/CLS) et STRESS TEST (accès parallèles bornés : concurrency ≤ 10, requests ≤ 200). Le rapport est rattaché à la recette évaluateur comme pièce `performance`. `repoDir` = checkout applicatif contenant Playwright (ex. /root/mada-talk-preprod) ; sans Playwright, la mesure réseau/stress se fait sans navigateur (Core Web Vitals indisponibles). `e2eTestId` (optionnel) rattache la mesure à un test Playwright.",
+  description: "Lance des TESTS STANDARD (distincts des tests E2E Playwright) sur une cible PRÉPROD : (1) PARCOURS de pages avec informations réseau (durées/requêtes/types/tailles, compression, timings TTFB/DCL/load) ET capture des ERREURS CONSOLE (warnings, exceptions JS) + ERREURS RÉSEAU (4xx/5xx, DNS, timeouts) ; (2) métriques Core Web Vitals (LCP < 2,5 s, INP < 200 ms, CLS < 0,1) + long tasks > 50 ms + temps d'exécution JS + poids/compression par type ; (3) STRESS TEST des ROUTES D'API (accès parallèles bornés : débit req/s, latence moy/p95/p99, taux d'erreurs — par route + agrégat). Le rapport est rattaché à la recette évaluateur comme pièce `performance`. `pages` (optionnel) = parcours multi-pages (défaut : `url`) ; `routes` (optionnel) = routes d'API à stresser (relatives à `baseUrl` ou absolues ; défaut : `url`). `repoDir` = checkout applicatif contenant Playwright (ex. /root/mada-talk-preprod) ; sans Playwright, mesure réseau/stress via fetch (Core Web Vitals/console indisponibles). `e2eTestId` (optionnel) rattache la mesure à un test Playwright. BORNÉ : pages ≤ 10, routes ≤ 20, concurrency ≤ 10, requests ≤ 200.",
   inputSchema: {
     evaluationId: z.string(),
-    url: z.string().describe("URL cible préprod (http/https)."),
-    repoDir: z.string().optional().describe("Checkout applicatif contenant Playwright (pour Core Web Vitals)."),
-    baseUrl: z.string().optional(),
+    url: z.string().describe("URL cible préprod (http/https) — première page du parcours."),
+    pages: z.array(z.string()).optional().describe("Parcours multi-pages (URLs http/https, ≤ 10 ; défaut : [url])."),
+    routes: z.array(z.union([
+      z.string(),
+      z.object({ path: z.string().optional(), url: z.string().optional(), method: z.string().optional(), name: z.string().optional() }),
+    ])).optional().describe("Routes d'API à stresser (chaînes relatives à `baseUrl` ou absolues, ou objets { path|url, method?, name? } ; ≤ 20 ; défaut : [url])."),
+    repoDir: z.string().optional().describe("Checkout applicatif contenant Playwright (pour Core Web Vitals/console)."),
+    baseUrl: z.string().optional().describe("Base des routes relatives (défaut : `url`)."),
     concurrency: z.number().int().optional().describe("Stress : accès parallèles (1..10, défaut 5)."),
-    requests: z.number().int().optional().describe("Stress : nombre total de requêtes (1..200, défaut 50)."),
+    requests: z.number().int().optional().describe("Stress : budget total de requêtes réparti sur les routes (1..200, défaut 50)."),
     itemId: z.number().int().optional().describe("Élément d'évaluation porteur (optionnel)."),
     e2eTestId: z.string().optional().describe("Test Playwright rattaché (optionnel)."),
     title: z.string().optional().describe("Titre lisible du rapport."),
     timeoutMs: z.number().int().optional().describe("Timeout du runner (ms, plafonné à 30 min)."),
   },
-}, async ({ evaluationId, url, repoDir, baseUrl, concurrency, requests, itemId, e2eTestId, title, timeoutMs }) => {
+}, async ({ evaluationId, url, pages, routes, repoDir, baseUrl, concurrency, requests, itemId, e2eTestId, title, timeoutMs }) => {
   try {
     if (!evaluationId) return err("evaluationId requis");
     if (!url || !/^https?:\/\//i.test(String(url))) return err("url préprod requise (http/https)");
@@ -2776,7 +2785,14 @@ server.registerTool("evaluation_perf_run", {
     const outDir = join(EVALUATION_PERF_DIR, String(evaluationId), `perf-${Date.now().toString(36)}`);
     mkdirSync(outDir, { recursive: true });
     const payloadFile = join(outDir, "payload.json");
-    writeFileSync(payloadFile, JSON.stringify({ evaluationId, url: String(url), repoDir: repoDir || null, baseUrl: baseUrl || null, concurrency: conc, requests: reqs, outDir }, null, 2));
+    const pageList = Array.isArray(pages) ? pages.map((p) => String(p)).filter((p) => /^https?:\/\//i.test(p)).slice(0, 10) : [];
+    const routeList = Array.isArray(routes)
+      ? routes
+        .map((r) => (typeof r === "string" ? { path: r } : (r && typeof r === "object" ? { path: r.path || r.url || "", method: r.method, name: r.name } : null)))
+        .filter((r) => r && r.path)
+        .slice(0, 20)
+      : [];
+    writeFileSync(payloadFile, JSON.stringify({ evaluationId, url: String(url), pages: pageList, routes: routeList, repoDir: repoDir || null, baseUrl: baseUrl || null, concurrency: conc, requests: reqs, outDir }, null, 2));
     let stdout = "";
     try {
       stdout = execFileSync("node", [EVALUATION_PERF_RUNNER, payloadFile], {
