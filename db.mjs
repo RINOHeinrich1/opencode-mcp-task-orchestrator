@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-sprint-filter-roles-regles";
+const SCHEMA_VERSION = "2026-09-22-recette-regles-contexte";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -700,6 +700,14 @@ $$ LANGUAGE plpgsql`);
     PRIMARY KEY (recette_id, adr_id)
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id)");
+  // Recette ↔ règle métier (T-20260922-070103-ncs1) — miroir DDL de
+  // `recette_fonctionnalites`. Miroir `schema.sql` (A001).
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_regles (
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    regle_id   TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
+    PRIMARY KEY (recette_id, regle_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id)");
   // =========================================================================
   // CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques
   // de cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
@@ -2429,6 +2437,7 @@ export async function deleteRule(ruleId) {
   await withTransaction(async (client) => {
     await client.query("DELETE FROM fonctionnalite_regles WHERE regle_id = $1", [rid]);
     await client.query("DELETE FROM sprint_regles WHERE regle_id = $1", [rid]);
+    await client.query("DELETE FROM recette_regles WHERE regle_id = $1", [rid]);
     await client.query("DELETE FROM regles_metier WHERE id = $1", [rid]);
   });
   return { ruleId: rid, deleted: true };
@@ -3283,6 +3292,30 @@ export async function unlinkRecetteAdr({ recetteId, adrId } = {}) {
     [String(recetteId), String(adrId)],
   );
   return { ok: true, recetteId: String(recetteId), adrId: String(adrId), unlinked: del.rowCount > 0 };
+}
+
+// Recette ↔ règle métier (T-20260922-070103-ncs1). Miroir de `linkRecetteFeature`.
+export async function linkRecetteRule({ recetteId, ruleId } = {}) {
+  await ensureSchema();
+  const rec = await getRecetteById(recetteId);
+  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const rule = await getRule(ruleId);
+  if (!rule) throw new Error(`règle métier inconnue : ${ruleId}`);
+  const ins = await pool().query(
+    "INSERT INTO recette_regles (recette_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.recetteId, rule.id],
+  );
+  return { ok: true, recetteId: rec.recetteId, ruleId: rule.id, linked: ins.rowCount > 0 };
+}
+
+export async function unlinkRecetteRule({ recetteId, ruleId } = {}) {
+  await ensureSchema();
+  if (!recetteId || !ruleId) throw new Error("recetteId et ruleId requis");
+  const del = await pool().query(
+    "DELETE FROM recette_regles WHERE recette_id = $1 AND regle_id = $2",
+    [String(recetteId), String(ruleId)],
+  );
+  return { ok: true, recetteId: String(recetteId), ruleId: String(ruleId), unlinked: del.rowCount > 0 };
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -5011,6 +5044,38 @@ function renderAdrContextBlock(adrs, projectId) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+// Bloc markdown « Fonctionnalités de référence » (une section par fonctionnalité).
+// Vide si aucune fonctionnalité (⇒ aucun bloc injecté).
+function renderFeatureContextBlock(features, projectId) {
+  if (!features.length) return "";
+  const lines = ["## Fonctionnalités de référence", ""];
+  if (projectId) lines.push(`Projet : ${projectId}`, "");
+  for (const f of features) {
+    lines.push(`### ${f.ref || f.id} — ${f.role || "sans rôle"}`);
+    if (f.userStory) lines.push(`- User story : ${oneLine(f.userStory)}`);
+    lines.push("");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+// Bloc markdown « Règles métier de référence » (une section par règle). Une règle
+// `roleGlobal` affiche « tous les rôles — globale » (et non une liste vide).
+// Vide si aucune règle (⇒ aucun bloc injecté).
+function renderRuleContextBlock(rules, projectId) {
+  if (!rules.length) return "";
+  const lines = ["## Règles métier de référence", ""];
+  if (projectId) lines.push(`Projet : ${projectId}`, "");
+  for (const r of rules) {
+    lines.push(`### ${r.ref || r.id}`);
+    if (r.content) lines.push(`- Contenu : ${oneLine(r.content)}`);
+    const roles = Array.isArray(r.roles) ? r.roles.filter(Boolean) : [];
+    if (r.roleGlobal) lines.push("- Rôles : (tous les rôles — globale)");
+    else lines.push(`- Rôles : ${roles.length ? roles.join(", ") : "(aucun)"}`);
+    lines.push("");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
 function rowToAdrConflict(r) {
   if (!r) return null;
   return {
@@ -5215,6 +5280,44 @@ export async function buildAdrContext({ projectId, scope, adrIds, taskId } = {})
   }
   const context = renderAdrContextBlock(adrs, pid);
   return { projectId: pid, count: adrs.length, adrs, context };
+}
+
+// Bloc de contexte « Fonctionnalités de référence » prêt à injecter dans un
+// prompt agent. Sélection EXPLICITE uniquement (`featureIds`) ; lecture BULK
+// `WHERE id = ANY($1::text[])` (1 requête, 0 N+1 — pas de `getFeature` par id).
+// Les ids inconnus sont ignorés. `context` = "" si vide ⇒ aucun bloc (facultatif).
+export async function buildFeatureContext({ projectId, featureIds } = {}) {
+  await ensureSchema();
+  const pid = projectId || null;
+  const ids = (Array.isArray(featureIds) ? featureIds : []).map((x) => String(x)).filter(Boolean);
+  let features = [];
+  if (ids.length) {
+    const rows = (await pool().query(
+      "SELECT * FROM fonctionnalites WHERE id = ANY($1::text[]) ORDER BY ref ASC",
+      [ids],
+    )).rows;
+    features = rows.map(rowToFonctionnalite).filter(Boolean);
+  }
+  const context = renderFeatureContextBlock(features, pid);
+  return { projectId: pid, count: features.length, features, context };
+}
+
+// Bloc de contexte « Règles métier de référence » (analogue à buildFeatureContext).
+// Sélection EXPLICITE uniquement (`ruleIds`) ; lecture BULK (1 requête, 0 N+1).
+export async function buildRuleContext({ projectId, ruleIds } = {}) {
+  await ensureSchema();
+  const pid = projectId || null;
+  const ids = (Array.isArray(ruleIds) ? ruleIds : []).map((x) => String(x)).filter(Boolean);
+  let rules = [];
+  if (ids.length) {
+    const rows = (await pool().query(
+      "SELECT * FROM regles_metier WHERE id = ANY($1::text[]) ORDER BY ref ASC",
+      [ids],
+    )).rows;
+    rules = rows.map(rowToRegle).filter(Boolean);
+  }
+  const context = renderRuleContextBlock(rules, pid);
+  return { projectId: pid, count: rules.length, rules, context };
 }
 
 // Crée une ADR structurée — statut initial 'Proposé' par défaut (l'acceptation
@@ -5867,11 +5970,11 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
 // ===========================================================================
 
 // Crée une recette de PROJET (titre + 0..N tâches couvertes) et la passe en cours.
-// `sprintId`/`featureIds`/`adrIds` (T6, OPTIONNELS) : liens posés à la création
-// (NON bloquants). Sans `sprintId`, rattachement au SPRINT PAR DÉFAUT si le projet
-// n'a aucun sprint. Un signal de cardinalité est tracé (recette → ≥1 ADR + ≥1
-// fonctionnalité + 1 sprint).
-export async function startRecette({ project, projects, title, description, taskIds, sprintId, featureIds, adrIds, status = "pending", sessionId = null, organizationId, createdBy }) {
+// `sprintId`/`featureIds`/`ruleIds`/`adrIds` (T6, OPTIONNELS) : liens posés à la
+// création (NON bloquants). Sans `sprintId`, rattachement au SPRINT PAR DÉFAUT si
+// le projet n'a aucun sprint. Un signal de cardinalité est tracé (recette → ≥1 ADR
+// + ≥1 fonctionnalité + 1 sprint).
+export async function startRecette({ project, projects, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status = "pending", sessionId = null, organizationId, createdBy }) {
   await ensureSchema();
   // 1 recette = 1 PROJET unique. Les repos transverses du projet (project_repos)
   // sont la portée de la recette — pas d'ajout de projets supplémentaires.
@@ -5898,6 +6001,10 @@ export async function startRecette({ project, projects, title, description, task
   for (const fid of Array.isArray(featureIds) ? featureIds : []) {
     if (!fid) continue;
     try { await linkRecetteFeature({ recetteId, featureId: fid }); } catch {}
+  }
+  for (const rid of Array.isArray(ruleIds) ? ruleIds : []) {
+    if (!rid) continue;
+    try { await linkRecetteRule({ recetteId, ruleId: rid }); } catch {}
   }
   for (const aid of Array.isArray(adrIds) ? adrIds : []) {
     if (!aid) continue;
@@ -6037,7 +6144,7 @@ export async function getRecetteById(recetteId) {
   // Liens N:N recette↔sprint / fonctionnalité(s) / ADR(s) (T5/A023) — lecture
   // ADDITIVE des tables T1 (`recette_sprints`, `recette_fonctionnalites`,
   // `recette_adr`). N'altère ni `recette_start` ni `recette_item_*`.
-  const [sprintRows, featureRows, adrRows] = await Promise.all([
+  const [sprintRows, featureRows, ruleRows, adrRows] = await Promise.all([
     pool().query(
       `SELECT s.* FROM sprints s JOIN recette_sprints rs ON rs.sprint_id = s.id
         WHERE rs.recette_id = $1 ORDER BY s.created_at ASC`, [recetteId]),
@@ -6045,12 +6152,16 @@ export async function getRecetteById(recetteId) {
       `SELECT f.* FROM fonctionnalites f JOIN recette_fonctionnalites rf ON rf.fonctionnalite_id = f.id
         WHERE rf.recette_id = $1 ORDER BY f.ref ASC`, [recetteId]),
     pool().query(
+      `SELECT rm.* FROM regles_metier rm JOIN recette_regles rr ON rr.regle_id = rm.id
+        WHERE rr.recette_id = $1 ORDER BY rm.ref ASC`, [recetteId]),
+    pool().query(
       `SELECT a.artifact_id, a.title, a.doc_type, a.kind, a.path FROM artifacts a
          JOIN recette_adr ra ON ra.adr_id = a.artifact_id
         WHERE ra.recette_id = $1 ORDER BY a.artifact_id ASC`, [recetteId]),
   ]);
   const sprints = sprintRows.rows.map(rowToSprint);
   const fonctionnalites = featureRows.rows.map(rowToFonctionnalite);
+  const regles = ruleRows.rows.map(rowToRegle);
   const adrs = adrRows.rows.map((a) => ({ adrId: a.artifact_id, title: a.title ?? null, docType: a.doc_type, kind: a.kind ?? null, path: a.path ?? null }));
   return {
     recetteId: r.recette_id,
@@ -6068,6 +6179,7 @@ export async function getRecetteById(recetteId) {
     documents,
     sprints,
     fonctionnalites,
+    regles,
     adrs,
     adrVigilances,
     adrVigilancesOpen: adrVigilances.filter((v) => v.status === "open"),

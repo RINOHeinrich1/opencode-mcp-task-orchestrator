@@ -115,6 +115,8 @@ import {
   getAdr,
   searchAdrs,
   buildAdrContext,
+  buildFeatureContext,
+  buildRuleContext,
   registerAdr,
   setAdrStatus,
   attachAdr,
@@ -205,6 +207,8 @@ import {
   unlinkRecetteSprint,
   linkRecetteFeature,
   unlinkRecetteFeature,
+  linkRecetteRule,
+  unlinkRecetteRule,
   linkRecetteAdr,
   unlinkRecetteAdr,
   ARTIFACT_SOURCES,
@@ -1382,6 +1386,28 @@ server.registerTool("recette_adr_unlink", {
   catch (e) { return err(e.message); }
 });
 
+server.registerTool("recette_rule_link", {
+  description: "LIE une RECETTE à une RÈGLE MÉTIER EXISTANTE (`recette_regles`, idempotent).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    ruleId: z.string().describe("Règle métier."),
+  },
+}, async ({ recetteId, ruleId }) => {
+  try { return text(JSON.stringify(await linkRecetteRule({ recetteId, ruleId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
+server.registerTool("recette_rule_unlink", {
+  description: "DÉLIE une RECETTE d'une RÈGLE MÉTIER (`recette_regles`).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette."),
+    ruleId: z.string().describe("Règle métier."),
+  },
+}, async ({ recetteId, ruleId }) => {
+  try { return text(JSON.stringify(await unlinkRecetteRule({ recetteId, ruleId }), null, 2)); }
+  catch (e) { return err(e.message); }
+});
+
 // ===========================================================================
 // Famille ADR `adr_*` (item 125) — sur-ensemble STRUCTURÉ du module `doc_*`.
 // Lecture/contexte (productivité), cycle de vie (écriture tracée), signalement.
@@ -1440,6 +1466,32 @@ server.registerTool("adr_context", {
 }, async ({ projectId, scope, adrIds, taskId }) => {
   try {
     const r = await buildAdrContext({ projectId, scope, adrIds, taskId });
+    return text(JSON.stringify(r, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("feature_context", {
+  description: "Construit le bloc de contexte FONCTIONNALITÉS prêt à injecter dans un prompt agent ('## Fonctionnalités de référence' : ref, rôle, user story). Sélection EXPLICITE via `featureIds` (lecture BULK, 1 requête, 0 N+1) ; `context` = \"\" si aucune sélection ⇒ aucun bloc (facultatif). Retourne { projectId, count, features, context }.",
+  inputSchema: {
+    projectId: z.string().optional().describe("Projet de référence (affiché dans le bloc)."),
+    featureIds: z.array(z.string()).optional().describe("Fonctionnalités sélectionnées."),
+  },
+}, async ({ projectId, featureIds }) => {
+  try {
+    const r = await buildFeatureContext({ projectId, featureIds });
+    return text(JSON.stringify(r, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_context", {
+  description: "Construit le bloc de contexte RÈGLES MÉTIER prêt à injecter dans un prompt agent ('## Règles métier de référence' : ref, contenu, rôles/global). Sélection EXPLICITE via `ruleIds` (lecture BULK, 1 requête, 0 N+1) ; `context` = \"\" si aucune sélection ⇒ aucun bloc (facultatif). Retourne { projectId, count, rules, context }.",
+  inputSchema: {
+    projectId: z.string().optional().describe("Projet de référence (affiché dans le bloc)."),
+    ruleIds: z.array(z.string()).optional().describe("Règles métier sélectionnées."),
+  },
+}, async ({ projectId, ruleIds }) => {
+  try {
+    const r = await buildRuleContext({ projectId, ruleIds });
     return text(JSON.stringify(r, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1811,15 +1863,16 @@ server.registerTool("task_link_remove", {
      taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N — doivent appartenir au projet de la recette)."),
      sprintId: z.string().optional().describe("Sprint de la recette (optionnel, T6) ; sinon sprint par défaut SI le projet n'a aucun sprint."),
      featureIds: z.array(z.string()).optional().describe("Fonctionnalités de la recette (optionnel, T6)."),
+     ruleIds: z.array(z.string()).optional().describe("Règles métier de la recette (optionnel, T6 — NON bloquant)."),
      adrIds: z.array(z.string()).optional().describe("ADR de la recette (optionnel, T6)."),
      status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
      sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
      createdBy: z.string().optional().describe("Utilisateur (username) qui crée la recette."),
      organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
    },
- }, async ({ project, title, description, taskIds, sprintId, featureIds, adrIds, status, sessionId, createdBy, organizationId }) => {
-  try {
-    const recette = await startRecette({ project, title, description, taskIds, sprintId, featureIds, adrIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
+ }, async ({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status, sessionId, createdBy, organizationId }) => {
+   try {
+     const recette = await startRecette({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
     // CARDINALITÉ (T6, lecture seule, NON bloquante) : recette → ≥1 ADR +
     // ≥1 fonctionnalité + 1 sprint.
     const cardinalite = await checkCardinality({ entityType: "recette", entityId: recette.recetteId }).catch(() => null);
@@ -1844,7 +1897,7 @@ server.registerTool("recette_list", {
 
 // === recette_get ===
 server.registerTool("recette_get", {
-  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
+  description: "Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`. Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
   inputSchema: { recetteId: z.string() },
 }, async ({ recetteId }) => {
   try {

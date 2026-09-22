@@ -890,6 +890,15 @@ CREATE TABLE IF NOT EXISTS recette_adr (
 );
 CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id);
 
+-- Recette ↔ règle métier (T-20260922-070103-ncs1). Miroir EXACT de la DDL
+-- posée dans `migrate()` (db.mjs). Miroir DDL de `recette_fonctionnalites`.
+CREATE TABLE IF NOT EXISTS recette_regles (
+  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  regle_id   TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
+  PRIMARY KEY (recette_id, regle_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id);
+
 -- ===========================================================================
 -- SESSION DE MIGRATION DES ANCIENS SPRINTS (ADR-001 §6) — DDL ADDITIVE.
 -- Miroir EXACT de la DDL posée dans `migrate()` (db.mjs). Aucune colonne
