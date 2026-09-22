@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-recette-evaluateur";
+const SCHEMA_VERSION = "2026-09-22-evaluation-items-workflow";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -752,6 +752,24 @@ $$ LANGUAGE plpgsql`);
     created_at    TEXT NOT NULL
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluation_items_evaluation ON evaluation_items(evaluation_id)");
+  // DÉCISION ADMIN « à traiter » (ou non), DISTINCTE du statut de suivi
+  // `status`. Trace qui a décidé et quand (T-20260922-100650-3w6i, ADR-001 :
+  // l'admin marque chaque élément « à traiter » ou non ; l'exécuteur n'accède
+  // qu'aux éléments « à traiter »). Colonnes ADDITIVES, défaut `pending`.
+  await pool().query("ALTER TABLE evaluation_items ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending'");
+  await pool().query("ALTER TABLE evaluation_items ADD COLUMN IF NOT EXISTS decided_at TEXT");
+  await pool().query("ALTER TABLE evaluation_items ADD COLUMN IF NOT EXISTS decided_by TEXT");
+  // REPRISE d'un élément de recette évaluateur par un CADRAGE TECHNIQUE
+  // (`recettes`, alias `cadrage_*`) : lien ADDITIF pour le traçage « repris par
+  // le cadrage X ». Aucune entité concurrente, aucune conversion en tâches.
+  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_evaluation_items (
+    recette_id         TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    evaluation_item_id INTEGER NOT NULL REFERENCES evaluation_items(id) ON DELETE CASCADE,
+    created_at         TEXT NOT NULL,
+    taken_by           TEXT,
+    PRIMARY KEY (recette_id, evaluation_item_id)
+  )`);
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_evaluation_items_item ON cadrage_evaluation_items(evaluation_item_id)");
   // =========================================================================
   // CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques
   // de cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
@@ -6211,6 +6229,8 @@ export async function getRecetteById(recetteId) {
   const fonctionnalites = featureRows.rows.map(rowToFonctionnalite);
   const regles = ruleRows.rows.map(rowToRegle);
   const adrs = adrRows.rows.map((a) => ({ adrId: a.artifact_id, title: a.title ?? null, docType: a.doc_type, kind: a.kind ?? null, path: a.path ?? null }));
+  // Éléments de recette évaluateur REPRIS par ce cadrage (traçage additif).
+  const evaluationItems = await listCadrageEvaluationItems({ recetteId });
   return {
     recetteId: r.recette_id,
     project: r.project,
@@ -6229,6 +6249,7 @@ export async function getRecetteById(recetteId) {
     fonctionnalites,
     regles,
     adrs,
+    evaluationItems,
     adrVigilances,
     adrVigilancesOpen: adrVigilances.filter((v) => v.status === "open"),
   };
@@ -6491,6 +6512,10 @@ export async function confirmRecette({ recetteId, confirmedBy }) {
 export const EVALUATION_ITEM_CATEGORIES = ["recommandation", "probleme"];
 export const EVALUATION_ITEM_SEVERITIES = ["low", "medium", "high", "critical"];
 export const EVALUATION_ITEM_STATUSES = ["open", "treated", "dismissed"];
+// DÉCISION ADMIN « à traiter » (ou non) — DISTINCTE du statut de suivi
+// `status` : l'admin marque chaque élément ; l'exécuteur n'accède qu'aux
+// éléments `a_traiter` (ADR-001).
+export const EVALUATION_ITEM_DECISIONS = ["pending", "a_traiter", "non_retenu"];
 // Verdicts possibles d'une fonctionnalité évaluée.
 export const EVALUATION_VERDICTS = ["conforme", "non_conforme", "a_ameliorer"];
 
@@ -6530,6 +6555,7 @@ export async function listProjectEvaluations(project) {
   const rows = (await pool().query(
     `SELECT e.*,
             (SELECT COUNT(*) FROM evaluation_items i WHERE i.evaluation_id = e.evaluation_id) AS items_count,
+            (SELECT COUNT(*) FROM evaluation_items i WHERE i.evaluation_id = e.evaluation_id AND i.decision = 'a_traiter') AS treatable_count,
             (SELECT COUNT(*) FROM evaluation_fonctionnalites ef WHERE ef.evaluation_id = e.evaluation_id) AS features_count,
             (SELECT COUNT(*) FROM evaluation_regles er WHERE er.evaluation_id = e.evaluation_id) AS rules_count
      FROM evaluations e
@@ -6554,6 +6580,7 @@ async function rowToEvaluationSummary(r) {
     confirmedBy: r.confirmed_by,
     createdBy: r.created_by ?? null,
     itemsCount: Number(r.items_count),
+    treatableCount: Number(r.treatable_count),
     featuresCount: Number(r.features_count),
     rulesCount: Number(r.rules_count),
   };
@@ -6564,19 +6591,39 @@ export async function getEvaluationById(evaluationId) {
   await ensureSchema();
   const r = (await pool().query("SELECT * FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
   if (!r) return null;
-  const items = (await pool().query(
-    "SELECT id, content, category, severity, discussion, status, created_at FROM evaluation_items WHERE evaluation_id = $1 ORDER BY id ASC",
+  const itemRows = (await pool().query(
+    "SELECT id, content, category, severity, discussion, status, decision, decided_at, decided_by, created_at FROM evaluation_items WHERE evaluation_id = $1 ORDER BY id ASC",
     [evaluationId],
-  )).rows.map((i) => ({
+  )).rows;
+  const documents = await listEvaluationDocuments(evaluationId);
+  // Reprises « par le cadrage X » (traçage) — une requête pour tous les items.
+  const reprisRows = itemRows.length ? (await pool().query(
+    `SELECT cei.evaluation_item_id, cei.recette_id, cei.created_at, cei.taken_by, r.title
+       FROM cadrage_evaluation_items cei
+       LEFT JOIN recettes r ON r.recette_id = cei.recette_id
+      WHERE cei.evaluation_item_id = ANY($1) ORDER BY cei.created_at ASC`,
+    [itemRows.map((i) => Number(i.id))],
+  )).rows : [];
+  const reprisByItem = new Map();
+  for (const x of reprisRows) {
+    const k = Number(x.evaluation_item_id);
+    if (!reprisByItem.has(k)) reprisByItem.set(k, []);
+    reprisByItem.get(k).push({ cadrageId: x.recette_id, title: x.title ?? null, createdAt: x.created_at, takenBy: x.taken_by ?? null });
+  }
+  const items = itemRows.map((i) => ({
     itemId: Number(i.id),
     content: i.content,
     category: i.category,
     severity: i.severity,
     discussion: i.discussion,
     status: i.status,
+    decision: i.decision,
+    decidedAt: i.decided_at ?? null,
+    decidedBy: i.decided_by ?? null,
     createdAt: i.created_at,
+    documents: documents.filter((d) => d.itemId === Number(i.id)),
+    reprisPar: reprisByItem.get(Number(i.id)) || [],
   }));
-  const documents = await listEvaluationDocuments(evaluationId);
   const repos = await reposOfProject(r.project);
   const [featureRows, ruleRows] = await Promise.all([
     pool().query(
@@ -6610,6 +6657,107 @@ export async function getEvaluationById(evaluationId) {
     fonctionnalites,
     regles,
   };
+}
+
+// Éléments ACCESSIBLES À L'EXÉCUTEUR : uniquement ceux que l'admin a marqués
+// « à traiter » (`decision='a_traiter'`). Contexte de sélection d'un cadrage
+// technique. Filtre `project` optionnel. Inclut le traçage `reprisPar`.
+export async function listTreatableEvaluationItems({ project } = {}) {
+  await ensureSchema();
+  const rows = (await pool().query(
+    `SELECT i.id, i.evaluation_id, i.content, i.category, i.severity, i.discussion, i.status,
+            i.decision, i.decided_at, i.decided_by, i.created_at,
+            e.title AS evaluation_title, e.project
+       FROM evaluation_items i
+       JOIN evaluations e ON e.evaluation_id = i.evaluation_id
+      WHERE i.decision = 'a_traiter'${project ? " AND e.project = $1" : ""}
+      ORDER BY i.id ASC`,
+    project ? [project] : [],
+  )).rows;
+  const reprisRows = rows.length ? (await pool().query(
+    `SELECT cei.evaluation_item_id, cei.recette_id, cei.created_at, cei.taken_by, r.title
+       FROM cadrage_evaluation_items cei
+       LEFT JOIN recettes r ON r.recette_id = cei.recette_id
+      WHERE cei.evaluation_item_id = ANY($1) ORDER BY cei.created_at ASC`,
+    [rows.map((i) => Number(i.id))],
+  )).rows : [];
+  const reprisByItem = new Map();
+  for (const x of reprisRows) {
+    const k = Number(x.evaluation_item_id);
+    if (!reprisByItem.has(k)) reprisByItem.set(k, []);
+    reprisByItem.get(k).push({ cadrageId: x.recette_id, title: x.title ?? null, createdAt: x.created_at, takenBy: x.taken_by ?? null });
+  }
+  return rows.map((i) => ({
+    itemId: Number(i.id),
+    evaluationId: i.evaluation_id,
+    evaluationTitle: i.evaluation_title ?? null,
+    project: i.project,
+    category: i.category,
+    severity: i.severity,
+    content: i.content,
+    discussion: i.discussion,
+    status: i.status,
+    decision: i.decision,
+    decidedAt: i.decided_at ?? null,
+    decidedBy: i.decided_by ?? null,
+    createdAt: i.created_at,
+    reprisPar: reprisByItem.get(Number(i.id)) || [],
+  }));
+}
+
+// --- Reprise d'un élément de recette par un CADRAGE technique ---------------
+// Lien ADDITIF cadrage (`recettes`) ↔ élément (`evaluation_items`). GARDE :
+// on ne reprend QUE des éléments `decision='a_traiter'` (ADR-001/002).
+export async function linkCadrageEvaluationItem({ recetteId, itemId, by } = {}) {
+  await ensureSchema();
+  if (!recetteId || itemId === undefined || itemId === null) throw new Error("recetteId et itemId requis");
+  const rec = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!rec) throw new Error(`cadrage inconnu : ${recetteId}`);
+  const item = (await pool().query("SELECT id, decision FROM evaluation_items WHERE id = $1", [Number(itemId)])).rows[0];
+  if (!item) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
+  if (item.decision !== "a_traiter") {
+    throw new Error(`élément ${itemId} non « à traiter » (décision = ${item.decision}) : reprise refusée`);
+  }
+  const ins = await pool().query(
+    `INSERT INTO cadrage_evaluation_items (recette_id, evaluation_item_id, created_at, taken_by)
+     VALUES ($1,$2,$3,$4) ON CONFLICT (recette_id, evaluation_item_id) DO NOTHING`,
+    [String(recetteId), Number(itemId), nowIso(), by ?? null],
+  );
+  return { ok: true, recetteId: String(recetteId), itemId: Number(itemId), linked: ins.rowCount > 0 };
+}
+
+export async function unlinkCadrageEvaluationItem({ recetteId, itemId } = {}) {
+  await ensureSchema();
+  if (!recetteId || itemId === undefined || itemId === null) throw new Error("recetteId et itemId requis");
+  const del = await pool().query(
+    "DELETE FROM cadrage_evaluation_items WHERE recette_id = $1 AND evaluation_item_id = $2",
+    [String(recetteId), Number(itemId)],
+  );
+  return { ok: true, recetteId: String(recetteId), itemId: Number(itemId), unlinked: del.rowCount > 0 };
+}
+
+export async function listCadrageEvaluationItems({ recetteId } = {}) {
+  await ensureSchema();
+  if (!recetteId) throw new Error("recetteId requis");
+  const rows = (await pool().query(
+    `SELECT i.id, i.evaluation_id, i.content, i.category, i.severity, i.discussion, i.status, i.decision, i.created_at,
+            e.title AS evaluation_title
+       FROM cadrage_evaluation_items cei
+       JOIN evaluation_items i ON i.id = cei.evaluation_item_id
+       JOIN evaluations e ON e.evaluation_id = i.evaluation_id
+      WHERE cei.recette_id = $1 ORDER BY i.id ASC`,
+    [String(recetteId)],
+  )).rows;
+  return rows.map((i) => ({
+    itemId: Number(i.id),
+    evaluationId: i.evaluation_id,
+    evaluationTitle: i.evaluation_title ?? null,
+    category: i.category,
+    severity: i.severity,
+    content: i.content,
+    status: i.status,
+    decision: i.decision,
+  }));
 }
 
 // --- Éléments (recommandation | problème) ----------------------------------
@@ -6654,9 +6802,25 @@ export async function deleteEvaluationItem({ itemId }) {
   return { ok: true, itemId: Number(itemId) };
 }
 
+// DÉCISION ADMIN « à traiter » (ou non) d'un élément — action TRACÉE,
+// DISTINCTE du statut de suivi (`updateEvaluationItem`). `decision` ∈
+// EVALUATION_ITEM_DECISIONS ; `by` = auteur de la décision.
+export async function setEvaluationItemDecision({ itemId, decision, by } = {}) {
+  await ensureSchema();
+  if (!EVALUATION_ITEM_DECISIONS.includes(decision)) {
+    throw new Error(`décision invalide : ${decision} (attendu : ${EVALUATION_ITEM_DECISIONS.join(" | ")})`);
+  }
+  const r = await pool().query(
+    "UPDATE evaluation_items SET decision = $1, decided_at = $2, decided_by = $3 WHERE id = $4 RETURNING id",
+    [decision, nowIso(), by ?? null, Number(itemId)],
+  );
+  if (!r.rows[0]) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
+  return getEvaluationItem(Number(itemId));
+}
+
 async function getEvaluationItem(itemId) {
   const r = (await pool().query(
-    "SELECT id, evaluation_id, content, category, severity, discussion, status, created_at FROM evaluation_items WHERE id = $1",
+    "SELECT id, evaluation_id, content, category, severity, discussion, status, decision, decided_at, decided_by, created_at FROM evaluation_items WHERE id = $1",
     [itemId],
   )).rows[0];
   return r ? {
@@ -6667,6 +6831,9 @@ async function getEvaluationItem(itemId) {
     severity: r.severity,
     discussion: r.discussion,
     status: r.status,
+    decision: r.decision,
+    decidedAt: r.decided_at ?? null,
+    decidedBy: r.decided_by ?? null,
     createdAt: r.created_at,
   } : null;
 }
@@ -6738,29 +6905,41 @@ export async function setEvaluationVerdict({ evaluationId, fonctionnaliteId, ver
 }
 
 // --- Pièces jointes (lien / document / photo / vidéo) -----------------------
-export async function addEvaluationDocument({ evaluationId, title, nature, source, path, artifactId }) {
+// `itemId` (optionnel) rattache la pièce à un ÉLÉMENT précis (via `meta.itemId`),
+// sans table nouvelle ; sans `itemId`, la pièce reste au niveau de l'évaluation.
+export async function addEvaluationDocument({ evaluationId, title, nature, source, path, artifactId, itemId }) {
   await ensureSchema();
   const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
   if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
   const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const meta = {
+    ...(artifactId ? { artifactId } : {}),
+    ...(itemId !== undefined && itemId !== null && itemId !== "" ? { itemId: Number(itemId) } : {}),
+  };
   await pool().query(
     `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
      VALUES ($1,'evaluation_doc',$2,'autre',$3,$4,$5,$6,$7,$8)`,
     [id, String(evaluationId), title ?? null, nature ?? null, source || "import", path ?? null,
-     artifactId ? { artifactId } : null, nowIso()],
+     Object.keys(meta).length ? meta : null, nowIso()],
   );
   return listEvaluationDocuments(evaluationId);
 }
 
-export async function listEvaluationDocuments(evaluationId) {
+export async function listEvaluationDocuments(evaluationId, { itemId } = {}) {
   await ensureSchema();
+  const params = [String(evaluationId), EVALUATION_DOC_TYPES];
+  let filter = "";
+  if (itemId !== undefined && itemId !== null && itemId !== "") {
+    params.push(String(Number(itemId)));
+    filter = ` AND d.meta->>'itemId' = $${params.length}`;
+  }
   const rows = (await pool().query(
     `SELECT d.id, d.artifact_id, d.content_id, d.title, d.nature, d.source, d.path, d.meta, d.created_at,
             a.title AS artifact_title
      FROM artifacts d
      LEFT JOIN artifacts a ON a.artifact_id = (d.meta->>'artifactId')
-     WHERE d.content_id = $1 AND d.doc_type = ANY($2) ORDER BY d.id ASC`,
-    [String(evaluationId), EVALUATION_DOC_TYPES],
+     WHERE d.content_id = $1 AND d.doc_type = ANY($2)${filter} ORDER BY d.id ASC`,
+    params,
   )).rows;
   return rows.map((r) => ({
     documentId: Number(r.id),
@@ -6770,6 +6949,7 @@ export async function listEvaluationDocuments(evaluationId) {
     source: r.source,
     path: r.path,
     meta: r.meta ?? null,
+    itemId: r.meta && r.meta.itemId !== undefined && r.meta.itemId !== null ? Number(r.meta.itemId) : null,
     artifactId: r.artifact_id ?? null,
     createdAt: r.created_at,
   }));

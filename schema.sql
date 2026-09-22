@@ -964,9 +964,24 @@ CREATE TABLE IF NOT EXISTS evaluation_items (
   severity      TEXT NOT NULL DEFAULT 'medium',     -- low | medium | high | critical
   discussion    TEXT,                               -- échanges liés
   status        TEXT NOT NULL DEFAULT 'open',       -- open | treated | dismissed
+  decision      TEXT NOT NULL DEFAULT 'pending',    -- pending | a_traiter | non_retenu (décision ADMIN)
+  decided_at    TEXT,                               -- date de la décision admin
+  decided_by    TEXT,                               -- auteur de la décision admin
   created_at    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evaluation_items_evaluation ON evaluation_items(evaluation_id);
+
+-- REPRISE d'un élément de recette évaluateur par un CADRAGE TECHNIQUE
+-- (`recettes`, alias `cadrage_*`) : lien ADDITIF (traçage « repris par le
+-- cadrage X »). Miroir EXACT de la DDL posée dans `migrate()` (db.mjs).
+CREATE TABLE IF NOT EXISTS cadrage_evaluation_items (
+  recette_id         TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  evaluation_item_id INTEGER NOT NULL REFERENCES evaluation_items(id) ON DELETE CASCADE,
+  created_at         TEXT NOT NULL,
+  taken_by           TEXT,
+  PRIMARY KEY (recette_id, evaluation_item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cadrage_evaluation_items_item ON cadrage_evaluation_items(evaluation_item_id);
 
 -- ===========================================================================
 -- CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques de

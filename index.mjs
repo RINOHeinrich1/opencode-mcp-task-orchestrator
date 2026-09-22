@@ -248,6 +248,11 @@ import {
   addEvaluationItem,
   updateEvaluationItem,
   deleteEvaluationItem,
+  setEvaluationItemDecision,
+  listTreatableEvaluationItems,
+  linkCadrageEvaluationItem,
+  unlinkCadrageEvaluationItem,
+  listCadrageEvaluationItems,
   linkEvaluationFeature,
   unlinkEvaluationFeature,
   linkEvaluationRule,
@@ -260,6 +265,7 @@ import {
   EVALUATION_ITEM_CATEGORIES,
   EVALUATION_ITEM_SEVERITIES,
   EVALUATION_ITEM_STATUSES,
+  EVALUATION_ITEM_DECISIONS,
   EVALUATION_VERDICTS,
   getArtifact,
 } from "./db.mjs";
@@ -1929,7 +1935,7 @@ server.registerTool("cadrage_list", {
 
 // === cadrage_get ===
 server.registerTool("cadrage_get", {
-  description: "Détail d'un cadrage technique (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments de cadrage). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`. Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
+  description: "Détail d'un cadrage technique (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments de cadrage). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`, ainsi que `evaluationItems` (éléments de recette évaluateur REPRIS par ce cadrage, « repris par le cadrage X »). Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
   inputSchema: { cadrageId: z.string() },
 }, async ({ cadrageId }) => {
   try {
@@ -2512,7 +2518,7 @@ server.registerTool("evaluation_list", {
 });
 
 server.registerTool("evaluation_get", {
-  description: "Détail d'une évaluation : parcours évalué, statut, éléments (recommandation/problème), fonctionnalités avec VERDICT, règles métier, pièces jointes.",
+  description: "Détail d'une évaluation : parcours évalué, statut, éléments (recommandation/problème) avec leur DÉCISION ADMIN (pending|a_traiter|non_retenu), leur statut de suivi, leurs PIÈCES (`documents[]`) et leur traçage `reprisPar[]` (« repris par le cadrage X »), fonctionnalités avec VERDICT, règles métier, pièces jointes.",
   inputSchema: { evaluationId: z.string().describe("Identifiant EVAL-<ts>-<rand>.") },
 }, async ({ evaluationId }) => {
   try {
@@ -2539,7 +2545,7 @@ server.registerTool("evaluation_item_add", {
 });
 
 server.registerTool("evaluation_item_update", {
-  description: "Met à jour un élément d'évaluation (contenu, catégorie, sévérité, discussion, statut de suivi open|treated|dismissed).",
+  description: "Met à jour un élément d'évaluation (contenu, catégorie, sévérité, discussion, statut de suivi open|treated|dismissed). La DÉCISION ADMIN « à traiter » (pending|a_traiter|non_retenu) n'est PAS modifiable ici : utiliser `evaluation_item_decision`.",
   inputSchema: {
     itemId: z.number().int(),
     content: z.string().optional(),
@@ -2552,6 +2558,63 @@ server.registerTool("evaluation_item_update", {
   try {
     const item = await updateEvaluationItem({ itemId, content, category, severity, discussion, status });
     return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === evaluation_item_decision (décision ADMIN « à traiter ») ===
+server.registerTool("evaluation_item_decision", {
+  description: "DÉCISION ADMIN d'un élément de recette évaluateur : `pending` (non décidé) | `a_traiter` | `non_retenu`. DISTINCTE du statut de suivi. Seuls les éléments `a_traiter` sont accessibles à l'exécuteur (contexte de cadrage).",
+  inputSchema: {
+    itemId: z.number().int(),
+    decision: z.enum(EVALUATION_ITEM_DECISIONS).describe("pending | a_traiter | non_retenu."),
+    by: z.string().optional().describe("Auteur de la décision (admin)."),
+  },
+}, async ({ itemId, decision, by }) => {
+  try {
+    const item = await setEvaluationItemDecision({ itemId, decision, by });
+    return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === evaluation_items_treatable (contexte de sélection de l'exécuteur) ===
+server.registerTool("evaluation_items_treatable", {
+  description: "Liste les ÉLÉMENTS DE RECETTE ÉVALUATEUR « à traiter » (décision admin = `a_traiter`), seuls accessibles à l'exécuteur comme entrée de contexte d'un cadrage technique. Inclut le traçage `reprisPar` (cadrage(s) ayant repris l'élément).",
+  inputSchema: { project: z.string().optional().describe("Projet (produit) — sinon tous.") },
+}, async ({ project }) => {
+  try {
+    const items = await listTreatableEvaluationItems({ project });
+    return text(JSON.stringify({ count: items.length, items }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === cadrage_evaluation_item_* (reprise d'un élément par un cadrage) ===
+server.registerTool("cadrage_evaluation_item_link", {
+  description: "Reprend un ÉLÉMENT DE RECETTE ÉVALUATEUR dans un CADRAGE technique (lien additif, traçage « repris par le cadrage X »). GARDE : refuse un élément dont la décision admin n'est pas `a_traiter`.",
+  inputSchema: { cadrageId: z.string().describe("Cadrage technique (recette)."), itemId: z.number().int().describe("Élément d'évaluation.") },
+}, async ({ cadrageId, itemId }) => {
+  try {
+    const r = await linkCadrageEvaluationItem({ recetteId: cadrageId, itemId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("cadrage_evaluation_item_unlink", {
+  description: "Détache un ÉLÉMENT DE RECETTE ÉVALUATEUR d'un CADRAGE technique (fin de la reprise « repris par le cadrage X »).",
+  inputSchema: { cadrageId: z.string(), itemId: z.number().int() },
+}, async ({ cadrageId, itemId }) => {
+  try {
+    const r = await unlinkCadrageEvaluationItem({ recetteId: cadrageId, itemId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("cadrage_evaluation_item_list", {
+  description: "Liste les ÉLÉMENTS DE RECETTE ÉVALUATEUR repris par un CADRAGE technique (traçage « repris par le cadrage X »).",
+  inputSchema: { cadrageId: z.string() },
+}, async ({ cadrageId }) => {
+  try {
+    const items = await listCadrageEvaluationItems({ recetteId: cadrageId });
+    return text(JSON.stringify({ count: items.length, items }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
@@ -2626,7 +2689,7 @@ server.registerTool("evaluation_verdict_set", {
 });
 
 server.registerTool("evaluation_doc_add", {
-  description: "Rattache une PIÈCE à une évaluation (lien / document / photo / vidéo) : `nature` libre + `source` (import d'un chemin, ou artifact existant) + `path`/`artifactId`. Famille isolée (`doc_type='evaluation_doc'`).",
+  description: "Rattache une PIÈCE à une évaluation (lien / document / photo / vidéo) : `nature` libre + `source` (import d'un chemin, ou artifact existant) + `path`/`artifactId`. `itemId` optionnel rattache la pièce à un ÉLÉMENT précis (sinon pièce au niveau de l'évaluation). Famille isolée (`doc_type='evaluation_doc'`).",
   inputSchema: {
     evaluationId: z.string(),
     title: z.string().optional(),
@@ -2634,8 +2697,9 @@ server.registerTool("evaluation_doc_add", {
     source: z.enum(["import", "artifact"]).default("import"),
     path: z.string().optional().describe("Chemin / URL de la pièce (mode import)."),
     artifactId: z.string().optional().describe("Artefact existant à lier (mode artifact)."),
+    itemId: z.number().int().optional().describe("Élément d'évaluation porteur de la pièce (optionnel)."),
   },
-}, async ({ evaluationId, title, nature, source, path, artifactId }) => {
+}, async ({ evaluationId, title, nature, source, path, artifactId, itemId }) => {
   try {
     let finalPath = path;
     if (source === "artifact") {
@@ -2644,7 +2708,7 @@ server.registerTool("evaluation_doc_add", {
       if (!a) return err(`artefact inconnu : ${artifactId}`);
       finalPath = a.path;
     }
-    const documents = await addEvaluationDocument({ evaluationId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null });
+    const documents = await addEvaluationDocument({ evaluationId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null, itemId });
     return text(JSON.stringify({ ok: true, documents }, null, 2));
   } catch (e) { return err(e.message); }
 });
