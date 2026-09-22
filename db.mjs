@@ -6842,6 +6842,62 @@ export async function confirmRecette({ recetteId, confirmedBy }) {
   return getRecetteById(recetteId);
 }
 
+// Supprime une RECETTE ENTIÈRE (cadrage technique, table `recettes`) + nettoyage
+// en CASCADE de toute sa famille polymorphe, dans une transaction unique.
+// Retourne `null` si la recette est INCONNUE (miroir deleteSprint/deleteFeature).
+// AUCUN `force` : la cascade est complète — la confirmation est portée par
+// l'appelant (panneau : double confirmation ; MCP : appel explicite).
+//
+// Ordre FK (enfants d'abord) :
+//   1. cadrage_evaluation_items (lien — l'élément d'évaluation reste)
+//   2. recette_sprints / _fonctionnalites / _regles / _adr / _projects (legacy)
+//   3. recette_tasks (lien — la tâche reste intacte) / recette_items
+//   4. artifacts (doc_type ∈ RECETTE_DOC_TYPES, content_id = recetteId) — les
+//      liens artifact_projects/artifact_repos cascadent (FK ON DELETE CASCADE)
+//   5. adr_vigilances (points de vigilance liés)
+//   6. batches.recette_id → NULL (aucune FK : évite un batch orphelin)
+//   7. cardinality_signals `open` de la recette (aucune FK : évite un signal
+//      orphelin)
+//   8. recettes
+//
+// NOTE `adr_vigilances` : la table est déclarée « HISTORIQUE APPEND-ONLY » pour
+// son cycle de vie NOMINAL (open → resolved), mais sa FK `recette_id` est
+// explicitement ON DELETE CASCADE (schema.sql) et le critère d'acceptation exige
+// le nettoyage des points de vigilance liés à une recette erronée. La suppression
+// est donc explicite ici (miroir exact de la FK déclarée). Alternative
+// « détachement » (UPDATE adr_vigilances SET recette_id = NULL ...) documentée
+// pour revue humaine (plan §9).
+export async function deleteRecette(recetteId) {
+  await ensureSchema();
+  if (!recetteId || !String(recetteId).trim()) throw new Error("recetteId requis");
+  const rid = String(recetteId).trim();
+  const exists = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [rid])).rows[0];
+  if (!exists) return null;
+  const detached = await withTransaction(async (client) => {
+    const evaluationItems = (await client.query("DELETE FROM cadrage_evaluation_items WHERE recette_id = $1", [rid])).rowCount;
+    const sprints = (await client.query("DELETE FROM recette_sprints WHERE recette_id = $1", [rid])).rowCount;
+    const fonctionnalites = (await client.query("DELETE FROM recette_fonctionnalites WHERE recette_id = $1", [rid])).rowCount;
+    const regles = (await client.query("DELETE FROM recette_regles WHERE recette_id = $1", [rid])).rowCount;
+    const adrs = (await client.query("DELETE FROM recette_adr WHERE recette_id = $1", [rid])).rowCount;
+    const projects = (await client.query("DELETE FROM recette_projects WHERE recette_id = $1", [rid])).rowCount;
+    const tasks = (await client.query("DELETE FROM recette_tasks WHERE recette_id = $1", [rid])).rowCount;
+    const items = (await client.query("DELETE FROM recette_items WHERE recette_id = $1", [rid])).rowCount;
+    const documents = (await client.query(
+      "DELETE FROM artifacts WHERE content_id = $1 AND doc_type = ANY($2)",
+      [rid, RECETTE_DOC_TYPES],
+    )).rowCount;
+    const vigilances = (await client.query("DELETE FROM adr_vigilances WHERE recette_id = $1", [rid])).rowCount;
+    const batchesDetached = (await client.query("UPDATE batches SET recette_id = NULL WHERE recette_id = $1", [rid])).rowCount;
+    await client.query(
+      "DELETE FROM cardinality_signals WHERE entity_type = 'recette' AND entity_id = $1 AND status = 'open'",
+      [rid],
+    );
+    await client.query("DELETE FROM recettes WHERE recette_id = $1", [rid]);
+    return { evaluationItems, sprints, fonctionnalites, regles, adrs, projects, tasks, items, documents, vigilances, batchesDetached };
+  });
+  return { recetteId: rid, deleted: true, detached };
+}
+
 // ===========================================================================
 // ÉVALUATIONS — « Recette » de l'ÉVALUATEUR PRODUIT (T-20260922-100650-sbc1).
 // Objet de PREMIER NIVEAU DISTINCT de `recettes` (Cadrage technique exécuteur).

@@ -68,6 +68,7 @@ import {
   recordE2EExecution,
   updateE2EExecution,
   deleteRecetteItem,
+  deleteRecette,
   listE2EExecutions,
   setE2EVar,
   listE2EVars,
@@ -2181,6 +2182,22 @@ server.registerTool("cadrage_confirm", {
   }
 });
 
+// === cadrage_delete ===
+server.registerTool("cadrage_delete", {
+  description: "Supprime un CADRAGE TECHNIQUE ENTIER (recette, table `recettes`) + nettoyage en CASCADE de toute sa famille polymorphe : éléments, liens tâches, documents/artefacts attachés (`artifacts` doc_type recette_doc/recette_report), points de vigilance ADR liés, liens sprint/fonctionnalité/règle/ADR/projet, liens d'éléments d'évaluation, signaux de cardinalité ouverts (et détache les batches liés). Les tâches et éléments d'évaluation rattachés restent intacts (seuls les LIENS sont supprimés). Retourne `null` si le cadrage est inconnu. Suppression IRRÉVERSIBLE — réservée à un administrateur (côté panneau : double confirmation).",
+  inputSchema: {
+    cadrageId: z.string().describe("Cadrage technique (recette) à supprimer."),
+  },
+}, async ({ cadrageId }) => {
+  try {
+    const r = await deleteRecette(cadrageId);
+    if (!r) return text(JSON.stringify({ ok: true, cadrageId, deleted: false, reason: "cadrage inconnu" }, null, 2));
+    return text(JSON.stringify({ ok: true, cadrage: r }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
 // --- Liens de contexte du cadrage (sprint / fonctionnalité / ADR / règle) ---
 
 // === cadrage_sprint_link ===
@@ -2520,6 +2537,22 @@ server.registerTool("recette_confirm", {
   try {
     const recette = await confirmRecette({ recetteId, confirmedBy });
     return text(JSON.stringify({ ok: true, recette }, null, 2));
+  } catch (e) {
+    return err(e.message);
+  }
+});
+
+// === recette_delete (alias legacy de cadrage_delete) ===
+server.registerTool("recette_delete", {
+  description: "Alias legacy de `cadrage_delete`. Supprime une RECETTE ENTIÈRE + nettoyage en CASCADE de toute sa famille polymorphe (éléments, liens tâches, documents/artefacts attachés, points de vigilance ADR liés, liens sprint/fonctionnalité/règle/ADR/projet, liens d'éléments d'évaluation, signaux de cardinalité ouverts, batches détachés). Les tâches et éléments d'évaluation rattachés restent intacts (seuls les LIENS sont supprimés). Retourne `null` si la recette est inconnue. Suppression IRRÉVERSIBLE — réservée à un administrateur (côté panneau : double confirmation).",
+  inputSchema: {
+    recetteId: z.string().describe("Recette à supprimer."),
+  },
+}, async ({ recetteId }) => {
+  try {
+    const r = await deleteRecette(recetteId);
+    if (!r) return text(JSON.stringify({ ok: true, recetteId, deleted: false, reason: "recette inconnue" }, null, 2));
+    return text(JSON.stringify({ ok: true, recette: r }, null, 2));
   } catch (e) {
     return err(e.message);
   }
