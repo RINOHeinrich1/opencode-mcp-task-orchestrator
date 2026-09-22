@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-recette-regles-contexte";
+const SCHEMA_VERSION = "2026-09-22-schema-sql-align-migrate";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
