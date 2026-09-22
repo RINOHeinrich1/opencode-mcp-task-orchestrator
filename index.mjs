@@ -241,6 +241,27 @@ import {
   addOrgGitToken,
   listOrgGitTokens,
   deleteOrgGitToken,
+  // Famille évaluation (Recette de l'ÉVALUATEUR PRODUIT) — T-20260922-100650-sbc1.
+  startEvaluation,
+  listProjectEvaluations,
+  getEvaluationById,
+  addEvaluationItem,
+  updateEvaluationItem,
+  deleteEvaluationItem,
+  linkEvaluationFeature,
+  unlinkEvaluationFeature,
+  linkEvaluationRule,
+  unlinkEvaluationRule,
+  setEvaluationVerdict,
+  addEvaluationDocument,
+  listEvaluationDocuments,
+  removeEvaluationDocument,
+  confirmEvaluation,
+  EVALUATION_ITEM_CATEGORIES,
+  EVALUATION_ITEM_SEVERITIES,
+  EVALUATION_ITEM_STATUSES,
+  EVALUATION_VERDICTS,
+  getArtifact,
 } from "./db.mjs";
 
 function text(content) {
@@ -2451,6 +2472,202 @@ server.registerTool("recette_confirm", {
   } catch (e) {
     return err(e.message);
   }
+});
+
+// ===========================================================================
+// Famille ÉVALUATION (T-20260922-100650-sbc1) — « Recette » de l'ÉVALUATEUR
+// PRODUIT. Objet de 1er niveau DISTINCT de `recettes`/`cadrage_*` (Cadrage
+// technique exécuteur). L'évaluateur décrit le PARCOURS ÉVALUÉ, rattache 1..N
+// fonctionnalités (verdict porté par le lien) + 1..N règles métier, enregistre
+// des ÉLÉMENTS (recommandation | problème) et joint des PIÈCES. Cycle de vie :
+// pending → in_progress → done. AUCUNE conversion en tâches.
+// ===========================================================================
+
+server.registerTool("evaluation_start", {
+  description: "Crée une ÉVALUATION (« Recette » de l'évaluateur produit) : 1 évaluation = 1 PROJET unique + titre + description du PARCOURS ÉVALUÉ + 1..N fonctionnalités + 1..N règles métier (liens posés à la création, NON bloquants). `createdBy` est indispensable au filtre propriétaire (l'évaluateur ne voit que SES recettes). Statut initial 'pending'. AUCUNE conversion en tâches.",
+  inputSchema: {
+    project: z.string().describe("Projet (produit) de l'évaluation."),
+    title: z.string().optional().describe("Titre court (dérivé si absent)."),
+    description: z.string().optional().describe("Description du PARCOURS ÉVALUÉ."),
+    featureIds: z.array(z.string()).optional().describe("Fonctionnalités évaluées (1..N)."),
+    ruleIds: z.array(z.string()).optional().describe("Règles métier évaluées (1..N)."),
+    createdBy: z.string().optional().describe("Utilisateur (username) évaluateur propriétaire."),
+    organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
+  },
+}, async ({ project, title, description, featureIds, ruleIds, createdBy, organizationId }) => {
+  try {
+    const evaluation = await startEvaluation({ project, title, description, featureIds, ruleIds, createdBy, organizationId });
+    return text(JSON.stringify({ ok: true, evaluation }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_list", {
+  description: "Liste les évaluations (« Recettes » évaluateur) d'un projet (ou toutes) avec nb d'éléments / fonctionnalités / règles.",
+  inputSchema: { project: z.string().optional().describe("Projet (produit) — sinon toutes.") },
+}, async ({ project }) => {
+  try {
+    const evaluations = await listProjectEvaluations(project);
+    return text(JSON.stringify({ count: evaluations.length, evaluations }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_get", {
+  description: "Détail d'une évaluation : parcours évalué, statut, éléments (recommandation/problème), fonctionnalités avec VERDICT, règles métier, pièces jointes.",
+  inputSchema: { evaluationId: z.string().describe("Identifiant EVAL-<ts>-<rand>.") },
+}, async ({ evaluationId }) => {
+  try {
+    const evaluation = await getEvaluationById(evaluationId);
+    if (!evaluation) return err(`évaluation inconnue : ${evaluationId}`);
+    return text(JSON.stringify({ evaluation }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_item_add", {
+  description: "Enregistre un ÉLÉMENT d'évaluation : une RECOMMANDATION ou un PROBLÈME (catégorie), avec sa SÉVÉRITÉ et une discussion libre. Statut de suivi initial 'open'.",
+  inputSchema: {
+    evaluationId: z.string(),
+    content: z.string().describe("La recommandation / le problème."),
+    category: z.enum(EVALUATION_ITEM_CATEGORIES).optional().describe("Nature (défaut recommandation)."),
+    severity: z.enum(EVALUATION_ITEM_SEVERITIES).optional().describe("Sévérité (défaut medium)."),
+    discussion: z.string().optional().describe("Échanges associés."),
+  },
+}, async ({ evaluationId, content, category, severity, discussion }) => {
+  try {
+    const item = await addEvaluationItem({ evaluationId, content, category, severity, discussion });
+    return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_item_update", {
+  description: "Met à jour un élément d'évaluation (contenu, catégorie, sévérité, discussion, statut de suivi open|treated|dismissed).",
+  inputSchema: {
+    itemId: z.number().int(),
+    content: z.string().optional(),
+    category: z.enum(EVALUATION_ITEM_CATEGORIES).optional(),
+    severity: z.enum(EVALUATION_ITEM_SEVERITIES).optional(),
+    discussion: z.string().optional(),
+    status: z.enum(EVALUATION_ITEM_STATUSES).optional(),
+  },
+}, async ({ itemId, content, category, severity, discussion, status }) => {
+  try {
+    const item = await updateEvaluationItem({ itemId, content, category, severity, discussion, status });
+    return text(JSON.stringify({ ok: true, item }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_item_delete", {
+  description: "Supprime un élément d'évaluation (recommandation/problème).",
+  inputSchema: { itemId: z.number().int() },
+}, async ({ itemId }) => {
+  try {
+    const r = await deleteEvaluationItem({ itemId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_feature_link", {
+  description: "Rattache une FONCTIONNALITÉ à une évaluation (idempotent). Le VERDICT est porté par le lien (`verdict` optionnel).",
+  inputSchema: {
+    evaluationId: z.string(),
+    featureId: z.string().describe("Fonctionnalité."),
+    verdict: z.enum(EVALUATION_VERDICTS).optional().describe("Verdict (conforme|non_conforme|a_ameliorer)."),
+    verdictComment: z.string().optional().describe("Commentaire du verdict."),
+  },
+}, async ({ evaluationId, featureId, verdict, verdictComment }) => {
+  try {
+    const r = await linkEvaluationFeature({ evaluationId, featureId, verdict, verdictComment });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_feature_unlink", {
+  description: "Détache une FONCTIONNALITÉ d'une évaluation.",
+  inputSchema: { evaluationId: z.string(), featureId: z.string() },
+}, async ({ evaluationId, featureId }) => {
+  try {
+    const r = await unlinkEvaluationFeature({ evaluationId, featureId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_rule_link", {
+  description: "Rattache une RÈGLE MÉTIER à une évaluation (idempotent).",
+  inputSchema: { evaluationId: z.string(), ruleId: z.string().describe("Règle métier.") },
+}, async ({ evaluationId, ruleId }) => {
+  try {
+    const r = await linkEvaluationRule({ evaluationId, ruleId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_rule_unlink", {
+  description: "Détache une RÈGLE MÉTIER d'une évaluation.",
+  inputSchema: { evaluationId: z.string(), ruleId: z.string() },
+}, async ({ evaluationId, ruleId }) => {
+  try {
+    const r = await unlinkEvaluationRule({ evaluationId, ruleId });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_verdict_set", {
+  description: "Positionne le VERDICT d'une fonctionnalité DÉJÀ rattachée à l'évaluation (conforme|non_conforme|a_ameliorer).",
+  inputSchema: {
+    evaluationId: z.string(),
+    fonctionnaliteId: z.string().describe("Fonctionnalité rattachée."),
+    verdict: z.enum(EVALUATION_VERDICTS).optional().describe("Verdict (null pour effacer)."),
+    verdictComment: z.string().optional(),
+  },
+}, async ({ evaluationId, fonctionnaliteId, verdict, verdictComment }) => {
+  try {
+    const r = await setEvaluationVerdict({ evaluationId, fonctionnaliteId, verdict, verdictComment });
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_doc_add", {
+  description: "Rattache une PIÈCE à une évaluation (lien / document / photo / vidéo) : `nature` libre + `source` (import d'un chemin, ou artifact existant) + `path`/`artifactId`. Famille isolée (`doc_type='evaluation_doc'`).",
+  inputSchema: {
+    evaluationId: z.string(),
+    title: z.string().optional(),
+    nature: z.string().optional().describe("Nature : lien | document | photo | video."),
+    source: z.enum(["import", "artifact"]).default("import"),
+    path: z.string().optional().describe("Chemin / URL de la pièce (mode import)."),
+    artifactId: z.string().optional().describe("Artefact existant à lier (mode artifact)."),
+  },
+}, async ({ evaluationId, title, nature, source, path, artifactId }) => {
+  try {
+    let finalPath = path;
+    if (source === "artifact") {
+      if (!artifactId) return err("artifactId requis en mode artifact");
+      const a = await getArtifact(artifactId);
+      if (!a) return err(`artefact inconnu : ${artifactId}`);
+      finalPath = a.path;
+    }
+    const documents = await addEvaluationDocument({ evaluationId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null });
+    return text(JSON.stringify({ ok: true, documents }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_doc_remove", {
+  description: "Retire une PIÈCE d'une évaluation.",
+  inputSchema: { documentId: z.number().int() },
+}, async ({ documentId }) => {
+  try {
+    const evaluationId = await removeEvaluationDocument(documentId);
+    if (!evaluationId) return err(`document inconnu : ${documentId}`);
+    return text(JSON.stringify({ ok: true, evaluationId, documents: await listEvaluationDocuments(evaluationId) }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_confirm", {
+  description: "Clôt une évaluation (statut 'done') SANS convertir en tâches. Les éléments restent attachés à l'évaluation.",
+  inputSchema: { evaluationId: z.string(), confirmedBy: z.string().optional() },
+}, async ({ evaluationId, confirmedBy }) => {
+  try {
+    const evaluation = await confirmEvaluation({ evaluationId, confirmedBy });
+    return text(JSON.stringify({ ok: true, evaluation }, null, 2));
+  } catch (e) { return err(e.message); }
 });
 
 // === batch (v0.9.0) : orchestration multi-tâches — une session, N tâches ===
