@@ -3,8 +3,8 @@
 // journal append-only (events).
 import pg from "pg";
 import Database from "better-sqlite3"; // lecture seule d'opencode.db (chaîne de sessions)
-import { readFileSync } from "node:fs";
-import { join, dirname, basename } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { join, dirname, basename, normalize } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { loadGlobalEnv } from "../../scripts/load-env.mjs";
@@ -4654,10 +4654,15 @@ export const RECETTE_DOC_TYPES = ["recette_report", "recette_doc"];
 // ne s'applique PAS ici.
 export const EVALUATION_DOC_TYPES = ["evaluation_doc"];
 // Natures ADMISES d'une pièce d'ÉVALUATION (recette évaluateur, ADR-003) :
-// lien | document | photo | video. DISTINCTE de `PIECE_NATURES` (pièces client
-// de sprint) : les PHOTOS et VIDÉOS y sont ADMISES — l'évaluateur joint des
-// preuves visuelles (captures, photos, vidéos de parcours) à ses éléments.
-export const EVALUATION_DOC_NATURES = ["lien", "document", "photo", "video"];
+// lien | document | photo | video | maquette | performance. DISTINCTE de
+// `PIECE_NATURES` (pièces client de sprint) : les PHOTOS et VIDÉOS y sont
+// ADMISES — l'évaluateur joint des preuves visuelles (captures, photos, vidéos
+// de parcours) à ses éléments. `maquette` = maquette HTML/CSS/JS (données mock)
+// servie par le panneau comme page statique (URL) ; `performance` = rapport de
+// test de performance (durées réseau + Core Web Vitals + stress) préprod.
+// CONVERGENCE (ADR-003) : aucune table neuve, ce sont 2 natures SUPPLÉMENTAIRES
+// de la famille `doc_type='evaluation_doc'`.
+export const EVALUATION_DOC_NATURES = ["lien", "document", "photo", "video", "maquette", "performance"];
 // Extension de fichier → nature d'évaluation. Les extensions photo/vidéo sont
 // résolues EXPLICITEMENT (au lieu d'être refusées comme pour les pièces client).
 export const EVALUATION_DOC_NATURE_BY_EXT = {
@@ -4666,6 +4671,31 @@ export const EVALUATION_DOC_NATURE_BY_EXT = {
   ".heic": "photo", ".bmp": "photo", ".tiff": "photo",
   ".mp4": "video", ".mov": "video", ".avi": "video", ".mkv": "video", ".webm": "video", ".m4v": "video",
 };
+// Répertoire de stockage des MAQUETTES d'évaluation (pages statiques HTML/CSS/JS
+// servies par le PANNEAU comme page accessible par URL). Il DOIT coïncider avec
+// `EVALUATION_MAQUETTE_DIR` du panneau (server.mjs) : le tool MCP
+// `evaluation_maquette_add` écrit ici, et le panneau sert ces fichiers via
+// `GET /api/evaluations/:id/maquette/*`. Surchargeable par env (worktree / test).
+export const EVALUATION_MAQUETTE_DIR =
+  process.env.EVALUATION_MAQUETTE_DIR || "/root/orchestrator-panel/storage/evaluation-maquettes";
+// Garde d'un chemin RELATIF de fichier de maquette : refuse l'absolu et toute
+// remontée (`..`) — les fichiers restent confinés au dossier de la maquette.
+function assertSafeMaquettePath(rel) {
+  const p = String(rel || "").trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!p) throw new Error("chemin de fichier de maquette vide");
+  if (p.startsWith("/") || /^[a-zA-Z]:/.test(p)) throw new Error(`chemin de maquette absolu refusé : ${rel}`);
+  const norm = normalize(p);
+  if (norm === ".." || norm.startsWith("../") || norm.includes("/../")) {
+    throw new Error(`chemin de maquette invalide (remontée '..') : ${rel}`);
+  }
+  return norm;
+}
+// Slug sûr d'un dossier de maquette (dérivé du titre + suffixe aléatoire).
+function maquetteSlug(title, fallback = "maquette") {
+  const base = String(title || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return `${base || fallback}-${Math.random().toString(36).slice(2, 7)}`;
+}
 // Nature d'un artefact (`kind`) — distincte de `doc_type`.
 export const ARTIFACT_KINDS = ["plan", "audit", "report", "autre"];
 // Domaine d'origine d'un artefact (`source`).
@@ -6945,6 +6975,75 @@ export async function addEvaluationDocument({ evaluationId, title, nature, sourc
   return listEvaluationDocuments(evaluationId);
 }
 
+// DÉPOSE une MAQUETTE (HTML/CSS/JS, données mock) rattachée à une évaluation et
+// retourne une URL consultable. Les fichiers sont écrits sous
+// `EVALUATION_MAQUETTE_DIR/<evaluationId>/<slug>/` et le PANNEAU les sert comme
+// page statique (`GET /api/evaluations/:id/maquette/*`). Nature de pièce
+// `maquette` (famille `evaluation_doc`) : `meta.url` / `meta.maquetteDir` /
+// `meta.entry` / `meta.files`. `itemId` (optionnel) rattache la maquette à un
+// ÉLÉMENT précis. Aucune table neuve (convergence ADR-003).
+export async function addEvaluationMaquette({ evaluationId, title, entry, files, itemId } = {}) {
+  await ensureSchema();
+  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const list = Array.isArray(files) ? files : [];
+  if (!list.length) throw new Error("files requis (au moins un fichier { path, content })");
+  const entryRel = assertSafeMaquettePath(entry || "index.html");
+  const slug = maquetteSlug(title);
+  const dir = join(EVALUATION_MAQUETTE_DIR, String(evaluationId), slug);
+  mkdirSync(dir, { recursive: true });
+  const written = [];
+  for (const f of list) {
+    const rel = assertSafeMaquettePath(f && (f.path || f.name));
+    const content = f && f.content !== undefined && f.content !== null ? String(f.content) : "";
+    const abs = join(dir, rel);
+    mkdirSync(dirname(abs), { recursive: true });
+    writeFileSync(abs, content, "utf8");
+    written.push(rel);
+  }
+  if (!written.includes(entryRel)) {
+    throw new Error(`entry '${entryRel}' absent des fichiers fournis (${written.join(", ")})`);
+  }
+  const url = `/api/evaluations/${encodeURIComponent(String(evaluationId))}/maquette/${slug}/${entryRel}`;
+  const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const meta = {
+    url, maquetteDir: dir, entry: entryRel, slug, files: written,
+    ...(itemId !== undefined && itemId !== null && itemId !== "" ? { itemId: Number(itemId) } : {}),
+  };
+  await pool().query(
+    `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
+     VALUES ($1,'evaluation_doc',$2,'autre',$3,'maquette','import',$4,$5,$6)`,
+    [id, String(evaluationId), title ?? `Maquette ${slug}`, join(dir, entryRel), meta, nowIso()],
+  );
+  const documents = await listEvaluationDocuments(evaluationId);
+  return { ok: true, evaluationId: String(evaluationId), url, maquetteDir: dir, entry: entryRel, document: documents.find((d) => d.artifactId === id) || null, documents };
+}
+
+// ENREGISTRE un RAPPORT DE PERFORMANCE (test préprod : durées réseau, timings,
+// Core Web Vitals, stress) comme pièce d'évaluation de nature `performance`.
+// `meta` porte le résumé (`metrics`) et le chemin du rapport (`reportPath`).
+// `e2eTestId` (optionnel) rattache la mesure à un test Playwright existant.
+export async function addEvaluationPerfResult({ evaluationId, title, reportPath, metrics, summary, itemId, e2eTestId } = {}) {
+  await ensureSchema();
+  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const meta = {
+    ...(reportPath ? { reportPath: String(reportPath) } : {}),
+    ...(metrics && typeof metrics === "object" ? { metrics } : {}),
+    ...(summary ? { summary: String(summary) } : {}),
+    ...(e2eTestId ? { e2eTestId: String(e2eTestId) } : {}),
+    ...(itemId !== undefined && itemId !== null && itemId !== "" ? { itemId: Number(itemId) } : {}),
+  };
+  await pool().query(
+    `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
+     VALUES ($1,'evaluation_doc',$2,'autre',$3,'performance','import',$4,$5,$6)`,
+    [id, String(evaluationId), title ?? "Rapport de performance", reportPath ?? null, Object.keys(meta).length ? meta : null, nowIso()],
+  );
+  const documents = await listEvaluationDocuments(evaluationId);
+  return { ok: true, evaluationId: String(evaluationId), document: documents.find((d) => d.artifactId === id) || null, documents };
+}
+
 export async function listEvaluationDocuments(evaluationId, { itemId } = {}) {
   await ensureSchema();
   const params = [String(evaluationId), EVALUATION_DOC_TYPES];
@@ -6977,11 +7076,20 @@ export async function listEvaluationDocuments(evaluationId, { itemId } = {}) {
 
 export async function removeEvaluationDocument(documentId) {
   await ensureSchema();
-  const r = (await pool().query(
-    "DELETE FROM artifacts WHERE id = $1 AND doc_type = ANY($2) RETURNING content_id",
+  const row = (await pool().query(
+    "SELECT content_id, nature, meta FROM artifacts WHERE id = $1 AND doc_type = ANY($2)",
     [documentId, EVALUATION_DOC_TYPES],
   )).rows[0];
-  return r ? r.content_id : null;
+  if (!row) return null;
+  // Nettoyage des fichiers physiques d'une MAQUETTE (`meta.maquetteDir`),
+  // confiné au répertoire des maquettes d'évaluation (garde anti-traversée).
+  const meta = row.meta && typeof row.meta === "object" ? row.meta : parseDocMeta(row.meta);
+  const dir = meta && typeof meta === "object" ? meta.maquetteDir : null;
+  if (dir && String(dir).startsWith(EVALUATION_MAQUETTE_DIR + "/")) {
+    try { rmSync(String(dir), { recursive: true, force: true }); } catch { /* best-effort */ }
+  }
+  await pool().query("DELETE FROM artifacts WHERE id = $1 AND doc_type = ANY($2)", [documentId, EVALUATION_DOC_TYPES]);
+  return row.content_id;
 }
 
 // Clôture (`pending→in_progress→done`) SANS créer de tâche (ADR-001).

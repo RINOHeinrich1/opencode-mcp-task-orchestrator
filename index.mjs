@@ -260,6 +260,8 @@ import {
   unlinkEvaluationRule,
   setEvaluationVerdict,
   addEvaluationDocument,
+  addEvaluationMaquette,
+  addEvaluationPerfResult,
   listEvaluationDocuments,
   removeEvaluationDocument,
   confirmEvaluation,
@@ -2711,6 +2713,88 @@ server.registerTool("evaluation_doc_add", {
     }
     const documents = await addEvaluationDocument({ evaluationId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null, itemId });
     return text(JSON.stringify({ ok: true, documents }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === evaluation_maquette_add (MAQUETTE HTML/CSS/JS servie par le panneau) ===
+// L'évaluateur dépose une maquette (données mock) pour la fonctionnalité
+// évaluée ; elle est écrite sous `EVALUATION_MAQUETTE_DIR` et SERVie par le
+// panneau comme PAGE STATIQUE accessible par URL (`meta.url`), rattachable à un
+// élément de recette (`itemId`). Nature de pièce `maquette` (famille
+// `evaluation_doc`) — aucune table neuve (convergence ADR-003).
+server.registerTool("evaluation_maquette_add", {
+  description: "Dépose une MAQUETTE (HTML/CSS/JS, données mock) sur une recette évaluateur et renvoie une URL consultable servie par le panneau (`/api/evaluations/<evaluationId>/maquette/<slug>/<entry>`). `files` = liste de { path, content } (chemins RELATIFS, ex. index.html, style.css, app.js) ; `entry` = fichier d'entrée (défaut index.html). `itemId` (optionnel) rattache la maquette à un ÉLÉMENT précis. La pièce est de nature `maquette` (famille `evaluation_doc`).",
+  inputSchema: {
+    evaluationId: z.string(),
+    title: z.string().optional().describe("Titre lisible de la maquette."),
+    entry: z.string().optional().describe("Fichier d'entrée (défaut : index.html)."),
+    files: z.array(z.object({ path: z.string(), content: z.string() })).describe("Fichiers de la maquette : { path (relatif), content }."),
+    itemId: z.number().int().optional().describe("Élément d'évaluation porteur (optionnel)."),
+  },
+}, async ({ evaluationId, title, entry, files, itemId }) => {
+  try {
+    const r = await addEvaluationMaquette({ evaluationId, title, entry, files, itemId });
+    return text(JSON.stringify({ ok: true, evaluationId: r.evaluationId, url: r.url, entry: r.entry, document: r.document, documents: r.documents }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+// === evaluation_perf_run (TEST DE PERFORMANCE préprod) =====================
+// Lance un test de performance web sur une cible PRÉPROD : durées de requêtes
+// réseau (type onglet Network), timings (TTFB/DCL/load), Core Web Vitals
+// (LCP/CLS) et STRESS TEST (accès parallèles bornés). Le moteur est le runner
+// `perf-runner.mjs` du panneau (Playwright résolu depuis `repoDir`) ; le rapport
+// est enregistré comme pièce `performance` (famille `evaluation_doc`).
+// BORNÉ volontairement (concurrency ≤ 10, requests ≤ 200) pour ne pas dégrader
+// la préprod. Peut être rattaché à un test Playwright (`e2eTestId`).
+const EVALUATION_PERF_DIR = process.env.EVALUATION_PERF_DIR || "/root/orchestrator-panel/storage/evaluation-perf";
+const EVALUATION_PERF_RUNNER = process.env.EVALUATION_PERF_RUNNER || "/root/orchestrator-panel/perf-runner.mjs";
+const PERF_MAX_CONCURRENCY = 10;
+const PERF_MAX_REQUESTS = 200;
+
+server.registerTool("evaluation_perf_run", {
+  description: "Lance un TEST DE PERFORMANCE sur une cible PRÉPROD : mesure des durées de requêtes réseau (type onglet Network), timings (TTFB/DCL/load), Core Web Vitals (LCP/CLS) et STRESS TEST (accès parallèles bornés : concurrency ≤ 10, requests ≤ 200). Le rapport est rattaché à la recette évaluateur comme pièce `performance`. `repoDir` = checkout applicatif contenant Playwright (ex. /root/mada-talk-preprod) ; sans Playwright, la mesure réseau/stress se fait sans navigateur (Core Web Vitals indisponibles). `e2eTestId` (optionnel) rattache la mesure à un test Playwright.",
+  inputSchema: {
+    evaluationId: z.string(),
+    url: z.string().describe("URL cible préprod (http/https)."),
+    repoDir: z.string().optional().describe("Checkout applicatif contenant Playwright (pour Core Web Vitals)."),
+    baseUrl: z.string().optional(),
+    concurrency: z.number().int().optional().describe("Stress : accès parallèles (1..10, défaut 5)."),
+    requests: z.number().int().optional().describe("Stress : nombre total de requêtes (1..200, défaut 50)."),
+    itemId: z.number().int().optional().describe("Élément d'évaluation porteur (optionnel)."),
+    e2eTestId: z.string().optional().describe("Test Playwright rattaché (optionnel)."),
+    title: z.string().optional().describe("Titre lisible du rapport."),
+    timeoutMs: z.number().int().optional().describe("Timeout du runner (ms, plafonné à 30 min)."),
+  },
+}, async ({ evaluationId, url, repoDir, baseUrl, concurrency, requests, itemId, e2eTestId, title, timeoutMs }) => {
+  try {
+    if (!evaluationId) return err("evaluationId requis");
+    if (!url || !/^https?:\/\//i.test(String(url))) return err("url préprod requise (http/https)");
+    if (!existsSync(EVALUATION_PERF_RUNNER)) return err(`runner de performance introuvable : ${EVALUATION_PERF_RUNNER} (définir EVALUATION_PERF_RUNNER)`);
+    const conc = Math.min(PERF_MAX_CONCURRENCY, Math.max(1, Number(concurrency) || 5));
+    const reqs = Math.min(PERF_MAX_REQUESTS, Math.max(1, Number(requests) || 50));
+    const outDir = join(EVALUATION_PERF_DIR, String(evaluationId), `perf-${Date.now().toString(36)}`);
+    mkdirSync(outDir, { recursive: true });
+    const payloadFile = join(outDir, "payload.json");
+    writeFileSync(payloadFile, JSON.stringify({ evaluationId, url: String(url), repoDir: repoDir || null, baseUrl: baseUrl || null, concurrency: conc, requests: reqs, outDir }, null, 2));
+    let stdout = "";
+    try {
+      stdout = execFileSync("node", [EVALUATION_PERF_RUNNER, payloadFile], {
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: Math.max(60000, Math.min(30 * 60 * 1000, Number(timeoutMs) || 10 * 60 * 1000)),
+      });
+    } catch (e) {
+      const detail = String((e && e.stderr) || (e && e.message) || e).slice(0, 800);
+      return err(`échec du runner de performance : ${detail}`);
+    }
+    const reportFile = join(outDir, "report.json");
+    let report = null;
+    try { report = JSON.parse(readFileSync(reportFile, "utf8")); } catch { try { report = JSON.parse(stdout); } catch { report = null; } }
+    if (!report || typeof report !== "object") return err("rapport de performance illisible (report.json absent ou invalide)");
+    const metrics = report.metrics && typeof report.metrics === "object" ? report.metrics : report;
+    const summary = report.summary || `Perf ${String(url)} — ${(report.warnings || []).length ? "avec avertissements" : "OK"}`;
+    const saved = await addEvaluationPerfResult({ evaluationId, title, reportPath: reportFile, metrics, summary, itemId, e2eTestId });
+    return text(JSON.stringify({ ok: true, evaluationId, report, document: saved.document, documents: saved.documents }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
