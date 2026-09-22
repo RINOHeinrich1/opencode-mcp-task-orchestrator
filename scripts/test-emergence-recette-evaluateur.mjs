@@ -85,6 +85,9 @@ async function childMain() {
   const rStd = await db.registerRule({ projectId, ref: "RM-STD", content: "règle standard", roleGlobal: true });
   check("sprint ouvert, sans signal (règle) → non émergente (rétrocompat)", em(rStd), { emergent: false, emergentOrigin: null });
 
+  // Nouveaux axes (T-20260922-100651-m6va) : NULL par défaut ⇒ rétrocompat stricte.
+  check("axes devStatus/respectStatus NULL par défaut", { dev: fStd.devStatus, respect: rStd.respectStatus }, { dev: null, respect: null });
+
   // -------------------------------------------------------------------------
   // 3. Sprint OUVERT + `fromRecette:true` → origine `recette` (fonctionnalité).
   // -------------------------------------------------------------------------
