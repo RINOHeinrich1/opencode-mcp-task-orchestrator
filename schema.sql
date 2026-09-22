@@ -720,6 +720,16 @@ ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_origin TEXT;
 ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_at TEXT;
 ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_by TEXT;
 ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_note TEXT;
+-- STATUT DE DÉVELOPPEMENT (axe 3, T-20260922-100651-m6va) — miroir idempotent
+-- de migrate(). `dev_status` ∈ {complet, non_demarre, partiel, incoherent}
+-- (analyse du code) ; `dev_status_source` ∈ {analyse_code, evaluateur, agent,
+-- humain} trace QUI alimente le statut. AXE DISTINCT du verdict d'évaluation et
+-- de l'implémentation. Valeurs NULL = « non évalué » (aucune donnée altérée).
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status TEXT;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_source TEXT;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_note TEXT;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_at TEXT;
+ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_by TEXT;
 
 CREATE TABLE IF NOT EXISTS regles_metier (
   id               TEXT PRIMARY KEY,               -- RMET-<ts>-<rand>
@@ -749,6 +759,13 @@ ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_origin TEXT;
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_at TEXT;
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_by TEXT;
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_note TEXT;
+-- STATUT DE RESPECT (T-20260922-100651-m6va) — miroir idempotent de migrate().
+-- `respect_status` ∈ {respectee, non_respectee} : le RESPECT de la règle, PAS un
+-- statut de développement (axe distinct).
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status TEXT;
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_note TEXT;
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_at TEXT;
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_by TEXT;
 -- Association EXPLICITE de rôles (1..N) ou rôle GLOBAL — miroir idempotent de migrate().
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS roles TEXT[] NOT NULL DEFAULT '{}';
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS role_global INTEGER NOT NULL DEFAULT 0;

@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-e2e-incoherent";
+const SCHEMA_VERSION = "2026-09-22-feature-rule-statuses";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -587,12 +587,30 @@ async function migrate() {
   await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_at TEXT");
   await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_by TEXT");
   await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS implemented_note TEXT");
+  // FONCTIONNALITÉ — STATUT DE DÉVELOPPEMENT (axe 3, T-20260922-100651-m6va).
+  // Additif et idempotent : `dev_status` ∈ {complet, non_demarre, partiel,
+  // incoherent} (analyse du code) ; `dev_status_source` ∈ {analyse_code,
+  // evaluateur, agent, humain} TRACE qui alimente le statut (vigilance élément
+  // 149). AXE DISTINCT du verdict d'évaluation (`evaluation_fonctionnalites`)
+  // et de l'implémentation (`implemented`/`implemented_origin`) : jamais fusionné.
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status TEXT");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_source TEXT");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_note TEXT");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_at TEXT");
+  await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_by TEXT");
   // RÈGLE MÉTIER — mêmes 5 colonnes (modèle symétrique).
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented INTEGER NOT NULL DEFAULT 0");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_origin TEXT");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_at TEXT");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_by TEXT");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_note TEXT");
+  // RÈGLE MÉTIER — STATUT DE RESPECT (axe dédié, T-20260922-100651-m6va).
+  // `respect_status` ∈ {respectee, non_respectee} : le RESPECT de la règle, PAS
+  // un statut de développement (distinction explicite de la décision de recette).
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status TEXT");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_note TEXT");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_at TEXT");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_by TEXT");
   // RÈGLE MÉTIER — association EXPLICITE de rôles (1..N) ou rôle GLOBAL (T-20260922-064200-e0yw).
   // Remplace le `roles` DÉRIVÉ des fonctionnalités liées : source de vérité unique.
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS roles TEXT[] NOT NULL DEFAULT '{}'");
@@ -1832,6 +1850,12 @@ function rowToFonctionnalite(r) {
     implementedAt: r.implemented_at ?? null,
     implementedBy: r.implemented_by ?? null,
     implementedNote: r.implemented_note ?? null,
+    // STATUT DE DÉVELOPPEMENT (axe 3, analyse du code) + source tracée.
+    devStatus: r.dev_status ?? null,
+    devStatusSource: r.dev_status_source ?? null,
+    devStatusNote: r.dev_status_note ?? null,
+    devStatusAt: r.dev_status_at ?? null,
+    devStatusBy: r.dev_status_by ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at ?? null,
     createdBy: r.created_by ?? null,
@@ -1855,6 +1879,11 @@ function rowToRegle(r) {
     implementedAt: r.implemented_at ?? null,
     implementedBy: r.implemented_by ?? null,
     implementedNote: r.implemented_note ?? null,
+    // STATUT DE RESPECT (axe dédié, distinct du développement) + traçabilité.
+    respectStatus: r.respect_status ?? null,
+    respectStatusNote: r.respect_status_note ?? null,
+    respectStatusAt: r.respect_status_at ?? null,
+    respectStatusBy: r.respect_status_by ?? null,
     // Association EXPLICITE de rôles (1..N) ou rôle GLOBAL (T-20260922-064200-e0yw).
     // `pg` renvoie TEXT[] comme tableau JS natif ; repli `[]` si NULL.
     roles: Array.isArray(r.roles) ? r.roles : [],
@@ -1942,12 +1971,13 @@ export async function registerFeature({ projectId, ref, role, userStory, sourced
 // `implementedNote` qualifient l'état d'implémentation via le helper UNIQUE
 // `applyImplementationQualification`. Si SEULS ces champs sont fournis, le
 // helper pose `updated_at` et on retourne sans second UPDATE (anti double écriture).
-export async function updateFeature({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, by } = {}) {
+export async function updateFeature({ featureId, ref, role, userStory, sourcedPieceId, implemented, implementedOrigin, implementedNote, devStatus, devStatusSource, devStatusNote, by } = {}) {
   await ensureSchema();
   if (!featureId) throw new Error("featureId requis");
   const cur = (await pool().query("SELECT * FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
   if (!cur) throw new Error(`fonctionnalité inconnue : ${featureId}`);
   const hasImplFields = implemented !== undefined || implementedOrigin !== undefined || implementedNote !== undefined;
+  const hasDevFields = devStatus !== undefined || devStatusSource !== undefined || devStatusNote !== undefined;
   const sets = [];
   const params = [];
   if (ref !== undefined) {
@@ -1978,9 +2008,13 @@ export async function updateFeature({ featureId, ref, role, userStory, sourcedPi
     }
   }
   if (!sets.length) {
-    // Seuls les champs d'implémentation (ou aucun) : le helper écrit `updated_at`.
+    // Seuls les champs d'implémentation / de développement (ou aucun) : les
+    // helpers écrivent `updated_at`.
     if (hasImplFields) {
       await applyImplementationQualification({ table: "fonctionnalites", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
+    }
+    if (hasDevFields) {
+      await applyDevStatusQualification({ table: "fonctionnalites", id: cur.id, devStatus, source: devStatusSource, note: devStatusNote, by });
     }
     return getFeature(cur.id);
   }
@@ -1990,6 +2024,9 @@ export async function updateFeature({ featureId, ref, role, userStory, sourcedPi
   await pool().query(`UPDATE fonctionnalites SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
   if (hasImplFields) {
     await applyImplementationQualification({ table: "fonctionnalites", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
+  }
+  if (hasDevFields) {
+    await applyDevStatusQualification({ table: "fonctionnalites", id: cur.id, devStatus, source: devStatusSource, note: devStatusNote, by });
   }
   return getFeature(cur.id);
 }
@@ -2008,6 +2045,22 @@ export async function updateFeature({ featureId, ref, role, userStory, sourcedPi
 
 // Origines d'implémentation admises (validation stricte).
 export const IMPLEMENTED_ORIGINS = ["ecosystem", "hors_ecosystem"];
+
+// ===========================================================================
+// STATUT DE DÉVELOPPEMENT (fonctionnalité) & STATUT DE RESPECT (règle métier)
+// (T-20260922-100651-m6va) — vocabulaire UNIQUE, validé à l'écriture.
+//   - `DEV_STATUSES` : issu de l'ANALYSE DU CODE (axe 3) — complet / non_demarre
+//     / partiel / incoherent. `incoherent` RÉUTILISE le signal évaluateur
+//     `e2e_tests.status='INCOHERENT'` (ADR-003) : lien documentaire/lecture,
+//     JAMAIS une écriture croisée sur `e2e_tests`.
+//   - `DEV_STATUS_SOURCES` : trace QUI alimente le statut (vigilance élément 149).
+//   - `RESPECT_STATUSES` : le RESPECT de la règle (axe distinct du développement).
+// AXES DISTINCTS, jamais fusionnés avec `implemented`/`implemented_origin` (axe 1
+// Intégration) ni avec le verdict d'évaluation (`evaluation_fonctionnalites`).
+// ===========================================================================
+export const DEV_STATUSES = ["complet", "non_demarre", "partiel", "incoherent"];
+export const DEV_STATUS_SOURCES = ["analyse_code", "evaluateur", "agent", "humain"];
+export const RESPECT_STATUSES = ["respectee", "non_respectee"];
 
 // QUALIFICATION D'IMPLÉMENTATION — helper interne UNIQUE, partagé par les deux
 // tables (`fonctionnalites`, `regles_metier`) et les quatre points d'entrée
@@ -2089,6 +2142,148 @@ async function applyImplementationQualification({ table, id, implemented, origin
   return true;
 }
 
+// QUALIFICATION DU STATUT DE DÉVELOPPEMENT — helper interne UNIQUE (table
+// `fonctionnalites`). Règles :
+//   - `devStatus` fourni ⇒ REQUIS ∈ DEV_STATUSES (sinon erreur) ;
+//   - `devStatus` explicitement null/vide ⇒ DÉQUALIFICATION (reset des 5 champs) ;
+//   - `source` fourni ⇒ REQUIS ∈ DEV_STATUS_SOURCES ; lors d'une POSE (statut
+//     non nul) la source est OBLIGATOIRE (à défaut la source existante valide est
+//     conservée) — jamais de statut « orphelin » non tracé ;
+//   - `note` seule ⇒ met à jour le motif sans toucher au statut ;
+//   - pose : `dev_status_at = now`, `dev_status_by = by`.
+// Idempotent. Retourne `true` si une écriture a eu lieu, `false` sinon.
+async function applyDevStatusQualification({ table, id, devStatus, source, note, by } = {}) {
+  const TABLES = { fonctionnalites: "fonctionnalites" };
+  const tbl = TABLES[table];
+  if (!tbl) throw new Error(`table inconnue pour la qualification de développement : ${table}`);
+  if (!id) throw new Error("identifiant requis pour la qualification de développement");
+
+  const hasStatus = devStatus !== undefined;
+  const hasSource = source !== undefined && source !== null && String(source).trim() !== "";
+  const hasNote = note !== undefined;
+  if (!hasStatus && !hasSource && !hasNote) return false; // rien à qualifier
+
+  const cur = (await pool().query(`SELECT dev_status, dev_status_source FROM ${tbl} WHERE id = $1`, [String(id)])).rows[0];
+  if (!cur) throw new Error(`élément inconnu : ${id}`);
+
+  // `note` seule : mise à jour du motif, statut conservé.
+  if (!hasStatus && !hasSource) {
+    const ts = nowIso();
+    await pool().query(
+      `UPDATE ${tbl} SET dev_status_note = $1, updated_at = $2 WHERE id = $3`,
+      [note != null && String(note).trim() ? String(note).trim() : null, ts, String(id)],
+    );
+    return true;
+  }
+
+  // DÉQUALIFICATION : statut explicitement null/vide ⇒ reset complet.
+  if (hasStatus && (devStatus === null || String(devStatus).trim() === "")) {
+    const ts = nowIso();
+    await pool().query(
+      `UPDATE ${tbl} SET dev_status = NULL, dev_status_source = NULL, dev_status_note = NULL,
+              dev_status_at = NULL, dev_status_by = NULL, updated_at = $1 WHERE id = $2`,
+      [ts, String(id)],
+    );
+    return true;
+  }
+
+  // Résolution du statut EFFECTIF (fourni, sinon courant requis).
+  let st;
+  if (hasStatus) {
+    st = String(devStatus).trim();
+    if (!DEV_STATUSES.includes(st)) {
+      throw new Error(`devStatus invalide : ${st} (attendu : ${DEV_STATUSES.join(" | ")})`);
+    }
+  } else {
+    st = cur.dev_status;
+    if (!DEV_STATUSES.includes(st)) {
+      throw new Error("devStatus requis pour qualifier (statut de développement absent)");
+    }
+  }
+  // Résolution de la SOURCE (fournie, sinon conservée si valide, sinon erreur).
+  let src;
+  if (hasSource) {
+    src = String(source).trim();
+    if (!DEV_STATUS_SOURCES.includes(src)) {
+      throw new Error(`devStatusSource invalide : ${src} (attendu : ${DEV_STATUS_SOURCES.join(" | ")})`);
+    }
+  } else {
+    src = DEV_STATUS_SOURCES.includes(cur.dev_status_source) ? cur.dev_status_source : null;
+    if (!src) {
+      throw new Error("devStatusSource requis pour poser un statut de développement (analyse_code | evaluateur | agent | humain)");
+    }
+  }
+  const ts = nowIso();
+  const sets = ["dev_status = $1", "dev_status_source = $2", "dev_status_at = $3", "dev_status_by = $4"];
+  const params = [st, src, ts, by ? String(by) : null];
+  if (hasNote) {
+    params.push(note != null && String(note).trim() ? String(note).trim() : null);
+    sets.push(`dev_status_note = $${params.length}`);
+  }
+  params.push(ts); const tsIdx = params.length;
+  params.push(String(id)); const idIdx = params.length;
+  await pool().query(`UPDATE ${tbl} SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
+  return true;
+}
+
+// QUALIFICATION DU STATUT DE RESPECT — helper interne UNIQUE (table
+// `regles_metier`). Miroir du helper de développement, vocabulaire propre :
+//   - `respectStatus` fourni ⇒ REQUIS ∈ RESPECT_STATUSES ;
+//   - `respectStatus` explicitement null/vide ⇒ DÉQUALIFICATION (reset des 4 champs) ;
+//   - `note` seule ⇒ met à jour le motif sans toucher au statut ;
+//   - pose : `respect_status_at = now`, `respect_status_by = by`.
+// Idempotent. Retourne `true` si une écriture a eu lieu, `false` sinon.
+async function applyRespectStatusQualification({ table, id, respectStatus, note, by } = {}) {
+  const TABLES = { regles_metier: "regles_metier" };
+  const tbl = TABLES[table];
+  if (!tbl) throw new Error(`table inconnue pour la qualification de respect : ${table}`);
+  if (!id) throw new Error("identifiant requis pour la qualification de respect");
+
+  const hasStatus = respectStatus !== undefined;
+  const hasNote = note !== undefined;
+  if (!hasStatus && !hasNote) return false; // rien à qualifier
+
+  const cur = (await pool().query(`SELECT respect_status FROM ${tbl} WHERE id = $1`, [String(id)])).rows[0];
+  if (!cur) throw new Error(`élément inconnu : ${id}`);
+
+  // `note` seule : mise à jour du motif, statut conservé.
+  if (!hasStatus) {
+    const ts = nowIso();
+    await pool().query(
+      `UPDATE ${tbl} SET respect_status_note = $1, updated_at = $2 WHERE id = $3`,
+      [note != null && String(note).trim() ? String(note).trim() : null, ts, String(id)],
+    );
+    return true;
+  }
+
+  // DÉQUALIFICATION : statut explicitement null/vide ⇒ reset complet.
+  if (respectStatus === null || String(respectStatus).trim() === "") {
+    const ts = nowIso();
+    await pool().query(
+      `UPDATE ${tbl} SET respect_status = NULL, respect_status_note = NULL,
+              respect_status_at = NULL, respect_status_by = NULL, updated_at = $1 WHERE id = $2`,
+      [ts, String(id)],
+    );
+    return true;
+  }
+
+  const st = String(respectStatus).trim();
+  if (!RESPECT_STATUSES.includes(st)) {
+    throw new Error(`respectStatus invalide : ${st} (attendu : ${RESPECT_STATUSES.join(" | ")})`);
+  }
+  const ts = nowIso();
+  const sets = ["respect_status = $1", "respect_status_at = $2", "respect_status_by = $3"];
+  const params = [st, ts, by ? String(by) : null];
+  if (hasNote) {
+    params.push(note != null && String(note).trim() ? String(note).trim() : null);
+    sets.push(`respect_status_note = $${params.length}`);
+  }
+  params.push(ts); const tsIdx = params.length;
+  params.push(String(id)); const idIdx = params.length;
+  await pool().query(`UPDATE ${tbl} SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
+  return true;
+}
+
 // MARQUE une FONCTIONNALITÉ comme implémentée avec son ORIGINE (intention
 // explicite, wrappers des agents/du panneau). `origin` REQUIS. Idempotent.
 export async function markFeatureImplemented({ featureId, origin, note, by } = {}) {
@@ -2104,6 +2299,27 @@ export async function markFeatureImplemented({ featureId, origin, note, by } = {
   return getFeature(cur.id);
 }
 
+// MARQUE le STATUT DE DÉVELOPPEMENT d'une fonctionnalité (intention explicite
+// des agents/du panneau — miroir `markFeatureImplemented`). `devStatus` REQUIS
+// ∈ DEV_STATUSES ; `source` REQUISE ∈ DEV_STATUS_SOURCES (traçabilité « qui
+// alimente le statut »). Idempotent (re-qualifier écrase proprement).
+export async function markFeatureDevStatus({ featureId, devStatus, source, note, by } = {}) {
+  await ensureSchema();
+  if (!featureId) throw new Error("featureId requis");
+  const st = devStatus != null ? String(devStatus).trim() : "";
+  if (!DEV_STATUSES.includes(st)) {
+    throw new Error(`devStatus requis (${DEV_STATUSES.join(" | ")})`);
+  }
+  const src = source != null ? String(source).trim() : "";
+  if (!DEV_STATUS_SOURCES.includes(src)) {
+    throw new Error(`source requise (${DEV_STATUS_SOURCES.join(" | ")})`);
+  }
+  const cur = (await pool().query("SELECT id FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
+  if (!cur) throw new Error(`fonctionnalité inconnue : ${featureId}`);
+  await applyDevStatusQualification({ table: "fonctionnalites", id: cur.id, devStatus: st, source: src, note, by });
+  return getFeature(cur.id);
+}
+
 // LECTURE détaillée d'une FONCTIONNALITÉ + liens : règles, scénarios Gherkin
 // (`e2e_tests`), ADR, sprints, tâches, recettes. `null` si inconnue.
 export async function getFeature(featureId) {
@@ -2112,7 +2328,7 @@ export async function getFeature(featureId) {
   const row = (await pool().query("SELECT * FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
   if (!row) return null;
   const feature = rowToFonctionnalite(row);
-  const [regleRows, gherkinRows, adrRows, sprintRows, taskRows, recetteRows] = await Promise.all([
+  const [regleRows, gherkinRows, adrRows, sprintRows, taskRows, recetteRows, evalRows] = await Promise.all([
     pool().query(
       `SELECT r.* FROM regles_metier r
          JOIN fonctionnalite_regles fr ON fr.regle_id = r.id
@@ -2136,6 +2352,14 @@ export async function getFeature(featureId) {
       `SELECT r.recette_id, r.title, r.status FROM recettes r
          JOIN recette_fonctionnalites rf ON rf.recette_id = r.recette_id
         WHERE rf.fonctionnalite_id = $1 ORDER BY r.created_at ASC`, [feature.id]),
+    // VERDICTS D'ÉVALUATION (recette évaluateur) — LECTURE SEULE, AXE DISTINCT
+    // du statut de développement (`devStatus`) et de l'implémentation. Aucune
+    // écriture : `evaluation_fonctionnalites` n'est jamais modifiée ici.
+    pool().query(
+      `SELECT ef.evaluation_id, e.title, e.status, ef.verdict, ef.verdict_comment
+         FROM evaluation_fonctionnalites ef
+         JOIN evaluations e ON e.evaluation_id = ef.evaluation_id
+        WHERE ef.fonctionnalite_id = $1 ORDER BY e.created_at ASC`, [feature.id]),
   ]);
   return {
     ...feature,
@@ -2148,6 +2372,15 @@ export async function getFeature(featureId) {
     sprints: sprintRows.rows.map(rowToSprint),
     tasks: taskRows.rows.map((t) => ({ id: t.id, title: t.title ?? null, request: t.request ?? null, project: t.project ?? null, emergent: !!t.emergent, emergentOrigin: t.emergent_origin ?? null })),
     recettes: recetteRows.rows.map((r) => ({ recetteId: r.recette_id, title: r.title ?? null, status: r.status ?? null })),
+    // VERDICTS d'évaluation (lecture seule) — axe DISTINCT du statut de
+    // développement. Exposés pour rendre la distinction visible (0 duplication).
+    evaluationVerdicts: evalRows.rows.map((e) => ({
+      evaluationId: e.evaluation_id,
+      title: e.title ?? null,
+      status: e.status ?? null,
+      verdict: e.verdict ?? null,
+      verdictComment: e.verdict_comment ?? null,
+    })),
   };
 }
 
@@ -2253,6 +2486,29 @@ async function featureLinkCounts(ids) {
   return out;
 }
 
+// LIENS E2E (scénarios Gherkin) des fonctionnalités — UNE requête bulk (pas de
+// N+1 SQL, contrainte tenue par le panneau). Retourne
+// `{ [id]: [{ e2eTestId, title, status }] }` (ordre stable `e2eTestId`).
+async function featureGherkinTests(ids) {
+  const out = {};
+  const list = (ids || []).map((x) => String(x)).filter(Boolean);
+  if (!list.length) return out;
+  const rows = (await pool().query(
+    `SELECT fg.fonctionnalite_id AS fid, e.id AS e2e_test_id, e.title, e.status
+       FROM fonctionnalite_gherkin fg
+       JOIN e2e_tests e ON e.id = fg.e2e_test_id
+      WHERE fg.fonctionnalite_id = ANY($1::text[])
+      ORDER BY fg.fonctionnalite_id ASC, e.id ASC`,
+    [list],
+  )).rows;
+  for (const r of rows) {
+    const k = r.fid;
+    if (!out[k]) out[k] = [];
+    out[k].push({ e2eTestId: r.e2e_test_id, title: r.title ?? null, status: r.status ?? null });
+  }
+  return out;
+}
+
 // Compteurs de LIENS des règles métier — UNE requête bulk (pas de N+1 SQL).
 // Retourne `{ [id]: { features, sprints, sprintIds } }` (zéros / tableau vide inclus).
 // `sprintIds` = ids des sprints liés (`sprint_regles`), exposés pour le filtre
@@ -2309,10 +2565,14 @@ export async function listFeatures({ projectId, emergent, search, limit } = {}) 
   // UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel (pas de cache
   // périmable — compatible avec le polling `refreshActive()`).
   const counts = await featureLinkCounts(features.map((f) => f.id));
+  // Liens E2E 1..N (id + titre + statut) — MÊME pattern bulk, 0 N+1.
+  const gherkinTests = await featureGherkinTests(features.map((f) => f.id));
   return features.map((f) => {
     const c = counts[f.id] || {};
     return {
       ...f,
+      // Champ ADDITIF : tests E2E liés (liens cliquables côté panneau).
+      gherkinTests: gherkinTests[f.id] || [],
       // `links` STRICTEMENT inchangé (`{ rules, gherkin, adrs, sprints, tasks, recettes }`) :
       // ré-extraction explicite pour éviter toute fuite de `sprintIds` dans ce contrat.
       links: {
@@ -2400,12 +2660,13 @@ export async function registerRule({ projectId, ref, content, sourcedPieceId, re
 // MODIFICATION partielle d'une RÈGLE MÉTIER ; re-gardage de la pièce source.
 // Étendue (T-20260921-133134-yz2i) : `implemented`/`implementedOrigin`/
 // `implementedNote` qualifient l'état d'implémentation (même helper unique).
-export async function updateRule({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, roles, roleGlobal, by } = {}) {
+export async function updateRule({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, respectStatus, respectStatusNote, roles, roleGlobal, by } = {}) {
   await ensureSchema();
   if (!ruleId) throw new Error("ruleId requis");
   const cur = (await pool().query("SELECT * FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
   if (!cur) throw new Error(`règle inconnue : ${ruleId}`);
   const hasImplFields = implemented !== undefined || implementedOrigin !== undefined || implementedNote !== undefined;
+  const hasRespectFields = respectStatus !== undefined || respectStatusNote !== undefined;
   const sets = [];
   const params = [];
   if (ref !== undefined) {
@@ -2447,6 +2708,9 @@ export async function updateRule({ ruleId, ref, content, sourcedPieceId, impleme
     if (hasImplFields) {
       await applyImplementationQualification({ table: "regles_metier", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
     }
+    if (hasRespectFields) {
+      await applyRespectStatusQualification({ table: "regles_metier", id: cur.id, respectStatus, note: respectStatusNote, by });
+    }
     return getRule(cur.id);
   }
   const ts = nowIso();
@@ -2455,6 +2719,9 @@ export async function updateRule({ ruleId, ref, content, sourcedPieceId, impleme
   await pool().query(`UPDATE regles_metier SET ${sets.join(", ")}, updated_at = $${tsIdx} WHERE id = $${idIdx}`, params);
   if (hasImplFields) {
     await applyImplementationQualification({ table: "regles_metier", id: cur.id, implemented, origin: implementedOrigin, note: implementedNote, by });
+  }
+  if (hasRespectFields) {
+    await applyRespectStatusQualification({ table: "regles_metier", id: cur.id, respectStatus, note: respectStatusNote, by });
   }
   return getRule(cur.id);
 }
@@ -2471,6 +2738,22 @@ export async function markRuleImplemented({ ruleId, origin, note, by } = {}) {
   const cur = (await pool().query("SELECT id FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
   if (!cur) throw new Error(`règle inconnue : ${ruleId}`);
   await applyImplementationQualification({ table: "regles_metier", id: cur.id, implemented: true, origin: org, note, by });
+  return getRule(cur.id);
+}
+
+// MARQUE le STATUT DE RESPECT d'une règle métier (intention explicite des
+// agents/du panneau — miroir `markRuleImplemented`). `respectStatus` REQUIS ∈
+// RESPECT_STATUSES. Idempotent.
+export async function markRuleRespectStatus({ ruleId, respectStatus, note, by } = {}) {
+  await ensureSchema();
+  if (!ruleId) throw new Error("ruleId requis");
+  const st = respectStatus != null ? String(respectStatus).trim() : "";
+  if (!RESPECT_STATUSES.includes(st)) {
+    throw new Error(`respectStatus requis (${RESPECT_STATUSES.join(" | ")})`);
+  }
+  const cur = (await pool().query("SELECT id FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
+  if (!cur) throw new Error(`règle inconnue : ${ruleId}`);
+  await applyRespectStatusQualification({ table: "regles_metier", id: cur.id, respectStatus: st, note, by });
   return getRule(cur.id);
 }
 
