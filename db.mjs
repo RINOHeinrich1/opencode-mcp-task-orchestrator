@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-feature-rule-statuses";
+const SCHEMA_VERSION = "2026-09-22-evaluation-session";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -749,6 +749,9 @@ $$ LANGUAGE plpgsql`);
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluations_project ON evaluations(project)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluations_created_by ON evaluations(created_by)");
+  // SESSION D'ÉVALUATION (agent-recette évaluateur) — colonne ADDITIVE
+  // idempotente (parité recettes/sprints/tests). `sessionId` null = détachée.
+  await pool().query("ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS session_id TEXT");
   await pool().query(`CREATE TABLE IF NOT EXISTS evaluation_fonctionnalites (
     evaluation_id     TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
     fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
@@ -6919,6 +6922,7 @@ async function rowToEvaluationSummary(r) {
     confirmedAt: r.confirmed_at,
     confirmedBy: r.confirmed_by,
     createdBy: r.created_by ?? null,
+    sessionId: r.session_id ?? null,
     itemsCount: Number(r.items_count),
     treatableCount: Number(r.treatable_count),
     featuresCount: Number(r.features_count),
@@ -6992,11 +6996,29 @@ export async function getEvaluationById(evaluationId) {
     confirmedBy: r.confirmed_by,
     createdBy: r.created_by ?? null,
     organizationId: r.organization_id ?? null,
+    sessionId: r.session_id ?? null,
     items,
     documents,
     fonctionnalites,
     regles,
   };
+}
+
+// ASSOCIE une session IA DÉDIÉE (agent-recette ÉVALUATEUR) à une évaluation
+// EXISTANTE (tool `evaluation_session_set`). Miroir de `setSprintSession` :
+// n'écrit QUE `session_id` (l'évaluation n'a pas d'`updated_at` ni de statut
+// piloté par ce rattachement). `sessionId` null détache la session.
+export async function setEvaluationSession(evaluationId, sessionId) {
+  await ensureSchema();
+  if (!evaluationId) throw new Error("evaluationId requis");
+  const id = String(evaluationId);
+  const row = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [id])).rows[0];
+  if (!row) throw new Error(`évaluation inconnue : ${id}`);
+  await pool().query(
+    "UPDATE evaluations SET session_id = $1 WHERE evaluation_id = $2",
+    [sessionId != null ? String(sessionId) : null, id],
+  );
+  return getEvaluationById(id);
 }
 
 // Éléments ACCESSIBLES À L'EXÉCUTEUR : uniquement ceux que l'admin a marqués

@@ -952,7 +952,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
   confirmed_at    TEXT,
   confirmed_by    TEXT,
   organization_id TEXT,
-  created_by      TEXT                              -- propriétaire (filtre évaluateur)
+  created_by      TEXT,                             -- propriétaire (filtre évaluateur)
+  session_id      TEXT                              -- session dédiée agent-recette (évaluateur)
 );
 CREATE INDEX IF NOT EXISTS idx_evaluations_project ON evaluations(project);
 CREATE INDEX IF NOT EXISTS idx_evaluations_created_by ON evaluations(created_by);

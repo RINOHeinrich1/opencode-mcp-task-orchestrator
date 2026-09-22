@@ -249,6 +249,7 @@ import {
   startEvaluation,
   listProjectEvaluations,
   getEvaluationById,
+  setEvaluationSession,
   addEvaluationItem,
   updateEvaluationItem,
   deleteEvaluationItem,
@@ -2569,6 +2570,16 @@ server.registerTool("evaluation_get", {
     const evaluation = await getEvaluationById(evaluationId);
     if (!evaluation) return err(`évaluation inconnue : ${evaluationId}`);
     return text(JSON.stringify({ evaluation }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("evaluation_session_set", {
+  description: "ASSOCIE la session IA dédiée (agent-recette ÉVALUATEUR) à une évaluation EXISTANTE (`evaluations.session_id`). Miroir de `recette_session_set` MAIS NE TOUCHE PAS au statut de l'évaluation : `pending`/`in_progress`/`done` restent pilotés par le cycle de vie de la recette. `sessionId` null détache la session. Retourne `{ ok, evaluation }`.",
+  inputSchema: { evaluationId: z.string().describe("Identifiant EVAL-<ts>-<rand>."), sessionId: z.string().nullable().describe("Session opencode (ses_…) à rattacher, ou null pour détacher.") },
+}, async ({ evaluationId, sessionId }) => {
+  try {
+    const evaluation = await setEvaluationSession(evaluationId, sessionId);
+    return text(JSON.stringify({ ok: true, evaluation }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
