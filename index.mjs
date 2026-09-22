@@ -49,8 +49,8 @@ import {
   removeTaskLink,
   listTaskLinks,
   listTaskEmergentFrom,
-  startRecette,
-  unlinkRecetteTask,
+  startCadrage,
+  unlinkCadrageTask,
   upsertE2ETest,
   reactivateE2ETest,
   markE2ETestObsolete,
@@ -67,24 +67,24 @@ import {
   listTaskE2E,
   recordE2EExecution,
   updateE2EExecution,
-  deleteRecetteItem,
-  deleteRecette,
+  deleteCadrageItem,
+  deleteCadrage,
   listE2EExecutions,
   setE2EVar,
   listE2EVars,
   getE2EVarValue,
   deleteE2EVar,
-  getRecette,
-  getRecetteById,
-  listProjectRecettes,
-  linkRecetteTask,
-  setRecetteSession,
-  addRecetteDocument,
-  listRecetteDocuments,
-  removeRecetteDocument,
-  addRecetteItem,
-  updateRecetteItem,
-  confirmRecette,
+  getCadrage,
+  getCadrageById,
+  listProjectCadrages,
+  linkCadrageTask,
+  setCadrageSession,
+  addCadrageDocument,
+  listCadrageDocuments,
+  removeCadrageDocument,
+  addCadrageItem,
+  updateCadrageItem,
+  confirmCadrage,
   registerParticipant,
   listParticipants,
   updateTaskSession,
@@ -139,7 +139,7 @@ import {
   DOC_ATTACHMENT_SOURCES,
   DOC_TYPES,
   PIECE_NATURES,
-  EVALUATION_DOC_NATURES,
+  RECETTE_DOC_NATURES,
   addPiece,
   listPieces,
   requalifyDocsAsPieces,
@@ -208,19 +208,19 @@ import {
   validateTaskAdr,
   unlinkTaskAdr,
   listTaskAdrs,
-  linkRecetteSprint,
-  unlinkRecetteSprint,
-  linkRecetteFeature,
-  unlinkRecetteFeature,
-  linkRecetteRule,
-  unlinkRecetteRule,
-  linkRecetteAdr,
-  unlinkRecetteAdr,
+  linkCadrageSprint,
+  unlinkCadrageSprint,
+  linkCadrageFeature,
+  unlinkCadrageFeature,
+  linkCadrageRule,
+  unlinkCadrageRule,
+  linkCadrageAdr,
+  unlinkCadrageAdr,
   ARTIFACT_SOURCES,
   ARTIFACT_KINDS,
   resolveDecisionAndTransition,
-  resolveRecette,
-  resetRecette,
+  resolveCadrage,
+  resetCadrage,
   applyPlanTransition,
   createPlanExecution,
   getPlanExecution,
@@ -247,34 +247,34 @@ import {
   listOrgGitTokens,
   deleteOrgGitToken,
   // Famille évaluation (Recette de l'ÉVALUATEUR PRODUIT) — T-20260922-100650-sbc1.
-  startEvaluation,
-  listProjectEvaluations,
-  getEvaluationById,
-  setEvaluationSession,
-  addEvaluationItem,
-  updateEvaluationItem,
-  deleteEvaluationItem,
-  setEvaluationItemDecision,
-  listTreatableEvaluationItems,
-  linkCadrageEvaluationItem,
-  unlinkCadrageEvaluationItem,
-  listCadrageEvaluationItems,
-  linkEvaluationFeature,
-  unlinkEvaluationFeature,
-  linkEvaluationRule,
-  unlinkEvaluationRule,
-  setEvaluationVerdict,
-  addEvaluationDocument,
-  addEvaluationMaquette,
-  addEvaluationPerfResult,
-  listEvaluationDocuments,
-  removeEvaluationDocument,
-  confirmEvaluation,
-  EVALUATION_ITEM_CATEGORIES,
-  EVALUATION_ITEM_SEVERITIES,
-  EVALUATION_ITEM_STATUSES,
-  EVALUATION_ITEM_DECISIONS,
-  EVALUATION_VERDICTS,
+  startRecette,
+  listProjectRecettes,
+  getRecetteById,
+  setRecetteSession,
+  addRecetteItem,
+  updateRecetteItem,
+  deleteRecetteItem,
+  setRecetteItemDecision,
+  listTreatableRecetteItems,
+  linkCadrageRecetteItem,
+  unlinkCadrageRecetteItem,
+  listCadrageRecetteItems,
+  linkRecetteFeature,
+  unlinkRecetteFeature,
+  linkRecetteRule,
+  unlinkRecetteRule,
+  setRecetteVerdict,
+  addRecetteDocument,
+  addRecetteMaquette,
+  addRecettePerfResult,
+  listRecetteDocuments,
+  removeRecetteDocument,
+  confirmRecette,
+  RECETTE_ITEM_CATEGORIES,
+  RECETTE_ITEM_SEVERITIES,
+  RECETTE_ITEM_STATUSES,
+  RECETTE_ITEM_DECISIONS,
+  RECETTE_VERDICTS,
   getArtifact,
 } from "./db.mjs";
 
@@ -325,6 +325,15 @@ function newExecutionId(taskId) {
 
 const server = new McpServer({ name: "task-orchestrator", version: "0.6.7" });
 
+// Enregistre un tool CANONIQUE `recette_*` (RECETTE évaluateur, ADR-004 §4) ET
+// son alias TRANSITOIRE `evaluation_*` (ex-nom historique) : les deux partagent
+// la MÊME définition et le MÊME handler. L'alias est conservé le temps de la
+// transition (les consommateurs `evaluation_*` continuent de fonctionner).
+function registerEvalTool(name, def, handler) {
+  server.registerTool(name, def, handler);
+  server.registerTool(`evaluation_${name.replace(/^recette_/, "")}`, def, handler);
+}
+
 // === task_register ===
 server.registerTool("task_register", {
   description:
@@ -346,8 +355,8 @@ server.registerTool("task_register", {
       taskId: z.string().describe("taskId de la tâche associée (source)."),
       description: z.string().optional().describe("Nature de la liaison (ex: 'c'est là que le package a été créé')."),
     })).optional().describe("Tâches liées : tâches associées à exploiter (commits, plans, docs) pour traiter la nouvelle tâche."),
-    recetteClass: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Si la tâche est issue d'une recette : sa classification."),
-    recetteId: z.string().optional().describe("Recette SOURCE si la tâche a été générée par une recette."),
+    cadrageClass: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Si la tâche est issue d'un cadrage : sa classification."),
+    cadrageId: z.string().optional().describe("Cadrage SOURCE si la tâche a été générée par un cadrage."),
     title: z.string().optional().describe("Titre court de la tâche (dérivé de la demande si absent)."),
     directExecution: z.boolean().optional().describe("Exécution directe via build-notify (pas d'atomic-plan) pour les tâches simples."),
     taskId: z.string().optional(),
@@ -355,7 +364,7 @@ server.registerTool("task_register", {
     repoIds: z.array(z.string()).optional().describe("Repos ciblés de la tâche (parmi ceux du projet, ADR 09). Défaut : TOUS les repos du projet."),
     featureIds: z.array(z.string()).optional().describe("Fonctionnalités liées à la tâche (optionnel, T6) — leur absence marque la tâche émergente `sans_fonctionnalite`."),
     sprintId: z.string().optional().describe("Sprint explicite (optionnel, T6) ; sinon rattachement au sprint par défaut SI le projet n'a aucun sprint."),
-    adrIds: z.array(z.string()).optional().describe("ADR PROPOSÉES pour la tâche (optionnel, T6) — lien `propose`, effectif après validation humaine en recette."),
+    adrIds: z.array(z.string()).optional().describe("ADR PROPOSÉES pour la tâche (optionnel, T6) — lien `propose`, effectif après validation humaine en cadrage."),
     originTaskId: z.string().optional().describe("Si cette tâche est ÉMERGENTE (créée hors scope pendant une tâche source) : taskId de la tâche SOURCE. La nouvelle tâche sera liée à sa source (relation_type='emergent')."),
     originReason: z.string().optional().describe("Raison de l'émergence (demande hors scope reçue pendant la tâche source)."),
     createdBy: z.string().optional().describe("Utilisateur (username) qui crée la tâche (attribution)."),
@@ -712,7 +721,7 @@ server.registerTool("piece_delete", {
 // ===========================================================================
 
 server.registerTool("sprint_report", {
-  description: "RAPPORT DE SPRINT (lecture seule, téléchargeable) — agrégation du registre : fonctionnalités implémentées (`implemented=1` **ou** ≥1 tâche liée `done`), **ventilées** écosystème / hors écosystème, et émergentes ; tâches effectuées et émergentes ; **règles métier implémentées** (section dédiée, `implemented=1` **ou** signal écosystème dérivé) et émergentes ; pièces client (émergentes), recettes. `format='markdown'` (défaut) renvoie le rapport rédigé ; `format='json'` renvoie `{ sprint, stats, sections, markdown }` (stats ventilées `implementeesEcosystem`/`implementeesHorsEcosystem`).",
+  description: "RAPPORT DE SPRINT (lecture seule, téléchargeable) — agrégation du registre : fonctionnalités implémentées (`implemented=1` **ou** ≥1 tâche liée `done`), **ventilées** écosystème / hors écosystème, et émergentes ; tâches effectuées et émergentes ; **règles métier implémentées** (section dédiée, `implemented=1` **ou** signal écosystème dérivé) et émergentes ; pièces client (émergentes), cadrages. `format='markdown'` (défaut) renvoie le rapport rédigé ; `format='json'` renvoie `{ sprint, stats, sections, markdown }` (stats ventilées `implementeesEcosystem`/`implementeesHorsEcosystem`).",
   inputSchema: {
     sprintId: z.string().describe("Identifiant du sprint (SPRINT-<ts>-<rand>)."),
     format: z.enum(["markdown", "json"]).optional().describe("Format de sortie : markdown (défaut) | json."),
@@ -726,7 +735,7 @@ server.registerTool("sprint_report", {
 });
 
 server.registerTool("sprint_start", {
-  description: "CRÉE un sprint NOMINAL à DURÉE PARAMÉTRABLE (ADR-001). `projectId` + `title` requis ; `startDate`/`endDate` ISO 8601 (`endDate >= startDate`) ; `autoClose` (défaut true) = clôture AUTOMATIQUE à l'échéance ; `pieces` (0..N pieceId) rattachées à la création (NON émergentes). Statut initial `open`, ou `close`/`auto_echeance` si l'échéance est déjà passée. Retourne le détail du sprint créé (`{ sprint, pieces, fonctionnalites, regles, tasks, recettes, counts }`).",
+  description: "CRÉE un sprint NOMINAL à DURÉE PARAMÉTRABLE (ADR-001). `projectId` + `title` requis ; `startDate`/`endDate` ISO 8601 (`endDate >= startDate`) ; `autoClose` (défaut true) = clôture AUTOMATIQUE à l'échéance ; `pieces` (0..N pieceId) rattachées à la création (NON émergentes). Statut initial `open`, ou `close`/`auto_echeance` si l'échéance est déjà passée. Retourne le détail du sprint créé (`{ sprint, pieces, fonctionnalites, regles, tasks, cadrages, counts }`).",
   inputSchema: {
     projectId: z.string().describe("Projet du sprint."),
     title: z.string().describe("Titre du sprint."),
@@ -759,7 +768,7 @@ server.registerTool("sprint_list", {
 });
 
 server.registerTool("sprint_get", {
-  description: "DÉTAIL COMPLET d'un sprint : statut, dates, cycle de vie + pièces client, fonctionnalités, règles métier, tâches et recettes rattachées + compteurs. `err` si le sprint est inconnu.",
+  description: "DÉTAIL COMPLET d'un sprint : statut, dates, cycle de vie + pièces client, fonctionnalités, règles métier, tâches et cadrages rattachées + compteurs. `err` si le sprint est inconnu.",
   inputSchema: {
     sprintId: z.string().describe("Identifiant du sprint (SPRINT-<ts>-<rand>)."),
   },
@@ -833,7 +842,7 @@ server.registerTool("sprint_attach_pieces", {
 });
 
 server.registerTool("sprint_delete", {
-  description: "SUPPRIME un SPRINT (`SPRINT-*`) et détache ses liens (`sprint_fonctionnalites`/`sprint_regles`/`sprint_pieces` — les entités restent au projet), `migrations.sprint_id` → NULL, et nettoie ses signaux de cardinalité `open`. REFUS DUR (pas de `force`) : sprint PAR DÉFAUT (`is_default=1`, message préfixé `[SPRINT_DEFAULT]`) ; sprint portant des TÂCHES ou RECETTES (`task_sprints`/`recette_sprints`, message préfixé `[SPRINT_LINKED]` — détacher d'abord via `task_sprint_unlink`/`recette_sprint_unlink`). Retourne `{ ok, sprintId, deleted, detached }`.",
+  description: "SUPPRIME un SPRINT (`SPRINT-*`) et détache ses liens (`sprint_fonctionnalites`/`sprint_regles`/`sprint_pieces` — les entités restent au projet), `migrations.sprint_id` → NULL, et nettoie ses signaux de cardinalité `open`. REFUS DUR (pas de `force`) : sprint PAR DÉFAUT (`is_default=1`, message préfixé `[SPRINT_DEFAULT]`) ; sprint portant des TÂCHES ou CADRAGES (`task_sprints`/`cadrage_sprints`, message préfixé `[SPRINT_LINKED]` — détacher d'abord via `task_sprint_unlink`/`cadrage_sprint_unlink`). Retourne `{ ok, sprintId, deleted, detached }`.",
   inputSchema: {
     sprintId: z.string().describe("Identifiant du sprint (SPRINT-<ts>-<rand>)."),
   },
@@ -846,7 +855,7 @@ server.registerTool("sprint_delete", {
 });
 
 server.registerTool("sprint_session_set", {
-  description: "ASSOCIE la session IA dédiée (agent-sprint) à un sprint EXISTANT (`sprints.session_id`). Miroir de `recette_session_set` MAIS NE TOUCHE PAS au statut du sprint : `open`/`close` (et donc la garde d'émergence) restent pilotés par `sprint_close`/`sprint_reopen`. `sessionId` null détache la session. Retourne `{ ok, sprint }`.",
+  description: "ASSOCIE la session IA dédiée (agent-sprint) à un sprint EXISTANT (`sprints.session_id`). Miroir de `cadrage_session_set` MAIS NE TOUCHE PAS au statut du sprint : `open`/`close` (et donc la garde d'émergence) restent pilotés par `sprint_close`/`sprint_reopen`. `sessionId` null détache la session. Retourne `{ ok, sprint }`.",
   inputSchema: {
     sprintId: z.string().describe("Sprint cible (SPRINT-<ts>-<rand>)."),
     sessionId: z.string().nullable().describe("Session opencode (ses_…) à rattacher, ou null pour détacher."),
@@ -936,7 +945,7 @@ server.registerTool("migration_finish", {
 });
 
 server.registerTool("sprint_migrate_elements", {
-  description: "RATTACHE à l'ANCIEN SPRINT (sprint par défaut du projet) tous les éléments EXISTANTS sans lien sprint : fonctionnalités, règles métier, pièces client, anciennes tâches et recettes. INSERT DIRECTS et IDEMPOTENTS — AUCUN FAUX ÉMERGENT : n'appelle JAMAIS `attachPiecesToSprint` et n'écrit AUCUN marqueur `emergent`/`emergent_origin` (l'émergence n'est pas rétroactive, ADR-001 §5). Retourne `{ ok, sprintId, sprint, fonctionnalites, regles, pieces, tasks, recettes }` (compteurs des liens créés).",
+  description: "RATTACHE à l'ANCIEN SPRINT (sprint par défaut du projet) tous les éléments EXISTANTS sans lien sprint : fonctionnalités, règles métier, pièces client, anciennes tâches et cadrages. INSERT DIRECTS et IDEMPOTENTS — AUCUN FAUX ÉMERGENT : n'appelle JAMAIS `attachPiecesToSprint` et n'écrit AUCUN marqueur `emergent`/`emergent_origin` (l'émergence n'est pas rétroactive, ADR-001 §5). Retourne `{ ok, sprintId, sprint, fonctionnalites, regles, pieces, tasks, cadrages }` (compteurs des liens créés).",
   inputSchema: {
     projectId: z.string().describe("Projet (produit) à migrer."),
     title: z.string().optional().describe("Titre du sprint par défaut (si création)."),
@@ -965,20 +974,20 @@ server.registerTool("sprint_migrate_elements", {
 // ===========================================================================
 
 server.registerTool("feature_register", {
-  description: "CRÉE une FONCTIONNALITÉ (`US-xxx`, ADR-001 §3) : `projectId` + `ref` + `userStory` requis ; `role` libre ; `sourcedPieceId` = pièce client SOURCE (optionnelle) GARDÉE (garde nature T2 + appartenance au projet). ÉMERGENCE : hors sprint → `hors_sprint` ; dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et rattachée au sprint courant, SAUF `recetteId`/`fromRecette` fourni (→ émergente origine `recette`). `ref` dupliquée pour le projet → erreur. Retourne le détail (liens inclus).",
+  description: "CRÉE une FONCTIONNALITÉ (`US-xxx`, ADR-001 §3) : `projectId` + `ref` + `userStory` requis ; `role` libre ; `sourcedPieceId` = pièce client SOURCE (optionnelle) GARDÉE (garde nature T2 + appartenance au projet). ÉMERGENCE : hors sprint → `hors_sprint` ; dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et rattachée au sprint courant, SAUF `cadrageId`/`fromCadrage` fourni (→ émergente origine `cadrage`). `ref` dupliquée pour le projet → erreur. Retourne le détail (liens inclus).",
   inputSchema: {
     projectId: z.string().describe("Projet de la fonctionnalité."),
     ref: z.string().describe("Référence de la fonctionnalité (ex. US-xxx)."),
     role: z.string().optional().describe("Rôle / acteur de la fonctionnalité."),
     userStory: z.string().describe("User story (formulation du besoin)."),
     sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
-    recetteId: z.string().optional().describe("Recette d'origine (optionnel, T6) — marque l'élément émergent d'origine `recette`."),
-    fromRecette: z.boolean().optional().describe("Signal EXPLICITE d'origine recette (optionnel, T6) : `true` marque l'élément émergent d'origine `recette` même sans `recetteId` (création depuis une recette évaluateur ou un cadrage en cours). Paramètre d'appel, jamais persisté."),
+    cadrageId: z.string().optional().describe("Cadrage d'origine (optionnel, T6) — marque l'élément émergent d'origine `cadrage`."),
+    fromCadrage: z.boolean().optional().describe("Signal EXPLICITE d'origine cadrage (optionnel, T6) : `true` marque l'élément émergent d'origine `cadrage` même sans `cadrageId` (création depuis une recette évaluateur ou un cadrage en cours). Paramètre d'appel, jamais persisté."),
     createdBy: z.string().optional().describe("Acteur créateur."),
   },
-}, async ({ projectId, ref, role, userStory, sourcedPieceId, recetteId, fromRecette, createdBy }) => {
+}, async ({ projectId, ref, role, userStory, sourcedPieceId, cadrageId, fromCadrage, createdBy }) => {
   try {
-    const feature = await registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, fromRecette, createdBy });
+    const feature = await registerFeature({ projectId, ref, role, userStory, sourcedPieceId, cadrageId, fromCadrage, createdBy });
     return text(JSON.stringify({ ok: true, feature }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1038,7 +1047,7 @@ server.registerTool("feature_dev_status_set", {
 });
 
 server.registerTool("feature_get", {
-  description: "DÉTAIL d'une FONCTIONNALITÉ + liens : règles métier, scénarios Gherkin (`e2e_tests`), ADR, sprints, tâches, recettes. Expose l'axe INTÉGRATION (`implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`), l'axe STATUT DE DÉVELOPPEMENT (`devStatus`/`devStatusSource`/`devStatusNote`/`devStatusAt`/`devStatusBy`, distinct) ET les VERDICTS D'ÉVALUATION (`evaluationVerdicts`, LECTURE SEULE, axe distinct). L'émergence reste un axe distinct. `err` si inconnue.",
+  description: "DÉTAIL d'une FONCTIONNALITÉ + liens : règles métier, scénarios Gherkin (`e2e_tests`), ADR, sprints, tâches, cadrages. Expose l'axe INTÉGRATION (`implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`), l'axe STATUT DE DÉVELOPPEMENT (`devStatus`/`devStatusSource`/`devStatusNote`/`devStatusAt`/`devStatusBy`, distinct) ET les VERDICTS D'ÉVALUATION (`recetteVerdicts`, LECTURE SEULE, axe distinct). L'émergence reste un axe distinct. `err` si inconnue.",
   inputSchema: { featureId: z.string().describe("Identifiant de la fonctionnalité.") },
 }, async ({ featureId }) => {
   try {
@@ -1049,7 +1058,7 @@ server.registerTool("feature_get", {
 });
 
 server.registerTool("feature_list", {
-  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose l'axe INTÉGRATION (`implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`), l'axe STATUT DE DÉVELOPPEMENT (`devStatus`/`devStatusSource`/`devStatusNote`/`devStatusAt`/`devStatusBy`), le champ additif `gherkinTests` (TESTS E2E liés 1..N : `[{e2eTestId,title,status}]`, liens cliquables, calculés en UNE requête bulk), le champ additif `links` (compteurs `{rules,gherkin,adrs,sprints,tasks,recettes}`) ET le champ additif `sprintIds` — le tout en requêtes bulk (0 N+1). Retourne `{ count, features }`.",
+  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose l'axe INTÉGRATION (`implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`), l'axe STATUT DE DÉVELOPPEMENT (`devStatus`/`devStatusSource`/`devStatusNote`/`devStatusAt`/`devStatusBy`), le champ additif `gherkinTests` (TESTS E2E liés 1..N : `[{e2eTestId,title,status}]`, liens cliquables, calculés en UNE requête bulk), le champ additif `links` (compteurs `{rules,gherkin,adrs,sprints,tasks,cadrages}`) ET le champ additif `sprintIds` — le tout en requêtes bulk (0 N+1). Retourne `{ count, features }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les fonctionnalités."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
@@ -1064,7 +1073,7 @@ server.registerTool("feature_list", {
 });
 
 server.registerTool("feature_delete", {
-  description: "SUPPRIME une FONCTIONNALITÉ (`FEAT-*`) et ses liens (`fonctionnalite_regles`, `fonctionnalite_gherkin`, `fonctionnalite_adr`, `sprint_fonctionnalites`, `task_fonctionnalites`, `recette_fonctionnalites`) en CASCADE. GARDE D'INTÉGRITÉ « ADR ≥ 1 fonctionnalité » : si la suppression ferait perdre à une ADR sa DERNIÈRE fonctionnalité, l'appel est REFUSÉ (message préfixé `[ADR_LAST_FEATURE]`) SAUF si `cascadeAdrs=true` — auquel cas l'ADR orpheline est supprimée dans la MÊME transaction (avant les liens, pour satisfaire le trigger différé). Retourne `{ ok, featureId, deleted, cascadedAdrs }`.",
+  description: "SUPPRIME une FONCTIONNALITÉ (`FEAT-*`) et ses liens (`fonctionnalite_regles`, `fonctionnalite_gherkin`, `fonctionnalite_adr`, `sprint_fonctionnalites`, `task_fonctionnalites`, `cadrage_fonctionnalites`) en CASCADE. GARDE D'INTÉGRITÉ « ADR ≥ 1 fonctionnalité » : si la suppression ferait perdre à une ADR sa DERNIÈRE fonctionnalité, l'appel est REFUSÉ (message préfixé `[ADR_LAST_FEATURE]`) SAUF si `cascadeAdrs=true` — auquel cas l'ADR orpheline est supprimée dans la MÊME transaction (avant les liens, pour satisfaire le trigger différé). Retourne `{ ok, featureId, deleted, cascadedAdrs }`.",
   inputSchema: {
     featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
     cascadeAdrs: z.boolean().optional().describe("true : supprimer aussi les ADR qui perdraient leur dernière fonctionnalité (défaut false → refus explicite)."),
@@ -1079,21 +1088,21 @@ server.registerTool("feature_delete", {
 });
 
 server.registerTool("rule_register", {
-  description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Association EXPLICITE de rôles OBLIGATOIRE : `roles` (1..N) OU `roleGlobal=true` (s'applique à TOUS les rôles) — sinon l'appel est REFUSÉ. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`), SAUF `recetteId`/`fromRecette` fourni (→ émergente origine `recette`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
+  description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Association EXPLICITE de rôles OBLIGATOIRE : `roles` (1..N) OU `roleGlobal=true` (s'applique à TOUS les rôles) — sinon l'appel est REFUSÉ. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`), SAUF `cadrageId`/`fromCadrage` fourni (→ émergente origine `cadrage`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
   inputSchema: {
     projectId: z.string().describe("Projet de la règle."),
     ref: z.string().describe("Référence de la règle (ex. RM-xxxx)."),
     content: z.string().describe("Contenu de la règle métier."),
     sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
-    recetteId: z.string().optional().describe("Recette d'origine (optionnel, T6) — marque la règle émergente d'origine `recette`."),
-    fromRecette: z.boolean().optional().describe("Signal EXPLICITE d'origine recette (optionnel, T6) : `true` marque la règle émergente d'origine `recette` même sans `recetteId` (création depuis une recette évaluateur ou un cadrage en cours). Paramètre d'appel, jamais persisté."),
+    cadrageId: z.string().optional().describe("Cadrage d'origine (optionnel, T6) — marque la règle émergente d'origine `cadrage`."),
+    fromCadrage: z.boolean().optional().describe("Signal EXPLICITE d'origine cadrage (optionnel, T6) : `true` marque la règle émergente d'origine `cadrage` même sans `cadrageId` (création depuis une recette évaluateur ou un cadrage en cours). Paramètre d'appel, jamais persisté."),
     roles: z.array(z.string()).optional().describe("Rôles EXPLICITES associés (1..N). Requis si `roleGlobal` n'est pas vrai."),
     roleGlobal: z.boolean().optional().describe("true = la règle s'applique à TOUS les rôles (dispense de `roles`)."),
     createdBy: z.string().optional().describe("Acteur créateur."),
   },
-}, async ({ projectId, ref, content, sourcedPieceId, recetteId, fromRecette, roles, roleGlobal, createdBy }) => {
+}, async ({ projectId, ref, content, sourcedPieceId, cadrageId, fromCadrage, roles, roleGlobal, createdBy }) => {
   try {
-    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, recetteId, fromRecette, roles, roleGlobal, createdBy });
+    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, cadrageId, fromCadrage, roles, roleGlobal, createdBy });
     return text(JSON.stringify({ ok: true, rule }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1350,7 +1359,7 @@ server.registerTool("task_adr_propose", {
     taskId: z.string().describe("Tâche concernée."),
     adrId: z.string().describe("docId de l'ADR EXISTANTE (kind='adr-tech')."),
     reason: z.string().optional().describe("Raison de la proposition (pertinence de l'ADR)."),
-    by: z.string().optional().describe("Agent proposant (ex. build-notify, agent-recette)."),
+    by: z.string().optional().describe("Agent proposant (ex. build-notify, agent-cadrage)."),
   },
 }, async ({ taskId, adrId, reason, by }) => {
   try { return text(JSON.stringify(await proposeTaskAdr({ taskId, adrId, reason, by }), null, 2)); }
@@ -1358,7 +1367,7 @@ server.registerTool("task_adr_propose", {
 });
 
 server.registerTool("task_adr_validate", {
-  description: "VALIDE (action HUMAINE, en recette) un lien ADR PROPOSÉ sur une tâche : `task_adr.status='valide'` + `validated_by`/`validated_at` ⇒ lien EFFECTIF. Erreur si AUCUNE proposition n'existe (utiliser `task_adr_propose` d'abord).",
+  description: "VALIDE (action HUMAINE, en cadrage) un lien ADR PROPOSÉ sur une tâche : `task_adr.status='valide'` + `validated_by`/`validated_at` ⇒ lien EFFECTIF. Erreur si AUCUNE proposition n'existe (utiliser `task_adr_propose` d'abord).",
   inputSchema: {
     taskId: z.string().describe("Tâche concernée."),
     adrId: z.string().describe("docId de l'ADR proposée."),
@@ -1391,94 +1400,6 @@ server.registerTool("task_adr_list", {
     const adrs = await listTaskAdrs({ taskId, status });
     return text(JSON.stringify({ count: adrs.length, adrs }, null, 2));
   } catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_sprint_link", {
-  description: "Alias legacy de `cadrage_sprint_link`. LIE une RECETTE à un SPRINT (`recette_sprints`, idempotent). Valide la recette et le sprint.",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    sprintId: z.string().describe("Sprint."),
-  },
-}, async ({ recetteId, sprintId }) => {
-  try { return text(JSON.stringify(await linkRecetteSprint({ recetteId, sprintId }), null, 2)); }
-  catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_sprint_unlink", {
-  description: "Alias legacy de `cadrage_sprint_unlink`. DÉLIE une RECETTE d'un SPRINT (`recette_sprints`).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    sprintId: z.string().describe("Sprint."),
-  },
-}, async ({ recetteId, sprintId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteSprint({ recetteId, sprintId }), null, 2)); }
-  catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_feature_link", {
-  description: "Alias legacy de `cadrage_feature_link`. LIE une RECETTE à une FONCTIONNALITÉ (`recette_fonctionnalites`, idempotent).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    featureId: z.string().describe("Fonctionnalité."),
-  },
-}, async ({ recetteId, featureId }) => {
-  try { return text(JSON.stringify(await linkRecetteFeature({ recetteId, featureId }), null, 2)); }
-  catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_feature_unlink", {
-  description: "Alias legacy de `cadrage_feature_unlink`. DÉLIE une RECETTE d'une FONCTIONNALITÉ (`recette_fonctionnalites`).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    featureId: z.string().describe("Fonctionnalité."),
-  },
-}, async ({ recetteId, featureId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteFeature({ recetteId, featureId }), null, 2)); }
-  catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_adr_link", {
-  description: "Alias legacy de `cadrage_adr_link`. LIE une RECETTE à une ADR EXISTANTE (`recette_adr`, idempotent).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    adrId: z.string().describe("docId de l'ADR (kind='adr-tech')."),
-  },
-}, async ({ recetteId, adrId }) => {
-  try { return text(JSON.stringify(await linkRecetteAdr({ recetteId, adrId }), null, 2)); }
-  catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_adr_unlink", {
-  description: "Alias legacy de `cadrage_adr_unlink`. DÉLIE une RECETTE d'une ADR (`recette_adr`).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    adrId: z.string().describe("docId de l'ADR."),
-  },
-}, async ({ recetteId, adrId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteAdr({ recetteId, adrId }), null, 2)); }
-  catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_rule_link", {
-  description: "Alias legacy de `cadrage_rule_link`. LIE une RECETTE à une RÈGLE MÉTIER EXISTANTE (`recette_regles`, idempotent).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    ruleId: z.string().describe("Règle métier."),
-  },
-}, async ({ recetteId, ruleId }) => {
-  try { return text(JSON.stringify(await linkRecetteRule({ recetteId, ruleId }), null, 2)); }
-  catch (e) { return err(e.message); }
-});
-
-server.registerTool("recette_rule_unlink", {
-  description: "Alias legacy de `cadrage_rule_unlink`. DÉLIE une RECETTE d'une RÈGLE MÉTIER (`recette_regles`).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette."),
-    ruleId: z.string().describe("Règle métier."),
-  },
-}, async ({ recetteId, ruleId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteRule({ recetteId, ruleId }), null, 2)); }
-  catch (e) { return err(e.message); }
 });
 
 // ===========================================================================
@@ -1722,54 +1643,54 @@ server.registerTool("adr_conversion_list", {
 });
 
 server.registerTool("adr_report_conflict", {
-  description: "Signale qu'une implémentation CONTREDIT une ADR → conflit persisté (adr_conflicts, status='open') MÊME SANS taskId ; si `taskId` fourni, une décision HUMAINE trackée (kind='conflict') est créée et référencée — sa résolution clôt le conflit. Aucune violation silencieuse. `recetteId` OPTIONNEL : signaler un conflit PENDANT une recette crée EN PLUS un POINT DE VIGILANCE GLOBAL de la recette (type='conflict'), qui BLOQUE sa terminaison jusqu'à levée. Retourne { ok, conflict, decision, vigilance }. Rebassé sur `artifacts` (adr_conflicts.adr_id → artifacts.artifact_id).",
+  description: "Signale qu'une implémentation CONTREDIT une ADR → conflit persisté (adr_conflicts, status='open') MÊME SANS taskId ; si `taskId` fourni, une décision HUMAINE trackée (kind='conflict') est créée et référencée — sa résolution clôt le conflit. Aucune violation silencieuse. `cadrageId` OPTIONNEL : signaler un conflit PENDANT un cadrage crée EN PLUS un POINT DE VIGILANCE GLOBAL du cadrage (type='conflict'), qui BLOQUE sa terminaison jusqu'à levée. Retourne { ok, conflict, decision, vigilance }. Rebassé sur `artifacts` (adr_conflicts.adr_id → artifacts.artifact_id).",
   inputSchema: {
     adrId: z.string().describe("ADR contredite."),
     taskId: z.string().optional().describe("Tâche concernée (→ décision humaine trackée)."),
-    recetteId: z.string().optional().describe("Recette en cours → point de vigilance global (bloquant)."),
+    cadrageId: z.string().optional().describe("Cadrage en cours → point de vigilance global (bloquant)."),
     description: z.string().describe("Description de la contradiction code ↔ ADR."),
     entity: z.string().optional().describe("Entité discutée (contexte du conflit)."),
     relatedAdrId: z.string().optional().describe("Nouvelle ADR en conflit avec `adrId` (chaînage)."),
   },
-}, async ({ adrId, taskId, recetteId, description, entity, relatedAdrId }) => {
+}, async ({ adrId, taskId, cadrageId, description, entity, relatedAdrId }) => {
   try {
-    const r = await reportAdrConflict({ adrId, taskId, recetteId, description, entity, relatedAdrId, by: "agent" });
+    const r = await reportAdrConflict({ adrId, taskId, cadrageId, description, entity, relatedAdrId, by: "agent" });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("adr_report_missing", {
-  description: "Signale une ADR MANQUANTE pour une entité réellement discutée en session de RECETTE ou de TEST (aucune ADR ne la couvre : adr_list/adr_search négatifs). Exige `entity` ET `description` (évite les fausses alertes). Contexte requis : `recetteId` (recette) OU `taskId` (test) OU `projectId` — le projet est résolu (recettes.project / tasks.project). Si `recetteId`, le point devient un POINT DE VIGILANCE GLOBAL de la recette qui BLOQUE sa terminaison. `proposedAdrId` référence l'ADR Proposé créée depuis la session (adr_register). Retourne { ok, vigilance }.",
+  description: "Signale une ADR MANQUANTE pour une entité réellement discutée en session de CADRAGE ou de TEST (aucune ADR ne la couvre : adr_list/adr_search négatifs). Exige `entity` ET `description` (évite les fausses alertes). Contexte requis : `cadrageId` (cadrage) OU `taskId` (test) OU `projectId` — le projet est résolu (cadrages.project / tasks.project). Si `cadrageId`, le point devient un POINT DE VIGILANCE GLOBAL du cadrage qui BLOQUE sa terminaison. `proposedAdrId` référence l'ADR Proposé créée depuis la session (adr_register). Retourne { ok, vigilance }.",
   inputSchema: {
-    recetteId: z.string().optional().describe("Recette en cours (→ point de vigilance global bloquant)."),
+    cadrageId: z.string().optional().describe("Cadrage en cours (→ point de vigilance global bloquant)."),
     taskId: z.string().optional().describe("Tâche/test concerné (résout le projet)."),
-    projectId: z.string().optional().describe("Projet (si ni recetteId ni taskId)."),
+    projectId: z.string().optional().describe("Projet (si ni cadrageId ni taskId)."),
     entity: z.string().describe("Entité/constat réellement discuté, sans ADR couvrante."),
     description: z.string().describe("Description du constat et de l'ADR manquante."),
     proposedAdrId: z.string().optional().describe("ADR Proposé créée depuis la session (adr_register)."),
-    sessionId: z.string().optional().describe("Session recette/test d'origine (traçage)."),
+    sessionId: z.string().optional().describe("Session cadrage/test d'origine (traçage)."),
   },
-}, async ({ recetteId, taskId, projectId, entity, description, proposedAdrId, sessionId }) => {
+}, async ({ cadrageId, taskId, projectId, entity, description, proposedAdrId, sessionId }) => {
   try {
-    const vigilance = await reportAdrMissing({ recetteId, taskId, projectId, entity, description, proposedAdrId, sessionId, by: "agent" });
+    const vigilance = await reportAdrMissing({ cadrageId, taskId, projectId, entity, description, proposedAdrId, sessionId, by: "agent" });
     return text(JSON.stringify({ ok: true, vigilance }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("adr_vigilance_list", {
-  description: "HISTORIQUE FILTRABLE (append-only, lecture seule) des points de vigilance ADR remontés par les recettes/tests : ADR manquante (type='missing') ou conflit d'ADR (type='conflict'). Filtres : projectId, recetteId, type, status (open|resolved), from/to (dates), limit. Chaque point porte sa `reason` explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] »). Retourne { count, vigilancess }.",
+  description: "HISTORIQUE FILTRABLE (append-only, lecture seule) des points de vigilance ADR remontés par les cadrages/tests : ADR manquante (type='missing') ou conflit d'ADR (type='conflict'). Filtres : projectId, cadrageId, type, status (open|resolved), from/to (dates), limit. Chaque point porte sa `reason` explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] »). Retourne { count, vigilancess }.",
   inputSchema: {
     projectId: z.string().optional().describe("Filtre projet."),
-    recetteId: z.string().optional().describe("Filtre recette liée."),
+    cadrageId: z.string().optional().describe("Filtre cadrage liée."),
     type: z.enum(ADR_VIGILANCE_TYPES).optional().describe("missing (ADR manquante) | conflict (conflit)."),
     status: z.enum(ADR_VIGILANCE_STATUS).optional().describe("open | resolved."),
     from: z.string().optional().describe("Date de détection ≥ (ISO/texte)."),
     to: z.string().optional().describe("Date de détection ≤ (ISO/texte)."),
     limit: z.number().int().optional().describe("Max (défaut 500)."),
   },
-}, async ({ projectId, recetteId, type, status, from, to, limit }) => {
+}, async ({ projectId, cadrageId, type, status, from, to, limit }) => {
   try {
-    const vigilancess = await listAdrVigilances({ projectId, recetteId, type, status, from, to, limit });
+    const vigilancess = await listAdrVigilances({ projectId, cadrageId, type, status, from, to, limit });
     return text(JSON.stringify({ count: vigilancess.length, vigilancess }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1798,7 +1719,7 @@ server.registerTool("adr_vigilance_resolve", {
 // ===========================================================================
 
 server.registerTool("cardinality_report", {
-  description: "AGRÉGAT de traçage des cardinalités heuristiques d'un projet (T6) : compteurs + vues complètes (tâche sans ADR/fonctionnalité/sprint, recette sans ADR/fonctionnalité/sprint, ADR sans fonctionnalité, sprint sans fonctionnalité/règle, émergents) + synthèse des signaux (total/open/resolved/stale). `view` (optionnel) restreint à une seule vue. Lecture seule, NON bloquant.",
+  description: "AGRÉGAT de traçage des cardinalités heuristiques d'un projet (T6) : compteurs + vues complètes (tâche sans ADR/fonctionnalité/sprint, cadrage sans ADR/fonctionnalité/sprint, ADR sans fonctionnalité, sprint sans fonctionnalité/règle, émergents) + synthèse des signaux (total/open/resolved/stale). `view` (optionnel) restreint à une seule vue. Lecture seule, NON bloquant.",
   inputSchema: {
     projectId: z.string().describe("Projet (produit) dont on veut les cardinalités."),
     view: z.string().optional().describe(`Vue unique (sinon rapport complet) : ${CARDINALITY_VIEWS.join(" | ")}.`),
@@ -1815,10 +1736,10 @@ server.registerTool("cardinality_report", {
 });
 
 server.registerTool("cardinality_signals_list", {
-  description: "HISTORIQUE filtrable des signaux de cardinalité (T6, append-only) : `projectId`, `entityType` (recette|task|adr|sprint), `entityId`, `status` (open|resolved). Chaque signal est enrichi de `currentGaps` (manques live) et `stale` (signal OPEN désormais comblé). Lecture seule.",
+  description: "HISTORIQUE filtrable des signaux de cardinalité (T6, append-only) : `projectId`, `entityType` (cadrage|task|adr|sprint), `entityId`, `status` (open|resolved). Chaque signal est enrichi de `currentGaps` (manques live) et `stale` (signal OPEN désormais comblé). Lecture seule.",
   inputSchema: {
     projectId: z.string().optional().describe("Filtre projet."),
-    entityType: z.string().optional().describe("recette | task | adr | sprint."),
+    entityType: z.string().optional().describe("cadrage | task | adr | sprint."),
     entityId: z.string().optional().describe("Identifiant de l'entité porteuse."),
     status: z.string().optional().describe("open | resolved."),
     limit: z.number().optional().describe("Nombre max (défaut 500)."),
@@ -1884,11 +1805,11 @@ server.registerTool("task_get", {
     const sessions = await listTaskSessions(taskId);
     const linkedTasks = await listTaskLinks(taskId);
     const emergentFrom = await listTaskEmergentFrom(taskId);
-    const recette = await getRecette(taskId).catch(() => null);
+    const cadrage = await getCadrage(taskId).catch(() => null);
     // CARDINALITÉ (T6, lecture seule, NON bloquante) + liens ADR de la tâche.
     const adrs = await listTaskAdrs({ taskId }).catch(() => []);
     const cardinalite = await checkCardinality({ entityType: "task", entityId: taskId }).catch(() => null);
-    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks, emergentFrom, recette, adrs, cardinalite }, null, 2));
+    return text(JSON.stringify({ task, executions, participants, planExecutions, planCommits, sessions, linkedTasks, emergentFrom, cadrage, adrs, cardinalite }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -1928,12 +1849,12 @@ server.registerTool("task_link_remove", {
 
 // ===========================================================================
 // Famille `cadrage_*` (CANONIQUE) — « Cadrage technique » (ADR-001,
-// doc-muchlzn8-acon). L'entité actuelle « recette » devient le « Cadrage
+// doc-muchlzn8-acon). L'entité actuelle « cadrage » devient le « Cadrage
 // technique » de l'exécuteur : mêmes capacités (contexte de mission, lecture du
 // code, analyse, production de tâches techniques) et mêmes fonctions `db.mjs`
-// (tables `recettes`/`recette_*` et historique CONSERVÉS — aucun renommage de
+// (tables `cadrages`/`cadrage_*` et historique CONSERVÉS — aucun renommage de
 // schéma). Les éléments convertibles en tâches sont les « ÉLÉMENTS DE CADRAGE ».
-// Les tools `recette_*` restent des ALIAS LEGACY (voir la section suivante) pour
+// Les tools `cadrage_*` restent des ALIAS LEGACY (voir la section suivante) pour
 // la rétrocompatibilité (`pilot.mjs` hors périmètre + historique).
 // ===========================================================================
 
@@ -1956,11 +1877,11 @@ server.registerTool("cadrage_start", {
   },
 }, async ({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status, sessionId, createdBy, organizationId }) => {
   try {
-    const recette = await startRecette({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
+    const cadrage = await startCadrage({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
     // CARDINALITÉ (T6, lecture seule, NON bloquante) : cadrage → ≥1 ADR +
     // ≥1 fonctionnalité + 1 sprint.
-    const cardinalite = await checkCardinality({ entityType: "recette", entityId: recette.recetteId }).catch(() => null);
-    return text(JSON.stringify({ ok: true, cadrage: recette, cardinalite }, null, 2));
+    const cardinalite = await checkCardinality({ entityType: "cadrage", entityId: cadrage.cadrageId }).catch(() => null);
+    return text(JSON.stringify({ ok: true, cadrage: cadrage, cardinalite }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -1972,7 +1893,7 @@ server.registerTool("cadrage_list", {
   inputSchema: { project: z.string().optional() },
 }, async ({ project }) => {
   try {
-    const cadrages = await listProjectRecettes(project);
+    const cadrages = await listProjectCadrages(project);
     return text(JSON.stringify({ count: cadrages.length, cadrages }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -1981,14 +1902,14 @@ server.registerTool("cadrage_list", {
 
 // === cadrage_get ===
 server.registerTool("cadrage_get", {
-  description: "Détail d'un cadrage technique (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments de cadrage). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`, ainsi que `evaluationItems` (éléments de recette évaluateur REPRIS par ce cadrage, « repris par le cadrage X »). Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
+  description: "Détail d'un cadrage technique (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments de cadrage). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`, ainsi que `recetteItems` (éléments de recette évaluateur REPRIS par ce cadrage, « repris par le cadrage X »). Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
   inputSchema: { cadrageId: z.string() },
 }, async ({ cadrageId }) => {
   try {
-    const cadrage = await getRecetteById(cadrageId);
+    const cadrage = await getCadrageById(cadrageId);
     if (!cadrage) return err(`cadrage inconnu : ${cadrageId}`);
     // CARDINALITÉ (T6, lecture seule, NON bloquante) — à côté de `adrVigilances`.
-    cadrage.cardinalite = await checkCardinality({ entityType: "recette", entityId: cadrageId }).catch(() => null);
+    cadrage.cardinalite = await checkCardinality({ entityType: "cadrage", entityId: cadrageId }).catch(() => null);
     return text(JSON.stringify({ cadrage }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -2001,7 +1922,7 @@ server.registerTool("cadrage_session_set", {
   inputSchema: { cadrageId: z.string(), sessionId: z.string() },
 }, async ({ cadrageId, sessionId }) => {
   try {
-    const cadrage = await setRecetteSession({ recetteId: cadrageId, sessionId });
+    const cadrage = await setCadrageSession({ cadrageId: cadrageId, sessionId });
     return text(JSON.stringify({ ok: true, cadrage }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -2028,7 +1949,7 @@ server.registerTool("cadrage_doc_add", {
       if (!a) return err(`artefact inconnu : ${artifactId}`);
       finalPath = a.path;
     }
-    const docs = await addRecetteDocument({ recetteId: cadrageId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null });
+    const docs = await addCadrageDocument({ cadrageId: cadrageId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null });
     return text(JSON.stringify({ ok: true, documents: docs }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -2041,9 +1962,9 @@ server.registerTool("cadrage_doc_remove", {
   inputSchema: { documentId: z.number().int() },
 }, async ({ documentId }) => {
   try {
-    const cadrageId = await removeRecetteDocument(documentId);
+    const cadrageId = await removeCadrageDocument(documentId);
     if (!cadrageId) return err(`document inconnu : ${documentId}`);
-    return text(JSON.stringify({ ok: true, cadrageId, documents: await listRecetteDocuments(cadrageId) }, null, 2));
+    return text(JSON.stringify({ ok: true, cadrageId, documents: await listCadrageDocuments(cadrageId) }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -2056,8 +1977,8 @@ server.registerTool("cadrage_link_task", {
 }, async ({ cadrageId, taskId }) => {
   try {
     if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
-    await linkRecetteTask(cadrageId, taskId);
-    return text(JSON.stringify({ ok: true, cadrage: await getRecetteById(cadrageId) }, null, 2));
+    await linkCadrageTask(cadrageId, taskId);
+    return text(JSON.stringify({ ok: true, cadrage: await getCadrageById(cadrageId) }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -2069,7 +1990,7 @@ server.registerTool("cadrage_unlink_task", {
   inputSchema: { cadrageId: z.string(), taskId: z.string() },
 }, async ({ cadrageId, taskId }) => {
   try {
-    const cadrage = await unlinkRecetteTask(cadrageId, taskId);
+    const cadrage = await unlinkCadrageTask(cadrageId, taskId);
     if (!cadrage) return err(`cadrage inconnu : ${cadrageId}`);
     return text(JSON.stringify({ ok: true, cadrage }, null, 2));
   } catch (e) {
@@ -2108,7 +2029,7 @@ server.registerTool("cadrage_item_add", {
   },
 }, async ({ cadrageId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent }) => {
   try {
-    const item = await addRecetteItem({ recetteId: cadrageId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent });
+    const item = await addCadrageItem({ cadrageId: cadrageId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -2148,7 +2069,7 @@ server.registerTool("cadrage_item_update", {
   },
 }, async ({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId }) => {
   try {
-    const item = await updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId });
+    const item = await updateCadrageItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -2161,7 +2082,7 @@ server.registerTool("cadrage_item_delete", {
   inputSchema: { itemId: z.number().int() },
 }, async ({ itemId }) => {
   try {
-    const r = await deleteRecetteItem({ itemId });
+    const r = await deleteCadrageItem({ itemId });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -2175,7 +2096,7 @@ server.registerTool("cadrage_confirm", {
   },
 }, async ({ cadrageId, confirmedBy }) => {
   try {
-    const cadrage = await confirmRecette({ recetteId: cadrageId, confirmedBy });
+    const cadrage = await confirmCadrage({ cadrageId: cadrageId, confirmedBy });
     return text(JSON.stringify({ ok: true, cadrage }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -2184,13 +2105,13 @@ server.registerTool("cadrage_confirm", {
 
 // === cadrage_delete ===
 server.registerTool("cadrage_delete", {
-  description: "Supprime un CADRAGE TECHNIQUE ENTIER (recette, table `recettes`) + nettoyage en CASCADE de toute sa famille polymorphe : éléments, liens tâches, documents/artefacts attachés (`artifacts` doc_type recette_doc/recette_report), points de vigilance ADR liés, liens sprint/fonctionnalité/règle/ADR/projet, liens d'éléments d'évaluation, signaux de cardinalité ouverts (et détache les batches liés). Les tâches et éléments d'évaluation rattachés restent intacts (seuls les LIENS sont supprimés). Retourne `null` si le cadrage est inconnu. Suppression IRRÉVERSIBLE — réservée à un administrateur (côté panneau : double confirmation).",
+  description: "Supprime un CADRAGE TECHNIQUE ENTIER (cadrage, table `cadrages`) + nettoyage en CASCADE de toute sa famille polymorphe : éléments, liens tâches, documents/artefacts attachés (`artifacts` doc_type cadrage_doc/cadrage_report), points de vigilance ADR liés, liens sprint/fonctionnalité/règle/ADR/projet, liens d'éléments d'évaluation, signaux de cardinalité ouverts (et détache les batches liés). Les tâches et éléments d'évaluation rattachés restent intacts (seuls les LIENS sont supprimés). Retourne `null` si le cadrage est inconnu. Suppression IRRÉVERSIBLE — réservée à un administrateur (côté panneau : double confirmation).",
   inputSchema: {
-    cadrageId: z.string().describe("Cadrage technique (recette) à supprimer."),
+    cadrageId: z.string().describe("Cadrage technique (cadrage) à supprimer."),
   },
 }, async ({ cadrageId }) => {
   try {
-    const r = await deleteRecette(cadrageId);
+    const r = await deleteCadrage(cadrageId);
     if (!r) return text(JSON.stringify({ ok: true, cadrageId, deleted: false, reason: "cadrage inconnu" }, null, 2));
     return text(JSON.stringify({ ok: true, cadrage: r }, null, 2));
   } catch (e) {
@@ -2202,372 +2123,110 @@ server.registerTool("cadrage_delete", {
 
 // === cadrage_sprint_link ===
 server.registerTool("cadrage_sprint_link", {
-  description: "LIE un CADRAGE TECHNIQUE à un SPRINT (`recette_sprints`, idempotent). Valide le cadrage et le sprint.",
+  description: "LIE un CADRAGE TECHNIQUE à un SPRINT (`cadrage_sprints`, idempotent). Valide le cadrage et le sprint.",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     sprintId: z.string().describe("Sprint."),
   },
 }, async ({ cadrageId, sprintId }) => {
-  try { return text(JSON.stringify(await linkRecetteSprint({ recetteId: cadrageId, sprintId }), null, 2)); }
+  try { return text(JSON.stringify(await linkCadrageSprint({ cadrageId: cadrageId, sprintId }), null, 2)); }
   catch (e) { return err(e.message); }
 });
 
 // === cadrage_sprint_unlink ===
 server.registerTool("cadrage_sprint_unlink", {
-  description: "DÉLIE un CADRAGE TECHNIQUE d'un SPRINT (`recette_sprints`).",
+  description: "DÉLIE un CADRAGE TECHNIQUE d'un SPRINT (`cadrage_sprints`).",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     sprintId: z.string().describe("Sprint."),
   },
 }, async ({ cadrageId, sprintId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteSprint({ recetteId: cadrageId, sprintId }), null, 2)); }
+  try { return text(JSON.stringify(await unlinkCadrageSprint({ cadrageId: cadrageId, sprintId }), null, 2)); }
   catch (e) { return err(e.message); }
 });
 
 // === cadrage_feature_link ===
 server.registerTool("cadrage_feature_link", {
-  description: "LIE un CADRAGE TECHNIQUE à une FONCTIONNALITÉ (`recette_fonctionnalites`, idempotent).",
+  description: "LIE un CADRAGE TECHNIQUE à une FONCTIONNALITÉ (`cadrage_fonctionnalites`, idempotent).",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     featureId: z.string().describe("Fonctionnalité."),
   },
 }, async ({ cadrageId, featureId }) => {
-  try { return text(JSON.stringify(await linkRecetteFeature({ recetteId: cadrageId, featureId }), null, 2)); }
+  try { return text(JSON.stringify(await linkCadrageFeature({ cadrageId: cadrageId, featureId }), null, 2)); }
   catch (e) { return err(e.message); }
 });
 
 // === cadrage_feature_unlink ===
 server.registerTool("cadrage_feature_unlink", {
-  description: "DÉLIE un CADRAGE TECHNIQUE d'une FONCTIONNALITÉ (`recette_fonctionnalites`).",
+  description: "DÉLIE un CADRAGE TECHNIQUE d'une FONCTIONNALITÉ (`cadrage_fonctionnalites`).",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     featureId: z.string().describe("Fonctionnalité."),
   },
 }, async ({ cadrageId, featureId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteFeature({ recetteId: cadrageId, featureId }), null, 2)); }
+  try { return text(JSON.stringify(await unlinkCadrageFeature({ cadrageId: cadrageId, featureId }), null, 2)); }
   catch (e) { return err(e.message); }
 });
 
 // === cadrage_adr_link ===
 server.registerTool("cadrage_adr_link", {
-  description: "LIE un CADRAGE TECHNIQUE à une ADR EXISTANTE (`recette_adr`, idempotent).",
+  description: "LIE un CADRAGE TECHNIQUE à une ADR EXISTANTE (`cadrage_adr`, idempotent).",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     adrId: z.string().describe("docId de l'ADR (kind='adr-tech')."),
   },
 }, async ({ cadrageId, adrId }) => {
-  try { return text(JSON.stringify(await linkRecetteAdr({ recetteId: cadrageId, adrId }), null, 2)); }
+  try { return text(JSON.stringify(await linkCadrageAdr({ cadrageId: cadrageId, adrId }), null, 2)); }
   catch (e) { return err(e.message); }
 });
 
 // === cadrage_adr_unlink ===
 server.registerTool("cadrage_adr_unlink", {
-  description: "DÉLIE un CADRAGE TECHNIQUE d'une ADR (`recette_adr`).",
+  description: "DÉLIE un CADRAGE TECHNIQUE d'une ADR (`cadrage_adr`).",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     adrId: z.string().describe("docId de l'ADR."),
   },
 }, async ({ cadrageId, adrId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteAdr({ recetteId: cadrageId, adrId }), null, 2)); }
+  try { return text(JSON.stringify(await unlinkCadrageAdr({ cadrageId: cadrageId, adrId }), null, 2)); }
   catch (e) { return err(e.message); }
 });
 
 // === cadrage_rule_link ===
 server.registerTool("cadrage_rule_link", {
-  description: "LIE un CADRAGE TECHNIQUE à une RÈGLE MÉTIER EXISTANTE (`recette_regles`, idempotent).",
+  description: "LIE un CADRAGE TECHNIQUE à une RÈGLE MÉTIER EXISTANTE (`cadrage_regles`, idempotent).",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     ruleId: z.string().describe("Règle métier."),
   },
 }, async ({ cadrageId, ruleId }) => {
-  try { return text(JSON.stringify(await linkRecetteRule({ recetteId: cadrageId, ruleId }), null, 2)); }
+  try { return text(JSON.stringify(await linkCadrageRule({ cadrageId: cadrageId, ruleId }), null, 2)); }
   catch (e) { return err(e.message); }
 });
 
 // === cadrage_rule_unlink ===
 server.registerTool("cadrage_rule_unlink", {
-  description: "DÉLIE un CADRAGE TECHNIQUE d'une RÈGLE MÉTIER (`recette_regles`).",
+  description: "DÉLIE un CADRAGE TECHNIQUE d'une RÈGLE MÉTIER (`cadrage_regles`).",
   inputSchema: {
     cadrageId: z.string().describe("Cadrage technique."),
     ruleId: z.string().describe("Règle métier."),
   },
 }, async ({ cadrageId, ruleId }) => {
-  try { return text(JSON.stringify(await unlinkRecetteRule({ recetteId: cadrageId, ruleId }), null, 2)); }
+  try { return text(JSON.stringify(await unlinkCadrageRule({ cadrageId: cadrageId, ruleId }), null, 2)); }
   catch (e) { return err(e.message); }
-});
-
-// === recette_start (alias legacy de cadrage_start) ===
-  server.registerTool("recette_start", {
-   description: "Alias legacy de `cadrage_start`. Crée une opération de recette de PROJET : 1 recette = 1 PROJET unique (produit). Les REPOS TRANSVERSES du projet (project_repos, ex: mada-talk traverse le repo oniria) couvrent la portée — pas d'ajout de projets supplémentaires. + titre + 0..N tâches couvertes (du projet) + session dédiée.",
-   inputSchema: {
-     project: z.string().describe("Projet (produit) unique de la recette — ses repos transverses sont la portée."),
-     title: z.string().optional().describe("Titre court compréhensible (ex: 'Recette du module chatbot'). Dérivé si absent."),
-     description: z.string().optional().describe("Description longue (détail du périmètre vérifié)."),
-     taskIds: z.array(z.string()).optional().describe("Tâches couvertes par la recette (0..N — doivent appartenir au projet de la recette)."),
-     sprintId: z.string().optional().describe("Sprint de la recette (optionnel, T6) ; sinon sprint par défaut SI le projet n'a aucun sprint."),
-     featureIds: z.array(z.string()).optional().describe("Fonctionnalités de la recette (optionnel, T6)."),
-     ruleIds: z.array(z.string()).optional().describe("Règles métier de la recette (optionnel, T6 — NON bloquant)."),
-     adrIds: z.array(z.string()).optional().describe("ADR de la recette (optionnel, T6)."),
-     status: z.enum(["pending", "in_progress"]).optional().describe("pending (défaut) ou in_progress (session lancée)."),
-     sessionId: z.string().optional().describe("Session dédiée de l'agent-recette (si lancée)."),
-     createdBy: z.string().optional().describe("Utilisateur (username) qui crée la recette."),
-     organizationId: z.string().optional().describe("Organisation (tenant). Défaut : celle du projet."),
-   },
- }, async ({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status, sessionId, createdBy, organizationId }) => {
-   try {
-     const recette = await startRecette({ project, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status: status || "pending", sessionId: sessionId || null, createdBy, organizationId });
-    // CARDINALITÉ (T6, lecture seule, NON bloquante) : recette → ≥1 ADR +
-    // ≥1 fonctionnalité + 1 sprint.
-    const cardinalite = await checkCardinality({ entityType: "recette", entityId: recette.recetteId }).catch(() => null);
-    return text(JSON.stringify({ ok: true, recette, cardinalite }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_list (alias legacy de cadrage_list) ===
-server.registerTool("recette_list", {
-  description: "Alias legacy de `cadrage_list`. Liste les recettes (toutes ou filtrées par projet) avec nb de tâches couvertes et nb d'éléments.",
-  inputSchema: { project: z.string().optional() },
-}, async ({ project }) => {
-  try {
-    const recettes = await listProjectRecettes(project);
-    return text(JSON.stringify({ count: recettes.length, recettes }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_get (alias legacy de cadrage_get) ===
-server.registerTool("recette_get", {
-  description: "Alias legacy de `cadrage_get`. Détail d'une recette (titre, projet UNIQUE + repos transverses du projet, statut, tâches couvertes, éléments). Expose les liens N:N `sprints`, `fonctionnalites`, `regles` (règles métier) et `adrs`. Expose aussi `adrVigilances` (historique des points de vigilance ADR : ADR manquante / conflit), `adrVigilancesOpen` (ceux qui BLOQUENT la terminaison) et `cardinalite` (manques heuristiques : ≥1 ADR / ≥1 fonctionnalité / 1 sprint — T6, non bloquant).",
-  inputSchema: { recetteId: z.string() },
-}, async ({ recetteId }) => {
-  try {
-    const recette = await getRecetteById(recetteId);
-    if (!recette) return err(`recette inconnue : ${recetteId}`);
-    // CARDINALITÉ (T6, lecture seule, NON bloquante) — à côté de `adrVigilances`.
-    recette.cardinalite = await checkCardinality({ entityType: "recette", entityId: recetteId }).catch(() => null);
-    return text(JSON.stringify({ recette }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_session_set (alias legacy de cadrage_session_set) ===
-server.registerTool("recette_session_set", {
-  description: "Alias legacy de `cadrage_session_set`. Associe la session dédiée lancée à une recette et la passe en cours (in_progress).",
-  inputSchema: { recetteId: z.string(), sessionId: z.string() },
-}, async ({ recetteId, sessionId }) => {
-  try {
-    const recette = await setRecetteSession({ recetteId, sessionId });
-    return text(JSON.stringify({ ok: true, recette }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_doc_add (alias legacy de cadrage_doc_add) ===
-server.registerTool("recette_doc_add", {
-  description: "Alias legacy de `cadrage_doc_add`. Rattache un document à une recette (importé ou artefact existant) avec la nature de la liaison (à quoi sert / comment l'exploiter).",
-  inputSchema: {
-    recetteId: z.string(),
-    title: z.string().optional(),
-    nature: z.string().optional().describe("Nature de la liaison : à quoi sert le document et comment l'exploiter."),
-    source: z.enum(["import", "artifact"]).default("import"),
-    path: z.string().optional().describe("Chemin du fichier (mode import)."),
-    artifactId: z.string().optional().describe("Artefact existant à lier (mode artifact)."),
-  },
-}, async ({ recetteId, title, nature, source, path, artifactId }) => {
-  try {
-    let finalPath = path;
-    if (source === "artifact") {
-      if (!artifactId) return err("artifactId requis en mode artifact");
-      const a = await getArtifact(artifactId);
-      if (!a) return err(`artefact inconnu : ${artifactId}`);
-      finalPath = a.path;
-    }
-    const docs = await addRecetteDocument({ recetteId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null });
-    return text(JSON.stringify({ ok: true, documents: docs }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_doc_remove (alias legacy de cadrage_doc_remove) ===
-server.registerTool("recette_doc_remove", {
-  description: "Alias legacy de `cadrage_doc_remove`. Retire un document d'une recette.",
-  inputSchema: { documentId: z.number().int() },
-}, async ({ documentId }) => {
-  try {
-    const recetteId = await removeRecetteDocument(documentId);
-    if (!recetteId) return err(`document inconnu : ${documentId}`);
-    return text(JSON.stringify({ ok: true, recetteId, documents: await listRecetteDocuments(recetteId) }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_link_task (alias legacy de cadrage_link_task) ===
-server.registerTool("recette_link_task", {
-  description: "Alias legacy de `cadrage_link_task`. Rattache une tâche à une recette (tâche couverte). Garde : la tâche doit appartenir au PROJET de la recette (1 recette = 1 projet ; les repos transverses du projet sont la portée).",
-  inputSchema: { recetteId: z.string(), taskId: z.string() },
-}, async ({ recetteId, taskId }) => {
-  try {
-    if (!(await getTask(taskId))) return err(`tâche inconnue : ${taskId}`);
-    await linkRecetteTask(recetteId, taskId);
-    return text(JSON.stringify({ ok: true, recette: await getRecetteById(recetteId) }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_unlink_task (alias legacy de cadrage_unlink_task) ===
-server.registerTool("recette_unlink_task", {
-  description: "Alias legacy de `cadrage_unlink_task`. Détache une tâche d'une recette (la tâche reste historiquement intacte, juste plus couverte).",
-  inputSchema: { recetteId: z.string(), taskId: z.string() },
-}, async ({ recetteId, taskId }) => {
-  try {
-    const recette = await unlinkRecetteTask(recetteId, taskId);
-    if (!recette) return err(`recette inconnue : ${recetteId}`);
-    return text(JSON.stringify({ ok: true, recette }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_item_add (alias legacy de cadrage_item_add) ===
-server.registerTool("recette_item_add", {
-  description: "Alias legacy de `cadrage_item_add`. Enregistre un élément détecté pendant la recette (remarque, demande, constat, problème) avec sa classification (rework|bug|improvement|feature), son projet cible (= projet unique de la recette — les repos transverses sont des repos, pas des projets), le périmètre (scope) suggéré et, si le constat implique de faire évoluer des TESTS et/ou des DOCUMENTS de référence du projet, une intention structurée (testIntent / docIntent).",
-  inputSchema: {
-    recetteId: z.string(),
-    content: z.string().describe("La remarque / demande / constat."),
-    classification: z.enum(["rework", "bug", "improvement", "feature"]).optional().describe("Nature de l'élément (défaut rework)."),
-    project: z.string().optional().describe("Projet cible de l'élément (= projet unique de la recette ; fourni par défaut, ignoré sinon). Les repos transverses du projet ne sont pas des projets."),
-    discussion: z.string().optional().describe("Échanges associés."),
-    scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins) — transmis à la tâche créée à la confirmation."),
-    title: z.string().optional().describe("Titre court de la tâche qui sera créée à la confirmation."),
-    acceptance: z.string().optional().describe("Critère d'acceptation / livrable attendu de la tâche qui sera créée."),
-    execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = exécutable en parallèle)."),
-    vigilance: z.string().optional().describe("Point de vigilance / écart sémantique détecté pour cet élément."),
-    testIntent: z.object({
-      action: z.enum(["create", "update", "obsolete"]).describe("Action sur le(s) test(s) : create (nouveau test pour le comportement voulu/bug) | update (adapter un test existant) | obsolete (test devenu obsolète)."),
-      testType: z.enum(["unit", "e2e"]).optional().describe("Type de test concerné : unit (unitaire, dans le repo) | e2e (entité E2E Playwright). Défaut unit."),
-      target: z.string().optional().describe("Cible : e2eTestId, specFile (E2E) ou chemin du test unitaire (ex. tests/mon-test.spec.ts)."),
-      scenario: z.string().optional().describe("Scénario / comportement à couvrir ou à vérifier."),
-      reason: z.string().optional().describe("Pourquoi ce besoin test (bug non couvert, comportement changé, test obsolète…)."),
-    }).optional().describe("Intention test structurée — à renseigner quand le constat requiert d'ajouter/modifier/obsoléter un test du projet pour couvrir le comportement voulu ou le bug détecté."),
-    docIntent: z.object({
-      action: z.enum(["create", "update", "obsolete"]).describe("Action sur le(s) document(s) de référence : update (mettre à jour) | create (documenter une règle nouvelle) | obsolete (document devenu obsolète)."),
-      docType: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional().describe("Type de document concerné (ADR-12) : adr-tech (architecture technique) | specs-fonctionnelles (User stories/règles métier) | scenarios-gherkin (scénarios BDD)."),
-      target: z.string().optional().describe("Cible : docId ou chemin du document à faire évoluer."),
-      summary: z.string().optional().describe("Ce que le document doit refléter après la recette."),
-      reason: z.string().optional().describe("Pourquoi ce besoin doc (la recette rend un document inexact/obsolète, ou une règle doit être documentée)."),
-    }).optional().describe("Intention document structurée — à renseigner quand une décision de recette impose de mettre à jour/créer/obsoléter un document de référence du projet (ADR technique, specs fonctionnelles, scénarios Gherkin)."),
-  },
-}, async ({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent }) => {
-  try {
-    const item = await addRecetteItem({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent });
-    return text(JSON.stringify({ ok: true, item }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_item_update (alias legacy de cadrage_item_update) ===
-server.registerTool("recette_item_update", {
-  description: "Alias legacy de `cadrage_item_update`. Met à jour un élément de recette (contenu, classification, discussion, scope, projet cible, titre, critère d'acceptation, ordre, vigilance, intentions test/document, statut, tâche créée).",
-  inputSchema: {
-    itemId: z.number().int(),
-    content: z.string().optional().describe("Contenu de l'élément (remarque/demande/constat) — non vide si fourni."),
-    classification: z.enum(["rework", "bug", "improvement", "feature"]).optional(),
-    discussion: z.string().optional(),
-    scope: z.array(z.string()).optional().describe("Périmètre suggéré (chemins)."),
-    project: z.string().optional().describe("Projet cible de l'élément."),
-    title: z.string().optional(),
-    acceptance: z.string().optional(),
-    execOrder: z.number().int().optional().describe("Ordre d'exécution recommandé (même numéro = parallèle)."),
-    vigilance: z.string().optional().describe("Point de vigilance / écart sémantique."),
-    testIntent: z.object({
-      action: z.enum(["create", "update", "obsolete"]),
-      testType: z.enum(["unit", "e2e"]).optional(),
-      target: z.string().optional(),
-      scenario: z.string().optional(),
-      reason: z.string().optional(),
-    }).optional().describe("Intention test structurée (remplace l'existante ; null/absent ne la change pas)."),
-    docIntent: z.object({
-      action: z.enum(["create", "update", "obsolete"]),
-      docType: z.enum(["adr-tech", "specs-fonctionnelles", "scenarios-gherkin"]).optional(),
-      target: z.string().optional(),
-      summary: z.string().optional(),
-      reason: z.string().optional(),
-    }).optional().describe("Intention document structurée (remplace l'existante ; null/absent ne la change pas)."),
-    status: z.enum(["open", "task_created"]).optional(),
-    createdTaskId: z.string().optional(),
-  },
-}, async ({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId }) => {
-  try {
-    const item = await updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId });
-    return text(JSON.stringify({ ok: true, item }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-
-// === recette_item_delete (alias legacy de cadrage_item_delete) ===
-server.registerTool("recette_item_delete", {
-  description: "Alias legacy de `cadrage_item_delete`. Supprime un élément de recette (remarque/demande/constat). Refus si une tâche a déjà été créée depuis cet élément (task_created).",
-  inputSchema: { itemId: z.number().int() },
-}, async ({ itemId }) => {
-  try {
-    const r = await deleteRecetteItem({ itemId });
-    return text(JSON.stringify({ ok: true, ...r }, null, 2));
-  } catch (e) { return err(e.message); }
-});
-
-// === recette_confirm (alias legacy de cadrage_confirm) ===
-server.registerTool("recette_confirm", {
-  description: "Alias legacy de `cadrage_confirm`. Clôt la recette (statut 'done' = faite) après confirmation de la liste consolidée. La tâche initiale reste done et close ; les travaux issus sont de nouvelles tâches. GARDE ADR : REFUSÉ avec raison explicite (« ADR manquant pour [entité] » / « Conflit d'ADR : [ancienne] vs [nouvelle] ») tant qu'un point de vigilance ADR (ADR manquante / conflit) est OUVERT sur la recette — levez-le via `adr_vigilance_resolve` (raison tracée).",
-  inputSchema: {
-    recetteId: z.string(),
-    confirmedBy: z.string().optional(),
-  },
-}, async ({ recetteId, confirmedBy }) => {
-  try {
-    const recette = await confirmRecette({ recetteId, confirmedBy });
-    return text(JSON.stringify({ ok: true, recette }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
-});
-
-// === recette_delete (alias legacy de cadrage_delete) ===
-server.registerTool("recette_delete", {
-  description: "Alias legacy de `cadrage_delete`. Supprime une RECETTE ENTIÈRE + nettoyage en CASCADE de toute sa famille polymorphe (éléments, liens tâches, documents/artefacts attachés, points de vigilance ADR liés, liens sprint/fonctionnalité/règle/ADR/projet, liens d'éléments d'évaluation, signaux de cardinalité ouverts, batches détachés). Les tâches et éléments d'évaluation rattachés restent intacts (seuls les LIENS sont supprimés). Retourne `null` si la recette est inconnue. Suppression IRRÉVERSIBLE — réservée à un administrateur (côté panneau : double confirmation).",
-  inputSchema: {
-    recetteId: z.string().describe("Recette à supprimer."),
-  },
-}, async ({ recetteId }) => {
-  try {
-    const r = await deleteRecette(recetteId);
-    if (!r) return text(JSON.stringify({ ok: true, recetteId, deleted: false, reason: "recette inconnue" }, null, 2));
-    return text(JSON.stringify({ ok: true, recette: r }, null, 2));
-  } catch (e) {
-    return err(e.message);
-  }
 });
 
 // ===========================================================================
 // Famille ÉVALUATION (T-20260922-100650-sbc1) — « Recette » de l'ÉVALUATEUR
-// PRODUIT. Objet de 1er niveau DISTINCT de `recettes`/`cadrage_*` (Cadrage
+// PRODUIT. Objet de 1er niveau DISTINCT de `cadrages`/`cadrage_*` (Cadrage
 // technique exécuteur). L'évaluateur décrit le PARCOURS ÉVALUÉ, rattache 1..N
 // fonctionnalités (verdict porté par le lien) + 1..N règles métier, enregistre
 // des ÉLÉMENTS (recommandation | problème) et joint des PIÈCES. Cycle de vie :
 // pending → in_progress → done. AUCUNE conversion en tâches.
 // ===========================================================================
 
-server.registerTool("evaluation_start", {
+registerEvalTool("recette_start", {
   description: "Crée une ÉVALUATION (« Recette » de l'évaluateur produit) : 1 évaluation = 1 PROJET unique + titre + description du PARCOURS ÉVALUÉ + 1..N fonctionnalités + 1..N règles métier (liens posés à la création, NON bloquants). `createdBy` est indispensable au filtre propriétaire (l'évaluateur ne voit que SES recettes). Statut initial 'pending'. AUCUNE conversion en tâches.",
   inputSchema: {
     project: z.string().describe("Projet (produit) de l'évaluation."),
@@ -2580,214 +2239,214 @@ server.registerTool("evaluation_start", {
   },
 }, async ({ project, title, description, featureIds, ruleIds, createdBy, organizationId }) => {
   try {
-    const evaluation = await startEvaluation({ project, title, description, featureIds, ruleIds, createdBy, organizationId });
-    return text(JSON.stringify({ ok: true, evaluation }, null, 2));
+    const recette = await startRecette({ project, title, description, featureIds, ruleIds, createdBy, organizationId });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_list", {
+registerEvalTool("recette_list", {
   description: "Liste les évaluations (« Recettes » évaluateur) d'un projet (ou toutes) avec nb d'éléments / fonctionnalités / règles.",
   inputSchema: { project: z.string().optional().describe("Projet (produit) — sinon toutes.") },
 }, async ({ project }) => {
   try {
-    const evaluations = await listProjectEvaluations(project);
-    return text(JSON.stringify({ count: evaluations.length, evaluations }, null, 2));
+    const recettes = await listProjectRecettes(project);
+    return text(JSON.stringify({ count: recettes.length, recettes }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_get", {
+registerEvalTool("recette_get", {
   description: "Détail d'une évaluation : parcours évalué, statut, éléments (recommandation/problème) avec leur DÉCISION ADMIN (pending|a_traiter|non_retenu), leur statut de suivi, leurs PIÈCES (`documents[]`) et leur traçage `reprisPar[]` (« repris par le cadrage X »), fonctionnalités avec VERDICT, règles métier, pièces jointes.",
-  inputSchema: { evaluationId: z.string().describe("Identifiant EVAL-<ts>-<rand>.") },
-}, async ({ evaluationId }) => {
+  inputSchema: { recetteId: z.string().describe("Identifiant RECT-<ts>-<rand>.") },
+}, async ({ recetteId }) => {
   try {
-    const evaluation = await getEvaluationById(evaluationId);
-    if (!evaluation) return err(`évaluation inconnue : ${evaluationId}`);
-    return text(JSON.stringify({ evaluation }, null, 2));
+    const recette = await getRecetteById(recetteId);
+    if (!recette) return err(`évaluation inconnue : ${recetteId}`);
+    return text(JSON.stringify({ recette }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_session_set", {
-  description: "ASSOCIE la session IA dédiée (agent-recette ÉVALUATEUR) à une évaluation EXISTANTE (`evaluations.session_id`). Miroir de `recette_session_set` MAIS NE TOUCHE PAS au statut de l'évaluation : `pending`/`in_progress`/`done` restent pilotés par le cycle de vie de la recette. `sessionId` null détache la session. Retourne `{ ok, evaluation }`.",
-  inputSchema: { evaluationId: z.string().describe("Identifiant EVAL-<ts>-<rand>."), sessionId: z.string().nullable().describe("Session opencode (ses_…) à rattacher, ou null pour détacher.") },
-}, async ({ evaluationId, sessionId }) => {
+registerEvalTool("recette_session_set", {
+  description: "ASSOCIE la session IA dédiée (agent-recette ÉVALUATEUR) à une évaluation EXISTANTE (`recettes.session_id`). Miroir de `cadrage_session_set` MAIS NE TOUCHE PAS au statut de l'évaluation : `pending`/`in_progress`/`done` restent pilotés par le cycle de vie de la recette. `sessionId` null détache la session. Retourne `{ ok, recette }`.",
+  inputSchema: { recetteId: z.string().describe("Identifiant RECT-<ts>-<rand>."), sessionId: z.string().nullable().describe("Session opencode (ses_…) à rattacher, ou null pour détacher.") },
+}, async ({ recetteId, sessionId }) => {
   try {
-    const evaluation = await setEvaluationSession(evaluationId, sessionId);
-    return text(JSON.stringify({ ok: true, evaluation }, null, 2));
+    const recette = await setRecetteSession(recetteId, sessionId);
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_item_add", {
+registerEvalTool("recette_item_add", {
   description: "Enregistre un ÉLÉMENT d'évaluation : une RECOMMANDATION ou un PROBLÈME (catégorie), avec sa SÉVÉRITÉ et une discussion libre. Statut de suivi initial 'open'.",
   inputSchema: {
-    evaluationId: z.string(),
+    recetteId: z.string(),
     content: z.string().describe("La recommandation / le problème."),
-    category: z.enum(EVALUATION_ITEM_CATEGORIES).optional().describe("Nature (défaut recommandation)."),
-    severity: z.enum(EVALUATION_ITEM_SEVERITIES).optional().describe("Sévérité (défaut medium)."),
+    category: z.enum(RECETTE_ITEM_CATEGORIES).optional().describe("Nature (défaut recommandation)."),
+    severity: z.enum(RECETTE_ITEM_SEVERITIES).optional().describe("Sévérité (défaut medium)."),
     discussion: z.string().optional().describe("Échanges associés."),
   },
-}, async ({ evaluationId, content, category, severity, discussion }) => {
+}, async ({ recetteId, content, category, severity, discussion }) => {
   try {
-    const item = await addEvaluationItem({ evaluationId, content, category, severity, discussion });
+    const item = await addRecetteItem({ recetteId, content, category, severity, discussion });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_item_update", {
-  description: "Met à jour un élément d'évaluation (contenu, catégorie, sévérité, discussion, statut de suivi open|treated|dismissed). La DÉCISION ADMIN « à traiter » (pending|a_traiter|non_retenu) n'est PAS modifiable ici : utiliser `evaluation_item_decision`.",
+registerEvalTool("recette_item_update", {
+  description: "Met à jour un élément d'évaluation (contenu, catégorie, sévérité, discussion, statut de suivi open|treated|dismissed). La DÉCISION ADMIN « à traiter » (pending|a_traiter|non_retenu) n'est PAS modifiable ici : utiliser `recette_item_decision`.",
   inputSchema: {
     itemId: z.number().int(),
     content: z.string().optional(),
-    category: z.enum(EVALUATION_ITEM_CATEGORIES).optional(),
-    severity: z.enum(EVALUATION_ITEM_SEVERITIES).optional(),
+    category: z.enum(RECETTE_ITEM_CATEGORIES).optional(),
+    severity: z.enum(RECETTE_ITEM_SEVERITIES).optional(),
     discussion: z.string().optional(),
-    status: z.enum(EVALUATION_ITEM_STATUSES).optional(),
+    status: z.enum(RECETTE_ITEM_STATUSES).optional(),
   },
 }, async ({ itemId, content, category, severity, discussion, status }) => {
   try {
-    const item = await updateEvaluationItem({ itemId, content, category, severity, discussion, status });
+    const item = await updateRecetteItem({ itemId, content, category, severity, discussion, status });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-// === evaluation_item_decision (décision ADMIN « à traiter ») ===
-server.registerTool("evaluation_item_decision", {
+// === recette_item_decision (décision ADMIN « à traiter ») ===
+registerEvalTool("recette_item_decision", {
   description: "DÉCISION ADMIN d'un élément de recette évaluateur : `pending` (non décidé) | `a_traiter` | `non_retenu`. DISTINCTE du statut de suivi. Seuls les éléments `a_traiter` sont accessibles à l'exécuteur (contexte de cadrage).",
   inputSchema: {
     itemId: z.number().int(),
-    decision: z.enum(EVALUATION_ITEM_DECISIONS).describe("pending | a_traiter | non_retenu."),
+    decision: z.enum(RECETTE_ITEM_DECISIONS).describe("pending | a_traiter | non_retenu."),
     by: z.string().optional().describe("Auteur de la décision (admin)."),
   },
 }, async ({ itemId, decision, by }) => {
   try {
-    const item = await setEvaluationItemDecision({ itemId, decision, by });
+    const item = await setRecetteItemDecision({ itemId, decision, by });
     return text(JSON.stringify({ ok: true, item }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-// === evaluation_items_treatable (contexte de sélection de l'exécuteur) ===
-server.registerTool("evaluation_items_treatable", {
+// === recette_items_treatable (contexte de sélection de l'exécuteur) ===
+registerEvalTool("recette_items_treatable", {
   description: "Liste les ÉLÉMENTS DE RECETTE ÉVALUATEUR « à traiter » (décision admin = `a_traiter`), seuls accessibles à l'exécuteur comme entrée de contexte d'un cadrage technique. Inclut le traçage `reprisPar` (cadrage(s) ayant repris l'élément).",
   inputSchema: { project: z.string().optional().describe("Projet (produit) — sinon tous.") },
 }, async ({ project }) => {
   try {
-    const items = await listTreatableEvaluationItems({ project });
+    const items = await listTreatableRecetteItems({ project });
     return text(JSON.stringify({ count: items.length, items }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-// === cadrage_evaluation_item_* (reprise d'un élément par un cadrage) ===
-server.registerTool("cadrage_evaluation_item_link", {
+// === cadrage_recette_item_* (reprise d'un élément par un cadrage) ===
+server.registerTool("cadrage_recette_item_link", {
   description: "Reprend un ÉLÉMENT DE RECETTE ÉVALUATEUR dans un CADRAGE technique (lien additif, traçage « repris par le cadrage X »). GARDE : refuse un élément dont la décision admin n'est pas `a_traiter`.",
-  inputSchema: { cadrageId: z.string().describe("Cadrage technique (recette)."), itemId: z.number().int().describe("Élément d'évaluation.") },
+  inputSchema: { cadrageId: z.string().describe("Cadrage technique (cadrage)."), itemId: z.number().int().describe("Élément d'évaluation.") },
 }, async ({ cadrageId, itemId }) => {
   try {
-    const r = await linkCadrageEvaluationItem({ recetteId: cadrageId, itemId });
+    const r = await linkCadrageRecetteItem({ cadrageId: cadrageId, itemId });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("cadrage_evaluation_item_unlink", {
+server.registerTool("cadrage_recette_item_unlink", {
   description: "Détache un ÉLÉMENT DE RECETTE ÉVALUATEUR d'un CADRAGE technique (fin de la reprise « repris par le cadrage X »).",
   inputSchema: { cadrageId: z.string(), itemId: z.number().int() },
 }, async ({ cadrageId, itemId }) => {
   try {
-    const r = await unlinkCadrageEvaluationItem({ recetteId: cadrageId, itemId });
+    const r = await unlinkCadrageRecetteItem({ cadrageId: cadrageId, itemId });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("cadrage_evaluation_item_list", {
+server.registerTool("cadrage_recette_item_list", {
   description: "Liste les ÉLÉMENTS DE RECETTE ÉVALUATEUR repris par un CADRAGE technique (traçage « repris par le cadrage X »).",
   inputSchema: { cadrageId: z.string() },
 }, async ({ cadrageId }) => {
   try {
-    const items = await listCadrageEvaluationItems({ recetteId: cadrageId });
+    const items = await listCadrageRecetteItems({ cadrageId: cadrageId });
     return text(JSON.stringify({ count: items.length, items }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_item_delete", {
+registerEvalTool("recette_item_delete", {
   description: "Supprime un élément d'évaluation (recommandation/problème).",
   inputSchema: { itemId: z.number().int() },
 }, async ({ itemId }) => {
   try {
-    const r = await deleteEvaluationItem({ itemId });
+    const r = await deleteRecetteItem({ itemId });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_feature_link", {
+registerEvalTool("recette_feature_link", {
   description: "Rattache une FONCTIONNALITÉ à une évaluation (idempotent). Le VERDICT est porté par le lien (`verdict` optionnel).",
   inputSchema: {
-    evaluationId: z.string(),
+    recetteId: z.string(),
     featureId: z.string().describe("Fonctionnalité."),
-    verdict: z.enum(EVALUATION_VERDICTS).optional().describe("Verdict (conforme|non_conforme|a_ameliorer)."),
+    verdict: z.enum(RECETTE_VERDICTS).optional().describe("Verdict (conforme|non_conforme|a_ameliorer)."),
     verdictComment: z.string().optional().describe("Commentaire du verdict."),
   },
-}, async ({ evaluationId, featureId, verdict, verdictComment }) => {
+}, async ({ recetteId, featureId, verdict, verdictComment }) => {
   try {
-    const r = await linkEvaluationFeature({ evaluationId, featureId, verdict, verdictComment });
+    const r = await linkRecetteFeature({ recetteId, featureId, verdict, verdictComment });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_feature_unlink", {
+registerEvalTool("recette_feature_unlink", {
   description: "Détache une FONCTIONNALITÉ d'une évaluation.",
-  inputSchema: { evaluationId: z.string(), featureId: z.string() },
-}, async ({ evaluationId, featureId }) => {
+  inputSchema: { recetteId: z.string(), featureId: z.string() },
+}, async ({ recetteId, featureId }) => {
   try {
-    const r = await unlinkEvaluationFeature({ evaluationId, featureId });
+    const r = await unlinkRecetteFeature({ recetteId, featureId });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_rule_link", {
+registerEvalTool("recette_rule_link", {
   description: "Rattache une RÈGLE MÉTIER à une évaluation (idempotent).",
-  inputSchema: { evaluationId: z.string(), ruleId: z.string().describe("Règle métier.") },
-}, async ({ evaluationId, ruleId }) => {
+  inputSchema: { recetteId: z.string(), ruleId: z.string().describe("Règle métier.") },
+}, async ({ recetteId, ruleId }) => {
   try {
-    const r = await linkEvaluationRule({ evaluationId, ruleId });
+    const r = await linkRecetteRule({ recetteId, ruleId });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_rule_unlink", {
+registerEvalTool("recette_rule_unlink", {
   description: "Détache une RÈGLE MÉTIER d'une évaluation.",
-  inputSchema: { evaluationId: z.string(), ruleId: z.string() },
-}, async ({ evaluationId, ruleId }) => {
+  inputSchema: { recetteId: z.string(), ruleId: z.string() },
+}, async ({ recetteId, ruleId }) => {
   try {
-    const r = await unlinkEvaluationRule({ evaluationId, ruleId });
+    const r = await unlinkRecetteRule({ recetteId, ruleId });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_verdict_set", {
+registerEvalTool("recette_verdict_set", {
   description: "Positionne le VERDICT d'une fonctionnalité DÉJÀ rattachée à l'évaluation (conforme|non_conforme|a_ameliorer).",
   inputSchema: {
-    evaluationId: z.string(),
+    recetteId: z.string(),
     fonctionnaliteId: z.string().describe("Fonctionnalité rattachée."),
-    verdict: z.enum(EVALUATION_VERDICTS).optional().describe("Verdict (null pour effacer)."),
+    verdict: z.enum(RECETTE_VERDICTS).optional().describe("Verdict (null pour effacer)."),
     verdictComment: z.string().optional(),
   },
-}, async ({ evaluationId, fonctionnaliteId, verdict, verdictComment }) => {
+}, async ({ recetteId, fonctionnaliteId, verdict, verdictComment }) => {
   try {
-    const r = await setEvaluationVerdict({ evaluationId, fonctionnaliteId, verdict, verdictComment });
+    const r = await setRecetteVerdict({ recetteId, fonctionnaliteId, verdict, verdictComment });
     return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_doc_add", {
-  description: "Rattache une PIÈCE à une évaluation (recette évaluateur) : `nature` (lien | document | photo | video) + `source` (import d'un chemin, ou artifact existant) + `path`/`artifactId`. Les PHOTOS et VIDÉOS sont ADMISES (preuves visuelles : captures, photos, vidéos de parcours) — la garde photo/vidéo des pièces CLIENT de sprint ne s'applique PAS à cette famille. `itemId` optionnel rattache la pièce à un ÉLÉMENT précis (sinon pièce au niveau de l'évaluation). Famille isolée (`doc_type='evaluation_doc'`), validée par la garde ciblée `assertEvaluationDocAllowed`.",
+registerEvalTool("recette_doc_add", {
+  description: "Rattache une PIÈCE à une évaluation (recette évaluateur) : `nature` (lien | document | photo | video) + `source` (import d'un chemin, ou artifact existant) + `path`/`artifactId`. Les PHOTOS et VIDÉOS sont ADMISES (preuves visuelles : captures, photos, vidéos de parcours) — la garde photo/vidéo des pièces CLIENT de sprint ne s'applique PAS à cette famille. `itemId` optionnel rattache la pièce à un ÉLÉMENT précis (sinon pièce au niveau de l'évaluation). Famille isolée (`doc_type='recette_doc'`), validée par la garde ciblée `assertRecetteDocAllowed`.",
   inputSchema: {
-    evaluationId: z.string(),
+    recetteId: z.string(),
     title: z.string().optional(),
-    nature: z.enum(EVALUATION_DOC_NATURES).optional().describe("Nature : lien | document | photo | video (déduite de l'extension si absente ; 'lien' si l'URL est passée en path). PHOTOS et VIDÉOS admises."),
+    nature: z.enum(RECETTE_DOC_NATURES).optional().describe("Nature : lien | document | photo | video (déduite de l'extension si absente ; 'lien' si l'URL est passée en path). PHOTOS et VIDÉOS admises."),
     source: z.enum(["import", "artifact"]).default("import"),
     path: z.string().optional().describe("Chemin / URL de la pièce (mode import)."),
     artifactId: z.string().optional().describe("Artefact existant à lier (mode artifact)."),
     itemId: z.number().int().optional().describe("Élément d'évaluation porteur de la pièce (optionnel)."),
   },
-}, async ({ evaluationId, title, nature, source, path, artifactId, itemId }) => {
+}, async ({ recetteId, title, nature, source, path, artifactId, itemId }) => {
   try {
     let finalPath = path;
     if (source === "artifact") {
@@ -2796,34 +2455,34 @@ server.registerTool("evaluation_doc_add", {
       if (!a) return err(`artefact inconnu : ${artifactId}`);
       finalPath = a.path;
     }
-    const documents = await addEvaluationDocument({ evaluationId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null, itemId });
+    const documents = await addRecetteDocument({ recetteId, title, nature, source, path: finalPath, artifactId: source === "artifact" ? artifactId : null, itemId });
     return text(JSON.stringify({ ok: true, documents }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-// === evaluation_maquette_add (MAQUETTE HTML/CSS/JS servie par le panneau) ===
+// === recette_maquette_add (MAQUETTE HTML/CSS/JS servie par le panneau) ===
 // L'évaluateur dépose une maquette (données mock) pour la fonctionnalité
 // évaluée ; elle est écrite sous `EVALUATION_MAQUETTE_DIR` et SERVie par le
 // panneau comme PAGE STATIQUE accessible par URL (`meta.url`), rattachable à un
-// élément de recette (`itemId`). Nature de pièce `maquette` (famille
-// `evaluation_doc`) — aucune table neuve (convergence ADR-003).
-server.registerTool("evaluation_maquette_add", {
-  description: "Dépose une MAQUETTE (HTML/CSS/JS, données mock) sur une recette évaluateur et renvoie une URL consultable servie par le panneau (`/api/evaluations/<evaluationId>/maquette/<slug>/<entry>`). `files` = liste de { path, content } (chemins RELATIFS, ex. index.html, style.css, app.js) ; `entry` = fichier d'entrée (défaut index.html). `itemId` (optionnel) rattache la maquette à un ÉLÉMENT précis. La pièce est de nature `maquette` (famille `evaluation_doc`).",
+// élément de cadrage (`itemId`). Nature de pièce `maquette` (famille
+// `recette_doc`) — aucune table neuve (convergence ADR-003).
+registerEvalTool("recette_maquette_add", {
+  description: "Dépose une MAQUETTE (HTML/CSS/JS, données mock) sur une recette évaluateur et renvoie une URL consultable servie par le panneau (`/api/recettes/<recetteId>/maquette/<slug>/<entry>`). `files` = liste de { path, content } (chemins RELATIFS, ex. index.html, style.css, app.js) ; `entry` = fichier d'entrée (défaut index.html). `itemId` (optionnel) rattache la maquette à un ÉLÉMENT précis. La pièce est de nature `maquette` (famille `recette_doc`).",
   inputSchema: {
-    evaluationId: z.string(),
+    recetteId: z.string(),
     title: z.string().optional().describe("Titre lisible de la maquette."),
     entry: z.string().optional().describe("Fichier d'entrée (défaut : index.html)."),
     files: z.array(z.object({ path: z.string(), content: z.string() })).describe("Fichiers de la maquette : { path (relatif), content }."),
     itemId: z.number().int().optional().describe("Élément d'évaluation porteur (optionnel)."),
   },
-}, async ({ evaluationId, title, entry, files, itemId }) => {
+}, async ({ recetteId, title, entry, files, itemId }) => {
   try {
-    const r = await addEvaluationMaquette({ evaluationId, title, entry, files, itemId });
-    return text(JSON.stringify({ ok: true, evaluationId: r.evaluationId, url: r.url, entry: r.entry, document: r.document, documents: r.documents }, null, 2));
+    const r = await addRecetteMaquette({ recetteId, title, entry, files, itemId });
+    return text(JSON.stringify({ ok: true, recetteId: r.recetteId, url: r.url, entry: r.entry, document: r.document, documents: r.documents }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-// === evaluation_perf_run (TESTS STANDARD préprod) ==========================
+// === recette_perf_run (TESTS STANDARD préprod) ==========================
 // Lance des TESTS STANDARD (distincts des tests E2E Playwright) sur une cible
 // PRÉPROD : parcours de pages avec informations réseau (durées/requêtes/types/
 // tailles/compression) + CAPTURE DES ERREURS CONSOLE (warnings, exceptions JS)
@@ -2832,18 +2491,18 @@ server.registerTool("evaluation_maquette_add", {
 // parallèles bornés : débit, latence moy/p95/p99, taux d'erreurs, par route).
 // Le moteur est le runner `perf-runner.mjs` du panneau (Playwright résolu depuis
 // `repoDir`) ; le rapport est enregistré comme pièce `performance` (famille
-// `evaluation_doc`). BORNÉ volontairement (pages ≤ 10, routes ≤ 20,
+// `recette_doc`). BORNÉ volontairement (pages ≤ 10, routes ≤ 20,
 // concurrency ≤ 10, requests ≤ 200) pour ne pas dégrader la préprod. Peut être
 // rattaché à un test Playwright (`e2eTestId`).
-const EVALUATION_PERF_DIR = process.env.EVALUATION_PERF_DIR || "/root/orchestrator-panel/storage/evaluation-perf";
-const EVALUATION_PERF_RUNNER = process.env.EVALUATION_PERF_RUNNER || "/root/orchestrator-panel/perf-runner.mjs";
+const RECETTE_PERF_DIR = process.env.EVALUATION_PERF_DIR || "/root/orchestrator-panel/storage/evaluation-perf";
+const RECETTE_PERF_RUNNER = process.env.RECETTE_PERF_RUNNER || "/root/orchestrator-panel/perf-runner.mjs";
 const PERF_MAX_CONCURRENCY = 10;
 const PERF_MAX_REQUESTS = 200;
 
-server.registerTool("evaluation_perf_run", {
+registerEvalTool("recette_perf_run", {
   description: "Lance des TESTS STANDARD (distincts des tests E2E Playwright) sur une cible PRÉPROD : (1) PARCOURS de pages avec informations réseau (durées/requêtes/types/tailles, compression, timings TTFB/DCL/load) ET capture des ERREURS CONSOLE (warnings, exceptions JS) + ERREURS RÉSEAU (4xx/5xx, DNS, timeouts) ; (2) métriques Core Web Vitals (LCP < 2,5 s, INP < 200 ms, CLS < 0,1) + long tasks > 50 ms + temps d'exécution JS + poids/compression par type ; (3) STRESS TEST des ROUTES D'API (accès parallèles bornés : débit req/s, latence moy/p95/p99, taux d'erreurs — par route + agrégat). Le rapport est rattaché à la recette évaluateur comme pièce `performance`. `pages` (optionnel) = parcours multi-pages (défaut : `url`) ; `routes` (optionnel) = routes d'API à stresser (relatives à `baseUrl` ou absolues ; défaut : `url`). `repoDir` = checkout applicatif contenant Playwright (ex. /root/mada-talk-preprod) ; sans Playwright, mesure réseau/stress via fetch (Core Web Vitals/console indisponibles). `e2eTestId` (optionnel) rattache la mesure à un test Playwright. BORNÉ : pages ≤ 10, routes ≤ 20, concurrency ≤ 10, requests ≤ 200.",
   inputSchema: {
-    evaluationId: z.string(),
+    recetteId: z.string(),
     url: z.string().describe("URL cible préprod (http/https) — première page du parcours."),
     pages: z.array(z.string()).optional().describe("Parcours multi-pages (URLs http/https, ≤ 10 ; défaut : [url])."),
     routes: z.array(z.union([
@@ -2859,14 +2518,14 @@ server.registerTool("evaluation_perf_run", {
     title: z.string().optional().describe("Titre lisible du rapport."),
     timeoutMs: z.number().int().optional().describe("Timeout du runner (ms, plafonné à 30 min)."),
   },
-}, async ({ evaluationId, url, pages, routes, repoDir, baseUrl, concurrency, requests, itemId, e2eTestId, title, timeoutMs }) => {
+}, async ({ recetteId, url, pages, routes, repoDir, baseUrl, concurrency, requests, itemId, e2eTestId, title, timeoutMs }) => {
   try {
-    if (!evaluationId) return err("evaluationId requis");
+    if (!recetteId) return err("recetteId requis");
     if (!url || !/^https?:\/\//i.test(String(url))) return err("url préprod requise (http/https)");
-    if (!existsSync(EVALUATION_PERF_RUNNER)) return err(`runner de performance introuvable : ${EVALUATION_PERF_RUNNER} (définir EVALUATION_PERF_RUNNER)`);
+    if (!existsSync(RECETTE_PERF_RUNNER)) return err(`runner de performance introuvable : ${RECETTE_PERF_RUNNER} (définir RECETTE_PERF_RUNNER)`);
     const conc = Math.min(PERF_MAX_CONCURRENCY, Math.max(1, Number(concurrency) || 5));
     const reqs = Math.min(PERF_MAX_REQUESTS, Math.max(1, Number(requests) || 50));
-    const outDir = join(EVALUATION_PERF_DIR, String(evaluationId), `perf-${Date.now().toString(36)}`);
+    const outDir = join(RECETTE_PERF_DIR, String(recetteId), `perf-${Date.now().toString(36)}`);
     mkdirSync(outDir, { recursive: true });
     const payloadFile = join(outDir, "payload.json");
     const pageList = Array.isArray(pages) ? pages.map((p) => String(p)).filter((p) => /^https?:\/\//i.test(p)).slice(0, 10) : [];
@@ -2876,10 +2535,10 @@ server.registerTool("evaluation_perf_run", {
         .filter((r) => r && r.path)
         .slice(0, 20)
       : [];
-    writeFileSync(payloadFile, JSON.stringify({ evaluationId, url: String(url), pages: pageList, routes: routeList, repoDir: repoDir || null, baseUrl: baseUrl || null, concurrency: conc, requests: reqs, outDir }, null, 2));
+    writeFileSync(payloadFile, JSON.stringify({ recetteId, url: String(url), pages: pageList, routes: routeList, repoDir: repoDir || null, baseUrl: baseUrl || null, concurrency: conc, requests: reqs, outDir }, null, 2));
     let stdout = "";
     try {
-      stdout = execFileSync("node", [EVALUATION_PERF_RUNNER, payloadFile], {
+      stdout = execFileSync("node", [RECETTE_PERF_RUNNER, payloadFile], {
         encoding: "utf8",
         maxBuffer: 64 * 1024 * 1024,
         timeout: Math.max(60000, Math.min(30 * 60 * 1000, Number(timeoutMs) || 10 * 60 * 1000)),
@@ -2894,29 +2553,29 @@ server.registerTool("evaluation_perf_run", {
     if (!report || typeof report !== "object") return err("rapport de performance illisible (report.json absent ou invalide)");
     const metrics = report.metrics && typeof report.metrics === "object" ? report.metrics : report;
     const summary = report.summary || `Perf ${String(url)} — ${(report.warnings || []).length ? "avec avertissements" : "OK"}`;
-    const saved = await addEvaluationPerfResult({ evaluationId, title, reportPath: reportFile, metrics, summary, itemId, e2eTestId });
-    return text(JSON.stringify({ ok: true, evaluationId, report, document: saved.document, documents: saved.documents }, null, 2));
+    const saved = await addRecettePerfResult({ recetteId, title, reportPath: reportFile, metrics, summary, itemId, e2eTestId });
+    return text(JSON.stringify({ ok: true, recetteId, report, document: saved.document, documents: saved.documents }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_doc_remove", {
+registerEvalTool("recette_doc_remove", {
   description: "Retire une PIÈCE d'une évaluation.",
   inputSchema: { documentId: z.number().int() },
 }, async ({ documentId }) => {
   try {
-    const evaluationId = await removeEvaluationDocument(documentId);
-    if (!evaluationId) return err(`document inconnu : ${documentId}`);
-    return text(JSON.stringify({ ok: true, evaluationId, documents: await listEvaluationDocuments(evaluationId) }, null, 2));
+    const recetteId = await removeRecetteDocument(documentId);
+    if (!recetteId) return err(`document inconnu : ${documentId}`);
+    return text(JSON.stringify({ ok: true, recetteId, documents: await listRecetteDocuments(recetteId) }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
-server.registerTool("evaluation_confirm", {
+registerEvalTool("recette_confirm", {
   description: "Clôt une évaluation (statut 'done') SANS convertir en tâches. Les éléments restent attachés à l'évaluation.",
-  inputSchema: { evaluationId: z.string(), confirmedBy: z.string().optional() },
-}, async ({ evaluationId, confirmedBy }) => {
+  inputSchema: { recetteId: z.string(), confirmedBy: z.string().optional() },
+}, async ({ recetteId, confirmedBy }) => {
   try {
-    const evaluation = await confirmEvaluation({ evaluationId, confirmedBy });
-    return text(JSON.stringify({ ok: true, evaluation }, null, 2));
+    const recette = await confirmRecette({ recetteId, confirmedBy });
+    return text(JSON.stringify({ ok: true, recette }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
@@ -2924,20 +2583,20 @@ server.registerTool("evaluation_confirm", {
 // Phase 1 : lecture + enregistrement (aucun auto-avancement). Readiness et
 // matrice de conflit fichiers sont CALCULÉES à la volée.
 server.registerTool("batch_register", {
-  description: "Enregistre un batch d'orchestration : groupe de tâches pilotées par une session d'orchestration unique. Source naturelle = recette (recetteId) ou ad-hoc. maxParallel = plafond d'écrivains simultanés (défaut 2). launchMode : batch (le worker batch-pilot lance les tâches automatiquement) | session (une session orchestrateur unique pilote le batch) | manual (aucun auto-lancement — l'utilisateur lance chaque tâche).",
+  description: "Enregistre un batch d'orchestration : groupe de tâches pilotées par une session d'orchestration unique. Source naturelle = cadrage (cadrageId) ou ad-hoc. maxParallel = plafond d'écrivains simultanés (défaut 2). launchMode : batch (le worker batch-pilot lance les tâches automatiquement) | session (une session orchestrateur unique pilote le batch) | manual (aucun auto-lancement — l'utilisateur lance chaque tâche).",
   inputSchema: {
     project: z.string().describe("Projet (produit) cible du batch."),
     title: z.string().describe("Titre court du batch."),
-    recetteId: z.string().optional().describe("Recette source (si le batch regroupe les tâches d'une recette)."),
+    cadrageId: z.string().optional().describe("Cadrage source (si le batch regroupe les tâches d'un cadrage)."),
     taskIds: z.array(z.string()).optional().describe("Tâches du batch (0..N)."),
     maxParallel: z.number().int().min(1).max(8).optional().describe("Plafond d'écrivains simultanés (défaut 2)."),
     launchMode: z.enum(["batch", "session", "manual"]).optional().describe("Mode de lancement (défaut batch)."),
     sessionId: z.string().optional().describe("Session d'orchestration unique (rattachée après lancement)."),
     createdBy: z.string().optional(),
   },
-}, async ({ project, title, recetteId, taskIds, maxParallel, launchMode, sessionId, createdBy }) => {
+}, async ({ project, title, cadrageId, taskIds, maxParallel, launchMode, sessionId, createdBy }) => {
   try {
-    const batch = await createBatch({ project, title, recetteId, taskIds, maxParallel: maxParallel || 2, launchMode: launchMode || "batch", sessionId: sessionId || null, createdBy });
+    const batch = await createBatch({ project, title, cadrageId, taskIds, maxParallel: maxParallel || 2, launchMode: launchMode || "batch", sessionId: sessionId || null, createdBy });
     return text(JSON.stringify({ ok: true, batch }, null, 2));
   } catch (e) {
     return err(e.message);
@@ -3055,7 +2714,7 @@ server.registerTool("batch_conflict_matrix", {
 
 // === organisations (v0.9.47) — tenant de premier niveau ======================
 server.registerTool("org_register", {
-  description: "Enregistre (ou met à jour) une ORGANISATION (tenant) : id (slug), nom, description. Les entités de 1er niveau (projets, repos, tâches, recettes, tests, docs, artefacts) portent organization_id.",
+  description: "Enregistre (ou met à jour) une ORGANISATION (tenant) : id (slug), nom, description. Les entités de 1er niveau (projets, repos, tâches, cadrages, tests, docs, artefacts) portent organization_id.",
   inputSchema: {
     id: z.string().describe("Identifiant/slug de l'organisation (ex. onirtech)."),
     name: z.string().describe("Nom lisible (ex. ONIRTECH)."),
@@ -3258,10 +2917,10 @@ server.registerTool("task_transition", {
     const exec = await getCurrentExecution(taskId);
     if (!exec) return err(`tâche inconnue : ${taskId}`);
     if (!isValidState(to)) return err(`statut invalide : ${to}`);
-    // Garde (v0.5.2) : une recette en cours ou terminée clôture la tâche (aucune transition) — aucune transition.
+    // Garde (v0.5.2) : un cadrage en cours ou terminée clôture la tâche (aucune transition) — aucune transition.
     const task = await getTask(taskId);
-    if (task && ["in_progress","approved","done"].includes(task.recetteStatus)) {
-      return err(`recette en cours ou terminée : la tâche ${taskId} est clôturée, aucune transition (${to}) n'est autorisée`);
+    if (task && ["in_progress","approved","done"].includes(task.cadrageStatus)) {
+      return err(`cadrage en cours ou terminée : la tâche ${taskId} est clôturée, aucune transition (${to}) n'est autorisée`);
     }
     if (!canTaskTransition(exec.status, to)) {
       await logTransitionError({ taskId, from: exec.status, to, by: by || "orchestrator", reason: `non autorisé depuis ${exec.status}` });
@@ -3486,7 +3145,7 @@ server.registerTool("decision_request", {
     "Enregistre une décision humaine en attente (validation de plan, review/merge ou permission) avec échéance (expiresAt).",
   inputSchema: {
     taskId: z.string(),
-    kind: z.enum(["validation", "review", "permission", "recette"]).default("validation"),
+    kind: z.enum(["validation", "review", "permission", "cadrage"]).default("validation"),
     ttlMinutes: z.number().int().optional().describe("Durée de validité avant expiration (défaut 2880 = 48h)."),
     expiresAt: z.string().optional().describe("Échéance ISO 8601 (sinon calculée via ttlMinutes)."),
     detail: z.string().optional().describe("Contexte/détail de la décision (ex: nom du plan, résumé des changements)."),
@@ -3498,9 +3157,9 @@ server.registerTool("decision_request", {
   try {
     const task = await getTask(taskId);
     if (!task) return err(`tâche inconnue : ${taskId}`);
-    // Garde (v0.5.2) : recette en cours ou terminée → aucune nouvelle décision.
-    if (["in_progress","approved","done"].includes(task.recetteStatus)) {
-      return err(`recette en cours ou terminée : la tâche ${taskId} est clôturée, aucune nouvelle décision (${kind}) n'est autorisée`);
+    // Garde (v0.5.2) : cadrage en cours ou terminée → aucune nouvelle décision.
+    if (["in_progress","approved","done"].includes(task.cadrageStatus)) {
+      return err(`cadrage en cours ou terminée : la tâche ${taskId} est clôturée, aucune nouvelle décision (${kind}) n'est autorisée`);
     }
     const d = await requestDecision({ taskId, kind, expiresAt, ttlMinutes: ttlMinutes ?? 2880, detail, requestedBy: by, sessionId, planId });
     return text(JSON.stringify({ ok: true, decision: d }, null, 2));
@@ -3511,7 +3170,7 @@ server.registerTool("decision_request", {
 
 // === decision_resolve ===
 server.registerTool("decision_resolve", {
-  description: "Clôt une décision humaine (approved/rejected). Pour kind=validation/review, provoque la transition atomique vers approved/rejected + événement CLOSED (remarques). Pour kind=recette, tranche la recette (colonne recette_status) sans toucher au statut d'exécution.",
+  description: "Clôt une décision humaine (approved/rejected). Pour kind=validation/review, provoque la transition atomique vers approved/rejected + événement CLOSED (remarques). Pour kind=cadrage, tranche le cadrage (colonne cadrage_status) sans toucher au statut d'exécution.",
   inputSchema: {
     decisionId: z.string(),
     status: z.enum(["approved", "rejected"]),
@@ -3528,33 +3187,33 @@ server.registerTool("decision_resolve", {
   }
 });
 
-// === task_recette ===
+// === task_cadrage ===
 server.registerTool("task_recette", {
   description:
-    "Tranche la recette (acceptation humaine après déploiement) d'une tâche au statut 'done' : approved/rejected + remarques, tracée comme décision kind='recette'. Colonne recette_status (indépendante du statut d'exécution).",
+    "Tranche le cadrage (acceptation humaine après déploiement) d'une tâche au statut 'done' : approved/rejected + remarques, tracée comme décision kind='cadrage'. Colonne cadrage_status (indépendante du statut d'exécution).",
   inputSchema: {
     taskId: z.string(),
     status: z.enum(["approved", "rejected"]),
-    resolution: z.string().optional().describe("Remarques de recette (ex: ce qui manque en cas de rejet)."),
+    resolution: z.string().optional().describe("Remarques de cadrage (ex: ce qui manque en cas de rejet)."),
     by: z.string().optional().describe("Acteur (ex: human)."),
   },
 }, async ({ taskId, status, resolution, by }) => {
   try {
-    const r = await resolveRecette({ taskId, status, resolution, by });
+    const r = await resolveCadrage({ taskId, status, resolution, by });
     return text(JSON.stringify(r, null, 2));
   } catch (e) {
     return err(e.message);
   }
 });
 
-// === task_recette_reset ===
+// === task_cadrage_reset ===
 server.registerTool("task_recette_reset", {
-  description: "Remet la recette d'une tâche à 'pending' (début d'une reprise après rejet de recette).",
+  description: "Remet le cadrage d'une tâche à 'pending' (début d'une reprise après rejet de cadrage).",
   inputSchema: { taskId: z.string() },
 }, async ({ taskId }) => {
   try {
-    const task = await resetRecette(taskId);
-    return text(JSON.stringify({ ok: true, taskId, recetteStatus: task.recetteStatus }, null, 2));
+    const task = await resetCadrage(taskId);
+    return text(JSON.stringify({ ok: true, taskId, cadrageStatus: task.cadrageStatus }, null, 2));
   } catch (e) {
     return err(e.message);
   }
@@ -3572,13 +3231,13 @@ server.registerTool("plan_transition", {
   },
 }, async ({ planId, to, by, note }) => {
   try {
-    // Garde (v0.5.2) : si la tâche liée au plan a une recette déjà validée → refus.
+    // Garde (v0.5.2) : si la tâche liée au plan a un cadrage déjà validé → refus.
     const planTaskId = await findPlanTask(planId).catch(() => null);
     if (planTaskId) {
       const task = await getTask(planTaskId);
-      if (task && ["in_progress","approved","done"].includes(task.recetteStatus)) {
-        await logTransitionError({ taskId: planTaskId, to, by: by || "orchestrator", reason: "recette en cours ou terminée — tâche clôturée" });
-        return err(`recette en cours ou terminée : la tâche ${planTaskId} (plan ${planId}) est clôturée, aucune transition de plan (${to}) n'est autorisée`);
+      if (task && ["in_progress","approved","done"].includes(task.cadrageStatus)) {
+        await logTransitionError({ taskId: planTaskId, to, by: by || "orchestrator", reason: "cadrage en cours ou terminée — tâche clôturée" });
+        return err(`cadrage en cours ou terminée : la tâche ${planTaskId} (plan ${planId}) est clôturée, aucune transition de plan (${to}) n'est autorisée`);
       }
     }
     const r = await applyPlanTransition({ planId, to, by: by || "orchestrator", note });
@@ -3678,12 +3337,12 @@ server.registerTool("decision_expired", {
 
 // === artifact_add ===
 // Gestionnaire central polymorphe (T-20260920-162801-jxtr) : `docType` + `contentId`
-// identifient l'entité porteuse (tâche/recette/projet/doc) ; `kind` = NATURE.
+// identifient l'entité porteuse (tâche/cadrage/projet/doc) ; `kind` = NATURE.
 // Rétrocompat : `artifact_add(taskId, kind, path)` reste fonctionnel (docType
 // dérivé de kind, contentId = taskId). Cf. `public/docs/nomenclature-doc-type.md`.
 server.registerTool("artifact_add", {
   description:
-    "Rattache un artefact (document/livrable) à une ENTITÉ porteuse via le couple (docType, contentId) — gestionnaire central polymorphe. docType : taxonomie (adr|specs|gherkin|project_doc|adr_file|plan|task_synthese|task_report|audit_report|recette_report|recette_doc|e2e_report|e2e_video|autre). kind = NATURE (plan|audit|report|autre). Rétrocompat : taskId seul + kind suffit (docType dérivé de kind, contentId = taskId). `path` = chemin absolu hôte lisible (téléchargement/visionneuse).",
+    "Rattache un artefact (document/livrable) à une ENTITÉ porteuse via le couple (docType, contentId) — gestionnaire central polymorphe. docType : taxonomie (adr|specs|gherkin|project_doc|adr_file|plan|task_synthese|task_report|audit_report|cadrage_report|cadrage_doc|e2e_report|e2e_video|autre). kind = NATURE (plan|audit|report|autre). Rétrocompat : taskId seul + kind suffit (docType dérivé de kind, contentId = taskId). `path` = chemin absolu hôte lisible (téléchargement/visionneuse).",
   inputSchema: {
     taskId: z.string().optional().describe("Entité porteuse (rétrocompat famille task) — requis si docType ∈ famille task."),
     docType: z.enum(DOC_TYPES).optional().describe("Type d'artefact (défaut dérivé de kind : plan|audit_report|task_report|autre)."),
@@ -3837,7 +3496,7 @@ server.registerTool("e2e_test_incoherent", {
   inputSchema: {
     e2eTestId: z.string(),
     remarks: z.string().describe("Remarques obligatoires décrivant l'incohérence constatée (comportement réel ≠ scénario)."),
-    by: z.string().optional().describe("Auteur du marquage (ex. évaluateur / recette)."),
+    by: z.string().optional().describe("Auteur du marquage (ex. évaluateur / cadrage)."),
   },
 }, async ({ e2eTestId, remarks, by }) => {
   try {
@@ -4339,7 +3998,7 @@ server.registerTool("e2e_run", {
       } else {
         reg = await upsertE2ETest({ project: resolvedProject, specFile: res.specFile, scenario: res.scenario, title: res.title, coveredProjects: [resolvedProject] });
       }
-      if (taskId) await linkTaskE2E({ taskId, e2eTestId: reg.id, relationType: res.relation || "REGRESSION", reason: res.reason || "Run déclenché par la recette/vérification" });
+      if (taskId) await linkTaskE2E({ taskId, e2eTestId: reg.id, relationType: res.relation || "REGRESSION", reason: res.reason || "Run déclenché par le cadrage/vérification" });
       const rec = await recordE2EExecution({ e2eTestId: reg.id, origin: runOrigin, taskId, env: "external", commitSha: manifest.commitSha || null, branch: manifest.branch || null, attempts: manifest.attempts || 1, paramValues: Object.keys(paramOverrides).length ? { ...paramOverrides, varsInjected: injectedVars.length ? injectedVars : undefined, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : ((injectedVars.length || injectedSecrets.length) ? { varsInjected: injectedVars.length ? injectedVars : undefined, secretsInjected: injectedSecrets.length ? injectedSecrets : undefined } : null) });
       const outDir = join("/root/orchestrator-panel/storage/e2e/runs", runId);
       mkdirSync(outDir, { recursive: true });

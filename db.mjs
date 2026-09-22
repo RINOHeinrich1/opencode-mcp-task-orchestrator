@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-evaluation-session";
+const SCHEMA_VERSION = "2026-09-22-nomenclature-cadrage-recette";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -77,6 +77,24 @@ async function ensureSchema() {
         await client.query("SELECT pg_advisory_lock($1)", [SCHEMA_LOCK_KEY]);
         // Re-check après acquisition : un autre process a pu appliquer entre-temps.
         if ((await readSchemaVersion()) !== SCHEMA_VERSION) {
+          // PREFLIGHT ANTI-COLLISION (ADR-004, A008) — exécuté AVANT `schema.sql` :
+          // si la base porte l'ANCIENNE table `recettes` (cadrage technique legacy)
+          // SANS la nouvelle table `cadrages`, c'est une base NON migrée. Sans ce
+          // garde, `CREATE TABLE IF NOT EXISTS cadrages` créerait une table VIDE et
+          // masquerait les données legacy (32 cadrages / 115 éléments en base réelle).
+          // La migration est EXPLICITE (décision humaine) — aucun renommage auto.
+          const pre = await client.query(
+            `SELECT to_regclass('public.recettes')  AS old_recettes,
+                    to_regclass('public.cadrages')  AS new_cadrages`,
+          );
+          if (pre.rows[0].old_recettes && !pre.rows[0].new_cadrages) {
+            throw new Error(
+              "nomenclature ADR-004 NON MIGRÉE : la table `recettes` (cadrage technique legacy) " +
+              "existe sans la table `cadrages`. Appliquez d'abord la migration explicite : " +
+              "`node scripts/migrate-nomenclature-cadrage-recette.mjs` (--dry-run par défaut ; " +
+              "--apply sur DÉCISION HUMAINE). Voir ADR-004 (nomenclature Cadrage CT-* / Recette RECT-*).",
+            );
+          }
           await client.query(readFileSync(join(__dirname, "schema.sql"), "utf8"));
           await migrate();
           await writeSchemaVersion(SCHEMA_VERSION);
@@ -100,42 +118,42 @@ async function migrate() {
   await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS main_branch TEXT");
   // Phase 3 — interleaving fin : fichiers par étape de plan (déclarés).
   await pool().query("ALTER TABLE plan_steps ADD COLUMN IF NOT EXISTS files TEXT");
-  // Recette — capture structurée du besoin TEST (créer/modifier/obsoléter un test).
-  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS test_intent TEXT");
-  // Recette — capture structurée du besoin DOCUMENT (ADR/specs/Gherkin à faire évoluer).
-  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS doc_intent TEXT");
+  // Cadrage — capture structurée du besoin TEST (créer/modifier/obsoléter un test).
+  await pool().query("ALTER TABLE cadrage_items ADD COLUMN IF NOT EXISTS test_intent TEXT");
+  // Cadrage — capture structurée du besoin DOCUMENT (ADR/specs/Gherkin à faire évoluer).
+  await pool().query("ALTER TABLE cadrage_items ADD COLUMN IF NOT EXISTS doc_intent TEXT");
   // Batch — mode de lancement : batch (worker auto) | session (session unique) | manual.
   await pool().query("ALTER TABLE batches ADD COLUMN IF NOT EXISTS launch_mode TEXT NOT NULL DEFAULT 'batch'");
   // E2E (cadrage 08) : checkout hôte où s'exécutent les runs + URL de test par défaut.
   await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS e2e_repo_dir TEXT");
   await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS e2e_base_url TEXT");
-  await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS project TEXT");
-  await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS title TEXT");
-  await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS description TEXT");
+  await pool().query("ALTER TABLE cadrages ADD COLUMN IF NOT EXISTS project TEXT");
+  await pool().query("ALTER TABLE cadrages ADD COLUMN IF NOT EXISTS title TEXT");
+  await pool().query("ALTER TABLE cadrages ADD COLUMN IF NOT EXISTS description TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS title TEXT");
-  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS recette_id TEXT");
+  await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cadrage_id TEXT");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS direct_execution INTEGER NOT NULL DEFAULT 0");
   // E2E : raison d'un SKIP / échec (précondition de données manquante, bug…).
   await pool().query("ALTER TABLE e2e_executions ADD COLUMN IF NOT EXISTS skip_reason TEXT");
-  await pool().query(`CREATE TABLE IF NOT EXISTS recette_tasks (
-    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_tasks (
+    cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
     task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    PRIMARY KEY (recette_id, task_id)
+    PRIMARY KEY (cadrage_id, task_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id)");
-  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS title TEXT");
-  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS acceptance TEXT");
-  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS exec_order INTEGER");
-  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS vigilance TEXT");
-  // Recette : 1 recette = 1 PROJET unique (`recettes.project`). Les REPOS
-  // transverses du projet (project_repos) sont la portée réelle de la recette :
-  // le projet mada-talk traverse par ex. le repo oniria. `recette_items.project`
-  // (projet cible d'un item) = toujours le projet de la recette (rétrocompat).
-  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS project TEXT");
-  // Items legacy sans projet cible → projet de leur recette.
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_tasks_task ON cadrage_tasks(task_id)");
+  await pool().query("ALTER TABLE cadrage_items ADD COLUMN IF NOT EXISTS title TEXT");
+  await pool().query("ALTER TABLE cadrage_items ADD COLUMN IF NOT EXISTS acceptance TEXT");
+  await pool().query("ALTER TABLE cadrage_items ADD COLUMN IF NOT EXISTS exec_order INTEGER");
+  await pool().query("ALTER TABLE cadrage_items ADD COLUMN IF NOT EXISTS vigilance TEXT");
+  // Cadrage : 1 cadrage = 1 PROJET unique (`cadrages.project`). Les REPOS
+  // transverses du projet (project_repos) sont la portée réelle du cadrage :
+  // le projet mada-talk traverse par ex. le repo oniria. `cadrage_items.project`
+  // (projet cible d'un item) = toujours le projet du cadrage (rétrocompat).
+  await pool().query("ALTER TABLE cadrage_items ADD COLUMN IF NOT EXISTS project TEXT");
+  // Items legacy sans projet cible → projet de leur cadrage.
   await pool().query(
-    `UPDATE recette_items i SET project = COALESCE(i.project, r.project)
-     FROM recettes r WHERE r.recette_id = i.recette_id AND i.project IS NULL`,
+    `UPDATE cadrage_items i SET project = COALESCE(i.project, r.project)
+     FROM cadrages r WHERE r.cadrage_id = i.cadrage_id AND i.project IS NULL`,
   );
   // Tests E2E (cadrage 08) : entités de 1er niveau (indépendantes des tâches).
   // `project` = REPO SOURCE (où vit le spec) ; projets couverts en N:N via
@@ -222,7 +240,7 @@ async function migrate() {
     await pool().query("DROP TABLE IF EXISTS e2e_secrets");
   }
   // LEGACY (T-20260920-162801-jxtr) : `recette_documents` est fusionnée dans
-  // `artifacts` (doc_type ∈ {recette_doc, recette_report}, content_id = recetteId).
+  // `artifacts` (doc_type ∈ {cadrage_doc, cadrage_report}, content_id = cadrageId).
   // Une base NEUVE ne la crée plus ; les bases existantes sont migrées puis
   // neutralisées (renommée `legacy_recette_documents`) — JAMAIS supprimée.
   // =========================================================================
@@ -315,7 +333,7 @@ async function migrate() {
   )).rows.length > 0;
   if (hasArtifactsTaskId) {
     // Levée de contrainte (PAS un DROP de colonne) : les familles non-task
-    // (recette/docs/attachments) n'ont pas de `task_id`.
+    // (cadrage/docs/attachments) n'ont pas de `task_id`.
     await pool().query("ALTER TABLE artifacts ALTER COLUMN task_id DROP NOT NULL");
     await pool().query("UPDATE artifacts SET content_id = task_id WHERE content_id IS NULL");
   }
@@ -343,15 +361,15 @@ async function migrate() {
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conflicts_adr ON adr_conflicts(adr_id)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_conflicts_status ON adr_conflicts(status)");
-  // Points de vigilance ADR en recette/test (item 126) : DDL identique à
+  // Points de vigilance ADR en cadrage/test (item 126) : DDL identique à
   // schema.sql (source logique) pour créer la table sur une base PostgreSQL
   // déjà migrée, de façon idempotente. APPEND-ONLY (aucun DELETE) ; seul
-  // `status` transite open → resolved. `recettes` existe (schema.sql appliqué
+  // `status` transite open → resolved. `cadrages` existe (schema.sql appliqué
   // en amont par ensureSchema) → FK valide.
   await pool().query(`CREATE TABLE IF NOT EXISTS adr_vigilances (
     vigilance_id    TEXT PRIMARY KEY,
     project         TEXT NOT NULL,
-    recette_id      TEXT REFERENCES recettes(recette_id) ON DELETE CASCADE,
+    cadrage_id      TEXT REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
     task_id         TEXT REFERENCES tasks(id) ON DELETE SET NULL,
     session_id      TEXT,
     type            TEXT NOT NULL,
@@ -369,7 +387,7 @@ async function migrate() {
     resolved_by     TEXT
   )`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_project ON adr_vigilances(project)");
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_recette ON adr_vigilances(recette_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_cadrage ON adr_vigilances(cadrage_id)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_status ON adr_vigilances(status)");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_adr_vigilances_type ON adr_vigilances(type)");
   // --- Backfill idempotent depuis projects (ne supprime rien) ---------------
@@ -500,14 +518,14 @@ async function migrate() {
   await pool().query("CREATE INDEX IF NOT EXISTS idx_org_git_tokens_org ON org_git_tokens(org)");
   // Liaison repo↔projet : token git choisi parmi les tokens de l'organisation.
   await pool().query("ALTER TABLE project_repos ADD COLUMN IF NOT EXISTS git_token_id TEXT");
-  for (const tbl of ["projects", "repos", "recettes", "tasks", "e2e_tests", "artifacts"]) {
+  for (const tbl of ["projects", "repos", "cadrages", "tasks", "e2e_tests", "artifacts"]) {
     await pool().query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS organization_id TEXT`);
     await pool().query(`UPDATE ${tbl} SET organization_id = 'onirtech' WHERE organization_id IS NULL`);
   }
-  for (const tbl of ["recettes", "e2e_tests", "artifacts"]) {
+  for (const tbl of ["cadrages", "e2e_tests", "artifacts"]) {
     await pool().query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS created_by TEXT`);
   }
-  for (const tbl of ["projects", "repos", "recettes", "tasks", "e2e_tests", "artifacts"]) {
+  for (const tbl of ["projects", "repos", "cadrages", "tasks", "e2e_tests", "artifacts"]) {
     await pool().query(`UPDATE ${tbl} SET created_by = 'Rino' WHERE created_by IS NULL`);
   }
   // =========================================================================
@@ -591,7 +609,7 @@ async function migrate() {
   // Additif et idempotent : `dev_status` ∈ {complet, non_demarre, partiel,
   // incoherent} (analyse du code) ; `dev_status_source` ∈ {analyse_code,
   // evaluateur, agent, humain} TRACE qui alimente le statut (vigilance élément
-  // 149). AXE DISTINCT du verdict d'évaluation (`evaluation_fonctionnalites`)
+  // 149). AXE DISTINCT du verdict d'évaluation (`recette_fonctionnalites`)
   // et de l'implémentation (`implemented`/`implemented_origin`) : jamais fusionné.
   await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status TEXT");
   await pool().query("ALTER TABLE fonctionnalites ADD COLUMN IF NOT EXISTS dev_status_source TEXT");
@@ -606,7 +624,7 @@ async function migrate() {
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_note TEXT");
   // RÈGLE MÉTIER — STATUT DE RESPECT (axe dédié, T-20260922-100651-m6va).
   // `respect_status` ∈ {respectee, non_respectee} : le RESPECT de la règle, PAS
-  // un statut de développement (distinction explicite de la décision de recette).
+  // un statut de développement (distinction explicite de la décision de cadrage).
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status TEXT");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_note TEXT");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS respect_status_at TEXT");
@@ -694,7 +712,7 @@ $$ LANGUAGE plpgsql`);
   await pool().query("CREATE INDEX IF NOT EXISTS idx_task_adr_adr ON task_adr(adr_id)");
   // Lien ADR d'une TÂCHE — workflow PROPOSÉ → VALIDÉ (ADR-001 §5, T5/A001) :
   // l'agent PROPOSE un lien vers une ADR EXISTANTE (`status='propose'`, non
-  // effectif) ; l'humain VALIDE en recette (`status='valide'` ⇒ effectif).
+  // effectif) ; l'humain VALIDE en cadrage (`status='valide'` ⇒ effectif).
   // Additif : aucune colonne existante n'est modifiée. Posé ici (migrate(),
   // exécuté après schema.sql) — miroir `schema.sql` à prévoir en suivi.
   await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'propose'");
@@ -704,39 +722,39 @@ $$ LANGUAGE plpgsql`);
   await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS validated_at TEXT");
   await pool().query("ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS reason TEXT");
   await pool().query("CREATE INDEX IF NOT EXISTS idx_task_adr_status ON task_adr(status)");
-  await pool().query(`CREATE TABLE IF NOT EXISTS recette_sprints (
-    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_sprints (
+    cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
     sprint_id  TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
-    PRIMARY KEY (recette_id, sprint_id)
+    PRIMARY KEY (cadrage_id, sprint_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_sprints_sprint ON recette_sprints(sprint_id)");
-  await pool().query(`CREATE TABLE IF NOT EXISTS recette_fonctionnalites (
-    recette_id        TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_sprints_sprint ON cadrage_sprints(sprint_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_fonctionnalites (
+    cadrage_id        TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
     fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
-    PRIMARY KEY (recette_id, fonctionnalite_id)
+    PRIMARY KEY (cadrage_id, fonctionnalite_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_fonctionnalites_feat ON recette_fonctionnalites(fonctionnalite_id)");
-  await pool().query(`CREATE TABLE IF NOT EXISTS recette_adr (
-    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_fonctionnalites_feat ON cadrage_fonctionnalites(fonctionnalite_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_adr (
+    cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
     adr_id     TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
-    PRIMARY KEY (recette_id, adr_id)
+    PRIMARY KEY (cadrage_id, adr_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id)");
-  // Recette ↔ règle métier (T-20260922-070103-ncs1) — miroir DDL de
-  // `recette_fonctionnalites`. Miroir `schema.sql` (A001).
-  await pool().query(`CREATE TABLE IF NOT EXISTS recette_regles (
-    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_adr_adr ON cadrage_adr(adr_id)");
+  // Cadrage ↔ règle métier (T-20260922-070103-ncs1) — miroir DDL de
+  // `cadrage_fonctionnalites`. Miroir `schema.sql` (A001).
+  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_regles (
+    cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
     regle_id   TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
-    PRIMARY KEY (recette_id, regle_id)
+    PRIMARY KEY (cadrage_id, regle_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_regles_regle ON cadrage_regles(regle_id)");
   // =========================================================================
   // ÉVALUATIONS — « Recette » de l'ÉVALUATEUR PRODUIT (T-20260922-100650-sbc1).
-  // Objet de PREMIER NIVEAU DISTINCT de `recettes` (Cadrage technique exécuteur).
+  // Objet de PREMIER NIVEAU DISTINCT de `cadrages` (Cadrage technique exécuteur).
   // Miroir EXACT de la DDL `schema.sql` (A001). AUCUNE conversion en tâches.
   // =========================================================================
-  await pool().query(`CREATE TABLE IF NOT EXISTS evaluations (
-    evaluation_id   TEXT PRIMARY KEY,
+  await pool().query(`CREATE TABLE IF NOT EXISTS recettes (
+    recette_id   TEXT PRIMARY KEY,
     project         TEXT NOT NULL,
     title           TEXT NOT NULL,
     description     TEXT,
@@ -747,28 +765,28 @@ $$ LANGUAGE plpgsql`);
     organization_id TEXT,
     created_by      TEXT
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluations_project ON evaluations(project)");
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluations_created_by ON evaluations(created_by)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recettes_project ON recettes(project)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recettes_created_by ON recettes(created_by)");
   // SESSION D'ÉVALUATION (agent-recette évaluateur) — colonne ADDITIVE
-  // idempotente (parité recettes/sprints/tests). `sessionId` null = détachée.
-  await pool().query("ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS session_id TEXT");
-  await pool().query(`CREATE TABLE IF NOT EXISTS evaluation_fonctionnalites (
-    evaluation_id     TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+  // idempotente (parité cadrages/sprints/tests). `sessionId` null = détachée.
+  await pool().query("ALTER TABLE recettes ADD COLUMN IF NOT EXISTS session_id TEXT");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_fonctionnalites (
+    recette_id     TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
     fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
     verdict           TEXT,
     verdict_comment   TEXT,
-    PRIMARY KEY (evaluation_id, fonctionnalite_id)
+    PRIMARY KEY (recette_id, fonctionnalite_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluation_fonctionnalites_feat ON evaluation_fonctionnalites(fonctionnalite_id)");
-  await pool().query(`CREATE TABLE IF NOT EXISTS evaluation_regles (
-    evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_fonctionnalites_feat ON recette_fonctionnalites(fonctionnalite_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_regles (
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
     regle_id      TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
-    PRIMARY KEY (evaluation_id, regle_id)
+    PRIMARY KEY (recette_id, regle_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluation_regles_regle ON evaluation_regles(regle_id)");
-  await pool().query(`CREATE TABLE IF NOT EXISTS evaluation_items (
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id)");
+  await pool().query(`CREATE TABLE IF NOT EXISTS recette_items (
     id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+    recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
     content       TEXT NOT NULL,
     category      TEXT NOT NULL DEFAULT 'recommandation',
     severity      TEXT NOT NULL DEFAULT 'medium',
@@ -776,28 +794,28 @@ $$ LANGUAGE plpgsql`);
     status        TEXT NOT NULL DEFAULT 'open',
     created_at    TEXT NOT NULL
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_evaluation_items_evaluation ON evaluation_items(evaluation_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id)");
   // DÉCISION ADMIN « à traiter » (ou non), DISTINCTE du statut de suivi
   // `status`. Trace qui a décidé et quand (T-20260922-100650-3w6i, ADR-001 :
   // l'admin marque chaque élément « à traiter » ou non ; l'exécuteur n'accède
   // qu'aux éléments « à traiter »). Colonnes ADDITIVES, défaut `pending`.
-  await pool().query("ALTER TABLE evaluation_items ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending'");
-  await pool().query("ALTER TABLE evaluation_items ADD COLUMN IF NOT EXISTS decided_at TEXT");
-  await pool().query("ALTER TABLE evaluation_items ADD COLUMN IF NOT EXISTS decided_by TEXT");
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS decision TEXT NOT NULL DEFAULT 'pending'");
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS decided_at TEXT");
+  await pool().query("ALTER TABLE recette_items ADD COLUMN IF NOT EXISTS decided_by TEXT");
   // REPRISE d'un élément de recette évaluateur par un CADRAGE TECHNIQUE
-  // (`recettes`, alias `cadrage_*`) : lien ADDITIF pour le traçage « repris par
+  // (`cadrages`, alias `cadrage_*`) : lien ADDITIF pour le traçage « repris par
   // le cadrage X ». Aucune entité concurrente, aucune conversion en tâches.
-  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_evaluation_items (
-    recette_id         TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
-    evaluation_item_id INTEGER NOT NULL REFERENCES evaluation_items(id) ON DELETE CASCADE,
+  await pool().query(`CREATE TABLE IF NOT EXISTS cadrage_recette_items (
+    cadrage_id         TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
+    recette_item_id INTEGER NOT NULL REFERENCES recette_items(id) ON DELETE CASCADE,
     created_at         TEXT NOT NULL,
     taken_by           TEXT,
-    PRIMARY KEY (recette_id, evaluation_item_id)
+    PRIMARY KEY (cadrage_id, recette_item_id)
   )`);
-  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_evaluation_items_item ON cadrage_evaluation_items(evaluation_item_id)");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_cadrage_recette_items_item ON cadrage_recette_items(recette_item_id)");
   // =========================================================================
   // CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques
-  // de cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
+  // de cardinalité (cadrage/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
   // bloquant. AUCUN BACKFILL : la table naît vide (l'émergence n'est jamais
   // rétroactive). L'index partiel unique garantit UN SEUL signal OPEN par
   // entité ; un nouveau passage RAFRAÎCHIT `missing`/`detail` (décision §2.5).
@@ -846,7 +864,7 @@ $$ LANGUAGE plpgsql`);
   // Idempotence du lien : une seule ligne par couple (origine, convertie).
   await pool().query("CREATE UNIQUE INDEX IF NOT EXISTS idx_adr_conversions_pair ON adr_conversions(original_adr_id, converted_adr_id)");
   // A002 : `migrations` porte l'entité « session de migration » d'un PROJET
-  // (type dédié, à l'image des sessions sprint/recette), ancrée sur le SPRINT
+  // (type dédié, à l'image des sessions sprint/cadrage), ancrée sur le SPRINT
   // PAR DÉFAUT (= l'ancien sprint). Une migration par projet (index unique) :
   // `startMigration` est IDEMPOTENT (relance = même ligne).
   await pool().query(`CREATE TABLE IF NOT EXISTS migrations (
@@ -976,14 +994,14 @@ export async function getSprint(sprintId) {
 // DÉTAIL COMPLET d'un sprint (T4, tool `sprint_get`) : sprint + pièces client
 // (`sprint_pieces` JOIN `artifacts` → `rowToPiece`) + fonctionnalités
 // (`sprint_fonctionnalites`) + règles métier (`sprint_regles`) + tâches
-// (`task_sprints`) + recettes (`recette_sprints`) + compteurs. `null` si le
+// (`task_sprints`) + cadrages (`cadrage_sprints`) + compteurs. `null` si le
 // sprint est inconnu.
 export async function getSprintDetail(sprintId) {
   await ensureSchema();
   const sprint = await getSprint(sprintId);
   if (!sprint) return null;
   const sid = sprint.id;
-  const [pieceRows, featRows, regleRows, taskRows, recetteRows] = await Promise.all([
+  const [pieceRows, featRows, regleRows, taskRows, cadrageRows] = await Promise.all([
     pool().query(
       `SELECT a.* FROM artifacts a
          JOIN sprint_pieces sp ON sp.piece_id = a.artifact_id
@@ -1002,8 +1020,8 @@ export async function getSprintDetail(sprintId) {
          FROM tasks t JOIN task_sprints ts ON ts.task_id = t.id
         WHERE ts.sprint_id = $1 ORDER BY t.created_at ASC, t.id ASC`, [sid]),
     pool().query(
-      `SELECT r.recette_id, r.title, r.status, r.project FROM recettes r
-         JOIN recette_sprints rs ON rs.recette_id = r.recette_id
+      `SELECT r.cadrage_id, r.title, r.status, r.project FROM cadrages r
+         JOIN cadrage_sprints rs ON rs.cadrage_id = r.cadrage_id
         WHERE rs.sprint_id = $1 ORDER BY r.created_at ASC`, [sid]),
   ]);
   const pieces = pieceRows.rows.map(rowToPiece);
@@ -1036,8 +1054,8 @@ export async function getSprintDetail(sprintId) {
     emergentOrigin: r.emergent_origin ?? null,
     createdAt: r.created_at,
   }));
-  const recettes = recetteRows.rows.map((r) => ({
-    recetteId: r.recette_id,
+  const cadrages = cadrageRows.rows.map((r) => ({
+    cadrageId: r.cadrage_id,
     title: r.title ?? null,
     status: r.status ?? null,
     project: r.project ?? null,
@@ -1048,13 +1066,13 @@ export async function getSprintDetail(sprintId) {
     fonctionnalites,
     regles,
     tasks,
-    recettes,
+    cadrages,
     counts: {
       pieces: pieces.length,
       fonctionnalites: fonctionnalites.length,
       regles: regles.length,
       tasks: tasks.length,
-      recettes: recettes.length,
+      cadrages: cadrages.length,
     },
   };
 }
@@ -1065,9 +1083,9 @@ export async function getSprintDetail(sprintId) {
 //   - le SPRINT PAR DÉFAUT (`is_default=1`) : ancre des migrations / « ancien
 //     sprint » (`ensureDefaultSprint`, `migrations.sprint_id`) — message
 //     préfixé `[SPRINT_DEFAULT]` ;
-//   - un sprint portant des TÂCHES (`task_sprints`) ou des RECETTES
-//     (`recette_sprints`) : le détachement est EXPLICITE via les tools
-//     `task_sprint_unlink` / `recette_sprint_unlink`, jamais silencieux (perte
+//   - un sprint portant des TÂCHES (`task_sprints`) ou des CADRAGES
+//     (`cadrage_sprints`) : le détachement est EXPLICITE via les tools
+//     `task_sprint_unlink` / `cadrage_sprint_unlink`, jamais silencieux (perte
 //     de traçabilité) — message préfixé `[SPRINT_LINKED]` avec les compteurs.
 //
 // AUTORISÉ sinon : les liens `sprint_fonctionnalites` / `sprint_regles` /
@@ -1086,17 +1104,17 @@ export async function deleteSprint(sprintId) {
       `« ${sprint.project} » (ancre des migrations / « ancien sprint »). Il ne peut pas être supprimé.`,
     );
   }
-  const [taskRow, recetteRow] = await Promise.all([
+  const [taskRow, cadrageRow] = await Promise.all([
     pool().query("SELECT count(*) AS n FROM task_sprints WHERE sprint_id = $1", [sid]),
-    pool().query("SELECT count(*) AS n FROM recette_sprints WHERE sprint_id = $1", [sid]),
+    pool().query("SELECT count(*) AS n FROM cadrage_sprints WHERE sprint_id = $1", [sid]),
   ]);
   const taskCount = Number(taskRow.rows[0]?.n) || 0;
-  const recetteCount = Number(recetteRow.rows[0]?.n) || 0;
-  if (taskCount || recetteCount) {
+  const cadrageCount = Number(cadrageRow.rows[0]?.n) || 0;
+  if (taskCount || cadrageCount) {
     throw new Error(
       `[SPRINT_LINKED] suppression refusée : le sprint ${sid} porte ${taskCount} tâche(s) et ` +
-      `${recetteCount} recette(s) rattachée(s). Détachez-les d'abord ` +
-      `(\`task_sprint_unlink\` / \`recette_sprint_unlink\`).`,
+      `${cadrageCount} cadrage(s) rattachée(s). Détachez-les d'abord ` +
+      `(\`task_sprint_unlink\` / \`cadrage_sprint_unlink\`).`,
     );
   }
   const detached = await withTransaction(async (client) => {
@@ -1189,21 +1207,21 @@ export async function attachPiecesToSprint(sprintId, { pieceIds, atInit = false,
 //   kind='element' : (fonctionnalité / règle / tâche) aucun sprint → émergent
 //                    `hors_sprint` ; dernier sprint close → `apres_cloture` ;
 //                    sprint open → non émergent (appartient au sprint courant),
-//                    SAUF si `fromRecette=true` (→ `recette`) ou si
+//                    SAUF si `fromCadrage=true` (→ `cadrage`) ou si
 //                    `hasFeature === false` (→ `sans_fonctionnalite`).
 //
 // PRIORITÉ des origines d'émergence (T6) — la plus haute l'emporte :
 //   1. `hors_sprint`        (aucun sprint du projet)
 //   2. `apres_cloture`      (dernier sprint clôturé)
-//   3. `recette`            (élément apparu en recette : règle/tâche/fonctionnalité)
+//   3. `cadrage`            (élément apparu en cadrage : règle/tâche/fonctionnalité)
 //   4. `sans_fonctionnalite`(élément du sprint courant sans fonctionnalité)
 // `apres_init_sprint` (pièces, T2/T4) reste INCHANGÉ et hors de cette échelle.
 //
-// RÉTROCOMPATIBILITÉ : `hasFeature` / `fromRecette` sont OPTIONNELS ; les
+// RÉTROCOMPATIBILITÉ : `hasFeature` / `fromCadrage` sont OPTIONNELS ; les
 // appels legacy `{kind:'element'}` / `{kind:'piece'}` produisent EXACTEMENT
 // le même résultat qu'avant T6.
 // Balaye d'abord la clôture auto (l'état lu est à jour).
-export async function classifyEmergence(projectId, { kind = "element", hasFeature, fromRecette } = {}) {
+export async function classifyEmergence(projectId, { kind = "element", hasFeature, fromCadrage } = {}) {
   await ensureSchema();
   const pid = projectId ? String(projectId).trim() : "";
   if (!pid) return { sprintId: null, sprintStatus: null, emergent: false, emergentOrigin: null };
@@ -1219,10 +1237,10 @@ export async function classifyEmergence(projectId, { kind = "element", hasFeatur
     if (isPiece) {
       return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: true, emergentOrigin: "apres_init_sprint" };
     }
-    // Élément dans le sprint courant : origine `recette` (3) puis
+    // Élément dans le sprint courant : origine `cadrage` (3) puis
     // `sans_fonctionnalite` (4) ; sinon non émergent.
-    if (fromRecette === true) {
-      return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: true, emergentOrigin: "recette" };
+    if (fromCadrage === true) {
+      return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: true, emergentOrigin: "cadrage" };
     }
     if (hasFeature === false) {
       return { sprintId: sprint.sprintId, sprintStatus: "open", emergent: true, emergentOrigin: "sans_fonctionnalite" };
@@ -1328,7 +1346,7 @@ export async function createSprint({ projectId, title, startDate, endDate, autoC
 }
 
 // ASSOCIE une session IA DÉDIÉE à un sprint EXISTANT (T8, tool
-// `sprint_session_set`). Miroir de `setRecetteSession` MAIS sans toucher au
+// `sprint_session_set`). Miroir de `setCadrageSession` MAIS sans toucher au
 // statut du sprint : `open`/`close` (et donc la garde d'émergence) restent
 // pilotés par `sprint_close`/`sprint_reopen` — rattacher une session ne clôt ni
 // ne rouvre rien. `sessionId` null détache la session. Retourne le sprint.
@@ -1346,7 +1364,7 @@ export async function setSprintSession({ sprintId, sessionId }) {
 }
 
 // MIGRATION des éléments EXISTANTS vers le sprint par défaut du projet :
-// rattache `recette_sprints` / `task_sprints` pour les recettes/tâches SANS lien
+// rattache `cadrage_sprints` / `task_sprints` pour les cadrages/tâches SANS lien
 // sprint. AUCUN marquage émergent (émergence NON rétroactive — ADR-001 §2).
 export async function migrateExistingToDefaultSprint({ projectId, title, startDate, endDate, createdBy } = {}) {
   await ensureSchema();
@@ -1354,10 +1372,10 @@ export async function migrateExistingToDefaultSprint({ projectId, title, startDa
   const pid = String(projectId).trim();
   const sprint = await ensureDefaultSprint(pid, { title, startDate, endDate, createdBy });
   const rec = await pool().query(
-    `INSERT INTO recette_sprints (recette_id, sprint_id)
-     SELECT r.recette_id, $2 FROM recettes r
+    `INSERT INTO cadrage_sprints (cadrage_id, sprint_id)
+     SELECT r.cadrage_id, $2 FROM cadrages r
       WHERE r.project = $1
-        AND NOT EXISTS (SELECT 1 FROM recette_sprints rs WHERE rs.recette_id = r.recette_id)
+        AND NOT EXISTS (SELECT 1 FROM cadrage_sprints rs WHERE rs.cadrage_id = r.cadrage_id)
      ON CONFLICT DO NOTHING`,
     [pid, sprint.id],
   );
@@ -1369,13 +1387,13 @@ export async function migrateExistingToDefaultSprint({ projectId, title, startDa
      ON CONFLICT DO NOTHING`,
     [pid, sprint.id],
   );
-  return { sprintId: sprint.id, recettes: rec.rowCount, tasks: tsk.rowCount, sprint };
+  return { sprintId: sprint.id, cadrages: rec.rowCount, tasks: tsk.rowCount, sprint };
 }
 
 // ===========================================================================
 // SESSION DE MIGRATION DES ANCIENS SPRINTS (ADR-001 §6) — A005/A006/A007.
 // Entité « migration » d'un PROJET (type dédié, à l'image des sessions
-// sprint/recette), ANCRÉE sur le SPRINT PAR DÉFAUT du projet (= l'ancien
+// sprint/cadrage), ANCRÉE sur le SPRINT PAR DÉFAUT du projet (= l'ancien
 // sprint). GARDE CRITIQUE : l'émergence n'est JAMAIS rétroactive — les
 // rattachements se font par INSERT DIRECTS, sans écrire `emergent`/
 // `emergent_origin` et sans passer par `attachPiecesToSprint`.
@@ -1508,7 +1526,7 @@ export async function finishMigration({ migrationId, status = "done", by } = {})
 // A007 — RATTACHEMENT des éléments EXISTANTS à l'ANCIEN SPRINT (sprint par
 // défaut du projet) : fonctionnalités (`sprint_fonctionnalites`), règles métier
 // (`sprint_regles`), pièces client (`sprint_pieces`), tâches (`task_sprints`) et
-// recettes (`recette_sprints`) SANS lien sprint. IDEMPOTENT.
+// cadrages (`cadrage_sprints`) SANS lien sprint. IDEMPOTENT.
 //
 // GARDE CRITIQUE — AUCUN FAUX ÉMERGENT : les rattachements sont des INSERT
 // DIRECTS (`INSERT ... SELECT ... ON CONFLICT DO NOTHING`). On n'appelle JAMAIS
@@ -1559,10 +1577,10 @@ export async function migrateProjectElementsToDefaultSprint({ projectId, title, 
     [pid, sid],
   );
   const recs = await pool().query(
-    `INSERT INTO recette_sprints (recette_id, sprint_id)
-     SELECT r.recette_id, $2 FROM recettes r
+    `INSERT INTO cadrage_sprints (cadrage_id, sprint_id)
+     SELECT r.cadrage_id, $2 FROM cadrages r
       WHERE r.project = $1
-        AND NOT EXISTS (SELECT 1 FROM recette_sprints rs WHERE rs.recette_id = r.recette_id)
+        AND NOT EXISTS (SELECT 1 FROM cadrage_sprints rs WHERE rs.cadrage_id = r.cadrage_id)
      ON CONFLICT DO NOTHING`,
     [pid, sid],
   );
@@ -1573,7 +1591,7 @@ export async function migrateProjectElementsToDefaultSprint({ projectId, title, 
     regles: regs.rowCount,
     pieces: pieces.rowCount,
     tasks: tasks.rowCount,
-    recettes: recs.rowCount,
+    cadrages: recs.rowCount,
   };
 }
 
@@ -1617,7 +1635,7 @@ export async function reopenSprint(sprintId, { endDate, autoClose, by } = {}) {
 // RAPPORT DE SPRINT (agrégation REGISTRE, ADR-001 §4) : fonctionnalités
 // implémentées (≥1 tâche liée dont la DERNIÈRE exécution est `done`) et
 // émergentes, tâches effectuées / émergentes, règles émergentes, pièces
-// (+ émergentes), recettes. Retourne `{ sprint, stats, sections, markdown }`.
+// (+ émergentes), cadrages. Retourne `{ sprint, stats, sections, markdown }`.
 export async function buildSprintReport(sprintId, { format = "markdown" } = {}) {
   await ensureSchema();
   if (!sprintId) throw new Error("sprintId requis");
@@ -1737,12 +1755,12 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
     return { pieceId: p.pieceId, nature: p.nature, title: p.title, url: p.url, emergent: p.emergent, emergentOrigin: p.emergentOrigin };
   });
 
-  const recettes = (await pool().query(
-    `SELECT r.recette_id, r.title, r.status FROM recettes r
-       JOIN recette_sprints rs ON rs.recette_id = r.recette_id
+  const cadrages = (await pool().query(
+    `SELECT r.cadrage_id, r.title, r.status FROM cadrages r
+       JOIN cadrage_sprints rs ON rs.cadrage_id = r.cadrage_id
       WHERE rs.sprint_id = $1
       ORDER BY r.created_at ASC`, [sid],
-  )).rows.map((r) => ({ recetteId: r.recette_id, title: r.title ?? null, status: r.status ?? null }));
+  )).rows.map((r) => ({ cadrageId: r.cadrage_id, title: r.title ?? null, status: r.status ?? null }));
 
   const sections = {
     fonctionnalitesImplementees: feats.filter((f) => f.implemented),
@@ -1756,7 +1774,7 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
     reglesEmergentes: regles.filter((r) => r.emergent),
     pieces: pieces,
     piecesEmergentes: pieces.filter((p) => p.emergent),
-    recettes: recettes,
+    cadrages: cadrages,
   };
 
   // Ventilation E/H (T-20260921-133134-yz2i) : « dont E dans l'écosystème,
@@ -1779,7 +1797,7 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
       emergentes: sections.reglesEmergentes.length,
     },
     pieces: { total: pieces.length, emergentes: sections.piecesEmergentes.length },
-    recettes: { total: recettes.length },
+    cadrages: { total: cadrages.length },
   };
 
   const md = [];
@@ -1799,7 +1817,7 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
   md.push(`| Tâches | ${stats.taches.total} | ${stats.taches.effectuees} effectuée(s), ${stats.taches.emergentes} émergente(s) |`);
   md.push(`| Règles métier | ${stats.regles.total} | ${stats.regles.implementees} implémentée(s) — dont ${stats.regles.implementeesEcosystem} dans l'écosystème, ${stats.regles.implementeesHorsEcosystem} hors écosystème ; ${stats.regles.emergentes} émergente(s) |`);
   md.push(`| Pièces client | ${stats.pieces.total} | ${stats.pieces.emergentes} émergente(s) |`);
-  md.push(`| Recettes | ${stats.recettes.total} | — |`);
+  md.push(`| Cadrages | ${stats.cadrages.total} | — |`);
   md.push("");
   const list = (title, arr, fmt) => {
     md.push(`## ${title} (${arr.length})`);
@@ -1817,7 +1835,7 @@ export async function buildSprintReport(sprintId, { format = "markdown" } = {}) 
   list("Règles métier implémentées", sections.reglesImplementees, (r) => `**${r.ref}** — ${r.content} — implémentée (${originLabel(r)})${r.implementedNote ? ` — ${r.implementedNote}` : ""}`);
   list("Règles métier", sections.regles, (r) => `**${r.ref}** — ${r.content}${r.implemented ? ` — implémentée (${originLabel(r)})${r.implementedNote ? ` — ${r.implementedNote}` : ""}` : ""}${r.emergent ? ` _(émergente : ${r.emergentOrigin || "?"})_` : ""}`);
   list("Pièces client", sections.pieces, (p) => `[${p.nature || "?"}] ${p.title || p.pieceId}${p.url ? ` — ${p.url}` : ""}${p.emergent ? ` _(émergente : ${p.emergentOrigin || "?"})_` : ""}`);
-  list("Recettes", sections.recettes, (r) => `\`${r.recetteId}\` — ${r.title || ""} (${r.status || "?"})`);
+  list("Cadrages", sections.cadrages, (r) => `\`${r.cadrageId}\` — ${r.title || ""} (${r.status || "?"})`);
 
   return { sprint, stats, sections, markdown: md.join("\n") };
 }
@@ -1918,15 +1936,15 @@ async function assertPieceOwnedByProject(pieceId, projectId) {
 // (garde nature T2 `assertAttachablePiece` + appartenance au projet).
 // ÉMERGENCE (`classifyEmergence`, kind='element') : hors sprint → `hors_sprint`,
 // dernier sprint clôturé → `apres_cloture` ; sprint OUVERT → non émergente et
-// rattachée au sprint courant (`sprint_fonctionnalites`). `recetteId` optionnel
-// (T6) → origine `recette` (élément apparu en recette). `fromRecette` optionnel
+// rattachée au sprint courant (`sprint_fonctionnalites`). `cadrageId` optionnel
+// (T6) → origine `cadrage` (élément apparu en cadrage). `fromCadrage` optionnel
 // (T6) → signal EXPLICITE d'origine recette, pour une création déclenchée
-// DEPUIS une recette/cadrage sans identifiant de recette encore disponible
-// (ex. modale de création) ou depuis une recette évaluateur (`evaluation`).
-// `fromRecette` est un paramètre d'APPEL : jamais persisté ; seule la colonne
-// existante `emergent_origin` est écrite (valeur `recette`). `organization_id`
+// DEPUIS un cadrage/cadrage sans identifiant de cadrage encore disponible
+// (ex. modale de création) ou depuis une recette évaluateur (`recette`).
+// `fromCadrage` est un paramètre d'APPEL : jamais persisté ; seule la colonne
+// existante `emergent_origin` est écrite (valeur `cadrage`). `organization_id`
 // héritée du projet. `ref` déjà utilisée pour le projet → erreur explicite.
-export async function registerFeature({ projectId, ref, role, userStory, sourcedPieceId, recetteId, fromRecette, createdBy } = {}) {
+export async function registerFeature({ projectId, ref, role, userStory, sourcedPieceId, cadrageId, fromCadrage, createdBy } = {}) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
   const pid = String(projectId).trim();
@@ -1948,7 +1966,7 @@ export async function registerFeature({ projectId, ref, role, userStory, sourced
   )).rows[0];
   if (dup) throw new Error(`référence déjà utilisée pour le projet ${pid} : ${rf} (${dup.id})`);
 
-  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!(recetteId || fromRecette) });
+  const em = await classifyEmergence(pid, { kind: "element", fromCadrage: !!(cadrageId || fromCadrage) });
   const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
   const id = `FEAT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();
@@ -2059,7 +2077,7 @@ export const IMPLEMENTED_ORIGINS = ["ecosystem", "hors_ecosystem"];
 //   - `DEV_STATUS_SOURCES` : trace QUI alimente le statut (vigilance élément 149).
 //   - `RESPECT_STATUSES` : le RESPECT de la règle (axe distinct du développement).
 // AXES DISTINCTS, jamais fusionnés avec `implemented`/`implemented_origin` (axe 1
-// Intégration) ni avec le verdict d'évaluation (`evaluation_fonctionnalites`).
+// Intégration) ni avec le verdict d'évaluation (`recette_fonctionnalites`).
 // ===========================================================================
 export const DEV_STATUSES = ["complet", "non_demarre", "partiel", "incoherent"];
 export const DEV_STATUS_SOURCES = ["analyse_code", "evaluateur", "agent", "humain"];
@@ -2324,14 +2342,14 @@ export async function markFeatureDevStatus({ featureId, devStatus, source, note,
 }
 
 // LECTURE détaillée d'une FONCTIONNALITÉ + liens : règles, scénarios Gherkin
-// (`e2e_tests`), ADR, sprints, tâches, recettes. `null` si inconnue.
+// (`e2e_tests`), ADR, sprints, tâches, cadrages. `null` si inconnue.
 export async function getFeature(featureId) {
   await ensureSchema();
   if (!featureId) return null;
   const row = (await pool().query("SELECT * FROM fonctionnalites WHERE id = $1", [String(featureId)])).rows[0];
   if (!row) return null;
   const feature = rowToFonctionnalite(row);
-  const [regleRows, gherkinRows, adrRows, sprintRows, taskRows, recetteRows, evalRows] = await Promise.all([
+  const [regleRows, gherkinRows, adrRows, sprintRows, taskRows, cadrageRows, evalRows] = await Promise.all([
     pool().query(
       `SELECT r.* FROM regles_metier r
          JOIN fonctionnalite_regles fr ON fr.regle_id = r.id
@@ -2352,16 +2370,16 @@ export async function getFeature(featureId) {
          FROM tasks t JOIN task_fonctionnalites tf ON tf.task_id = t.id
         WHERE tf.fonctionnalite_id = $1 ORDER BY t.created_at ASC, t.id ASC`, [feature.id]),
     pool().query(
-      `SELECT r.recette_id, r.title, r.status FROM recettes r
-         JOIN recette_fonctionnalites rf ON rf.recette_id = r.recette_id
+      `SELECT r.cadrage_id, r.title, r.status FROM cadrages r
+         JOIN cadrage_fonctionnalites rf ON rf.cadrage_id = r.cadrage_id
         WHERE rf.fonctionnalite_id = $1 ORDER BY r.created_at ASC`, [feature.id]),
     // VERDICTS D'ÉVALUATION (recette évaluateur) — LECTURE SEULE, AXE DISTINCT
     // du statut de développement (`devStatus`) et de l'implémentation. Aucune
-    // écriture : `evaluation_fonctionnalites` n'est jamais modifiée ici.
+    // écriture : `recette_fonctionnalites` n'est jamais modifiée ici.
     pool().query(
-      `SELECT ef.evaluation_id, e.title, e.status, ef.verdict, ef.verdict_comment
-         FROM evaluation_fonctionnalites ef
-         JOIN evaluations e ON e.evaluation_id = ef.evaluation_id
+      `SELECT ef.recette_id, e.title, e.status, ef.verdict, ef.verdict_comment
+         FROM recette_fonctionnalites ef
+         JOIN recettes e ON e.recette_id = ef.recette_id
         WHERE ef.fonctionnalite_id = $1 ORDER BY e.created_at ASC`, [feature.id]),
   ]);
   return {
@@ -2374,11 +2392,11 @@ export async function getFeature(featureId) {
     adrs: adrRows.rows.map((a) => ({ adrId: a.artifact_id, title: a.title ?? null, docType: a.doc_type, kind: a.kind ?? null, path: a.path ?? null })),
     sprints: sprintRows.rows.map(rowToSprint),
     tasks: taskRows.rows.map((t) => ({ id: t.id, title: t.title ?? null, request: t.request ?? null, project: t.project ?? null, emergent: !!t.emergent, emergentOrigin: t.emergent_origin ?? null })),
-    recettes: recetteRows.rows.map((r) => ({ recetteId: r.recette_id, title: r.title ?? null, status: r.status ?? null })),
+    cadrages: cadrageRows.rows.map((r) => ({ cadrageId: r.cadrage_id, title: r.title ?? null, status: r.status ?? null })),
     // VERDICTS d'évaluation (lecture seule) — axe DISTINCT du statut de
     // développement. Exposés pour rendre la distinction visible (0 duplication).
     evaluationVerdicts: evalRows.rows.map((e) => ({
-      evaluationId: e.evaluation_id,
+      evaluationId: e.recette_id,
       title: e.title ?? null,
       status: e.status ?? null,
       verdict: e.verdict ?? null,
@@ -2447,7 +2465,7 @@ export async function deleteFeature(featureId, { cascadeAdrs, by } = {}) {
     await client.query("DELETE FROM fonctionnalite_adr WHERE fonctionnalite_id = $1", [fid]);
     await client.query("DELETE FROM sprint_fonctionnalites WHERE fonctionnalite_id = $1", [fid]);
     await client.query("DELETE FROM task_fonctionnalites WHERE fonctionnalite_id = $1", [fid]);
-    await client.query("DELETE FROM recette_fonctionnalites WHERE fonctionnalite_id = $1", [fid]);
+    await client.query("DELETE FROM cadrage_fonctionnalites WHERE fonctionnalite_id = $1", [fid]);
     await client.query("DELETE FROM fonctionnalites WHERE id = $1", [fid]);
     return { featureId: fid, deleted: true, cascadedAdrs };
   });
@@ -2456,7 +2474,7 @@ export async function deleteFeature(featureId, { cascadeAdrs, by } = {}) {
 // Compteurs de LIENS des fonctionnalités — UNE requête bulk (pas de N+1 SQL).
 // `unnest($1::text[])` produit une ligne par id et 6 sous-requêtes `count(*)`
 // comptent les liens de chaque nature. Retourne
-// `{ [id]: { rules, gherkin, adrs, sprints, tasks, recettes } }` (zéros inclus).
+// `{ [id]: { rules, gherkin, adrs, sprints, tasks, cadrages } }` (zéros inclus).
 async function featureLinkCounts(ids) {
   const out = {};
   const list = (ids || []).map((x) => String(x)).filter(Boolean);
@@ -2471,7 +2489,7 @@ async function featureLinkCounts(ids) {
                FROM sprint_fonctionnalites sf
               WHERE sf.fonctionnalite_id = i.id) AS "sprintIds",
             (SELECT count(*) FROM task_fonctionnalites    x WHERE x.fonctionnalite_id = i.id) AS tasks,
-            (SELECT count(*) FROM recette_fonctionnalites x WHERE x.fonctionnalite_id = i.id) AS recettes
+            (SELECT count(*) FROM cadrage_fonctionnalites x WHERE x.fonctionnalite_id = i.id) AS cadrages
        FROM unnest($1::text[]) AS i(id)`,
     [list],
   )).rows;
@@ -2483,7 +2501,7 @@ async function featureLinkCounts(ids) {
       sprints: Number(r.sprints) || 0,
       sprintIds: Array.from(new Set((r.sprintIds || []).filter(Boolean))).sort(),
       tasks: Number(r.tasks) || 0,
-      recettes: Number(r.recettes) || 0,
+      cadrages: Number(r.cadrages) || 0,
     };
   }
   return out;
@@ -2576,7 +2594,7 @@ export async function listFeatures({ projectId, emergent, search, limit } = {}) 
       ...f,
       // Champ ADDITIF : tests E2E liés (liens cliquables côté panneau).
       gherkinTests: gherkinTests[f.id] || [],
-      // `links` STRICTEMENT inchangé (`{ rules, gherkin, adrs, sprints, tasks, recettes }`) :
+      // `links` STRICTEMENT inchangé (`{ rules, gherkin, adrs, sprints, tasks, cadrages }`) :
       // ré-extraction explicite pour éviter toute fuite de `sprintIds` dans ce contrat.
       links: {
         rules: c.rules || 0,
@@ -2584,7 +2602,7 @@ export async function listFeatures({ projectId, emergent, search, limit } = {}) 
         adrs: c.adrs || 0,
         sprints: c.sprints || 0,
         tasks: c.tasks || 0,
-        recettes: c.recettes || 0,
+        cadrages: c.cadrages || 0,
       },
       // Champ ADDITIF : ids des sprints liés ([] = « Sans sprint »), même requête bulk.
       sprintIds: c.sprintIds || [],
@@ -2612,11 +2630,11 @@ function normalizeRuleRoles({ roles, roleGlobal } = {}) {
 
 // CRÉATION d'une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3). Mêmes gardes que
 // `registerFeature` (projet, pièce source, émergence). Non émergente ⇒ lien
-// `sprint_regles` au sprint ouvert. `recetteId` optionnel (T6) → origine
-// `recette` (règle métier apparue en recette). `fromRecette` optionnel (T6) →
+// `sprint_regles` au sprint ouvert. `cadrageId` optionnel (T6) → origine
+// `cadrage` (règle métier apparue en cadrage). `fromCadrage` optionnel (T6) →
 // signal EXPLICITE d'origine recette (miroir exact de `registerFeature`) ;
 // paramètre d'appel, jamais persisté.
-export async function registerRule({ projectId, ref, content, sourcedPieceId, recetteId, fromRecette, roles, roleGlobal, createdBy } = {}) {
+export async function registerRule({ projectId, ref, content, sourcedPieceId, cadrageId, fromCadrage, roles, roleGlobal, createdBy } = {}) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
   const pid = String(projectId).trim();
@@ -2641,7 +2659,7 @@ export async function registerRule({ projectId, ref, content, sourcedPieceId, re
   // Association EXPLICITE de rôles : garde « ≥1 rôle OU global » (T-20260922-064200-e0yw).
   const { roles: roleList, roleGlobal: isGlobal } = normalizeRuleRoles({ roles, roleGlobal });
 
-  const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!(recetteId || fromRecette) });
+  const em = await classifyEmergence(pid, { kind: "element", fromCadrage: !!(cadrageId || fromCadrage) });
   const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
   const id = `RMET-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();
@@ -2796,7 +2814,7 @@ export async function deleteRule(ruleId) {
   await withTransaction(async (client) => {
     await client.query("DELETE FROM fonctionnalite_regles WHERE regle_id = $1", [rid]);
     await client.query("DELETE FROM sprint_regles WHERE regle_id = $1", [rid]);
-    await client.query("DELETE FROM recette_regles WHERE regle_id = $1", [rid]);
+    await client.query("DELETE FROM cadrage_regles WHERE regle_id = $1", [rid]);
     await client.query("DELETE FROM regles_metier WHERE id = $1", [rid]);
   });
   return { ruleId: rid, deleted: true };
@@ -3057,7 +3075,7 @@ export async function proposeTaskAdr({ taskId, adrId, reason, by } = {}) {
   return { ok: true, taskId: tid, adrId: aid, status: "propose", effective: false, created: true };
 }
 
-// VALIDATION (action HUMAINE, en recette) : `status='valide'` + `validated_by`
+// VALIDATION (action HUMAINE, en cadrage) : `status='valide'` + `validated_by`
 // / `validated_at` ⇒ lien EFFECTIF. Erreur si AUCUNE proposition n'existe.
 // Idempotent si le lien est déjà validé.
 export async function validateTaskAdr({ taskId, adrId, by } = {}) {
@@ -3128,7 +3146,7 @@ export async function listTaskAdrs({ taskId, status } = {}) {
 // (`cardinality_signals`, append-only) et exposent des VUES de suivi.
 // L'ÉMERGENCE n'est JAMAIS RÉTROACTIVE : aucune fonction de ce bloc ne marque
 // les éléments EXISTANTS (aucun backfill ; le marquage n'a lieu qu'à la
-// création, cf. `createTask`/`startRecette`/`registerFeature`/`registerRule`).
+// création, cf. `createTask`/`startCadrage`/`registerFeature`/`registerRule`).
 // ===========================================================================
 
 // Origines d'émergence connues (flag `emergent_origin`). `sans_piece` est
@@ -3138,30 +3156,30 @@ export const EMERGENT_ORIGINS = [
   "hors_sprint",
   "apres_cloture",
   "apres_init_sprint",
-  "recette",
+  "cadrage",
   "sans_fonctionnalite",
   "sans_piece",
 ];
 
 // Cardinalités attendues par type d'entité (heuristiques, non bloquantes).
-//   recette : 1 sprint + 1..N fonctionnalités + 1..N ADR
+//   cadrage : 1 sprint + 1..N fonctionnalités + 1..N ADR
 //   task    : 1 sprint + 1 fonctionnalité + 1..N ADR EFFECTIF (lien validé)
 //   adr     : 1..N fonctionnalités
 //   sprint  : 1..N fonctionnalités + 1..N règles métier
 export const CARDINALITY_RULES = {
-  recette: { sprint: 1, fonctionnalite: 1, adr: 1 },
+  cadrage: { sprint: 1, fonctionnalite: 1, adr: 1 },
   task: { sprint: 1, fonctionnalite: 1, adr: 1 },
   adr: { fonctionnalite: 1 },
   sprint: { fonctionnalite: 1, regle: 1 },
 };
-export const CARDINALITY_ENTITY_TYPES = ["recette", "task", "adr", "sprint"];
+export const CARDINALITY_ENTITY_TYPES = ["cadrage", "task", "adr", "sprint"];
 export const CARDINALITY_VIEWS = [
   "tache_sans_adr",
   "tache_sans_fonctionnalite",
   "tache_sans_sprint",
-  "recette_sans_adr",
-  "recette_sans_fonctionnalite",
-  "recette_sans_sprint",
+  "cadrage_sans_adr",
+  "cadrage_sans_fonctionnalite",
+  "cadrage_sans_sprint",
   "adr_sans_fonctionnalite",
   "sprint_sans_fonctionnalite",
   "sprint_sans_regle",
@@ -3245,14 +3263,14 @@ export async function checkCardinality({ entityType, entityId, projectId } = {})
       if (nSp < 1) out.missing.push("sprint");
       if (nFe < 1) out.missing.push("fonctionnalite");
       if (nAdr < 1) out.missing.push("adr");
-    } else if (type === "recette") {
-      const r = await getRecetteById(id);
-      if (!r) { out.ok = false; out.found = false; out.detail = { error: `recette inconnue : ${id}` }; return out; }
+    } else if (type === "cadrage") {
+      const r = await getCadrageById(id);
+      if (!r) { out.ok = false; out.found = false; out.detail = { error: `cadrage inconnu : ${id}` }; return out; }
       out.projectId = out.projectId || r.project || null;
       const [sp, fe, adr] = await Promise.all([
-        pool().query("SELECT COUNT(*) AS n FROM recette_sprints WHERE recette_id = $1", [id]),
-        pool().query("SELECT COUNT(*) AS n FROM recette_fonctionnalites WHERE recette_id = $1", [id]),
-        pool().query("SELECT COUNT(*) AS n FROM recette_adr WHERE recette_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM cadrage_sprints WHERE cadrage_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM cadrage_fonctionnalites WHERE cadrage_id = $1", [id]),
+        pool().query("SELECT COUNT(*) AS n FROM cadrage_adr WHERE cadrage_id = $1", [id]),
       ]);
       const nSp = Number(sp.rows[0].n) || 0;
       const nFe = Number(fe.rows[0].n) || 0;
@@ -3410,24 +3428,24 @@ export async function resolveCardinalitySignal({ signalId, resolution, resolvedB
 }
 
 // RATTACHEMENT NON BLOQUANT au sprint PAR DÉFAUT du projet (décision T6 §2.3) :
-// uniquement si l'entité (task | recette) n'a AUCUN lien sprint ET que le projet
+// uniquement si l'entité (task | cadrage) n'a AUCUN lien sprint ET que le projet
 // n'a AUCUN sprint. Idempotent, jamais bloquant (try/catch intégral).
 export async function ensureDefaultSprintLink({ entityType, entityId, projectId, by } = {}) {
   try {
     await ensureSchema();
     const type = entityType ? String(entityType).trim() : "";
     const id = entityId ? String(entityId).trim() : "";
-    if (!["task", "recette"].includes(type) || !id) {
-      return { ok: false, linked: false, error: "entityType (task|recette) et entityId requis" };
+    if (!["task", "cadrage"].includes(type) || !id) {
+      return { ok: false, linked: false, error: "entityType (task|cadrage) et entityId requis" };
     }
     let pid = projectId ? String(projectId).trim() : "";
     if (!pid) {
       if (type === "task") { const t = await getTask(id); pid = t ? (t.project || "") : ""; }
-      else { const r = await getRecetteById(id); pid = r ? (r.project || "") : ""; }
+      else { const r = await getCadrageById(id); pid = r ? (r.project || "") : ""; }
     }
     if (!pid) return { ok: false, linked: false, error: "projectId introuvable" };
-    const linkTable = type === "task" ? "task_sprints" : "recette_sprints";
-    const col = type === "task" ? "task_id" : "recette_id";
+    const linkTable = type === "task" ? "task_sprints" : "cadrage_sprints";
+    const col = type === "task" ? "task_id" : "cadrage_id";
     const existing = (await pool().query(`SELECT sprint_id FROM ${linkTable} WHERE ${col} = $1 LIMIT 1`, [id])).rows[0];
     if (existing) return { ok: true, linked: false, reason: "deja_lie", sprintId: existing.sprint_id };
     const anySprint = (await pool().query("SELECT id FROM sprints WHERE project = $1 LIMIT 1", [pid])).rows[0];
@@ -3435,7 +3453,7 @@ export async function ensureDefaultSprintLink({ entityType, entityId, projectId,
     const sprint = await ensureDefaultSprint(pid, { createdBy: by });
     if (!sprint) return { ok: false, linked: false, error: "sprint par défaut non créé" };
     if (type === "task") await linkTaskSprint({ taskId: id, sprintId: sprint.id });
-    else await linkRecetteSprint({ recetteId: id, sprintId: sprint.id });
+    else await linkCadrageSprint({ cadrageId: id, sprintId: sprint.id });
     return { ok: true, linked: true, sprintId: sprint.id, sprint };
   } catch (e) {
     return { ok: false, linked: false, error: e.message };
@@ -3477,30 +3495,30 @@ export async function cardinalityView({ projectId, view } = {}) {
           AND NOT EXISTS (SELECT 1 FROM task_sprints ts WHERE ts.task_id = t.id)
         ORDER BY t.created_at ASC, t.id ASC`, [pid],
     )).rows.map((r) => ({ entityType: "task", id: r.id, title: r.title ?? null, request: r.request ?? null, emergent: !!r.emergent, emergentOrigin: r.emergent_origin ?? null, createdAt: r.created_at }));
-  } else if (v === "recette_sans_adr") {
+  } else if (v === "cadrage_sans_adr") {
     items = (await pool().query(
-      `SELECT r.recette_id, r.title, r.status, r.created_at
-         FROM recettes r
+      `SELECT r.cadrage_id, r.title, r.status, r.created_at
+         FROM cadrages r
         WHERE r.project = $1
-          AND NOT EXISTS (SELECT 1 FROM recette_adr ra WHERE ra.recette_id = r.recette_id)
+          AND NOT EXISTS (SELECT 1 FROM cadrage_adr ra WHERE ra.cadrage_id = r.cadrage_id)
         ORDER BY r.created_at ASC`, [pid],
-    )).rows.map((r) => ({ entityType: "recette", id: r.recette_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
-  } else if (v === "recette_sans_fonctionnalite") {
+    )).rows.map((r) => ({ entityType: "cadrage", id: r.cadrage_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
+  } else if (v === "cadrage_sans_fonctionnalite") {
     items = (await pool().query(
-      `SELECT r.recette_id, r.title, r.status, r.created_at
-         FROM recettes r
+      `SELECT r.cadrage_id, r.title, r.status, r.created_at
+         FROM cadrages r
         WHERE r.project = $1
-          AND NOT EXISTS (SELECT 1 FROM recette_fonctionnalites rf WHERE rf.recette_id = r.recette_id)
+          AND NOT EXISTS (SELECT 1 FROM cadrage_fonctionnalites rf WHERE rf.cadrage_id = r.cadrage_id)
         ORDER BY r.created_at ASC`, [pid],
-    )).rows.map((r) => ({ entityType: "recette", id: r.recette_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
-  } else if (v === "recette_sans_sprint") {
+    )).rows.map((r) => ({ entityType: "cadrage", id: r.cadrage_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
+  } else if (v === "cadrage_sans_sprint") {
     items = (await pool().query(
-      `SELECT r.recette_id, r.title, r.status, r.created_at
-         FROM recettes r
+      `SELECT r.cadrage_id, r.title, r.status, r.created_at
+         FROM cadrages r
         WHERE r.project = $1
-          AND NOT EXISTS (SELECT 1 FROM recette_sprints rs WHERE rs.recette_id = r.recette_id)
+          AND NOT EXISTS (SELECT 1 FROM cadrage_sprints rs WHERE rs.cadrage_id = r.cadrage_id)
         ORDER BY r.created_at ASC`, [pid],
-    )).rows.map((r) => ({ entityType: "recette", id: r.recette_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
+    )).rows.map((r) => ({ entityType: "cadrage", id: r.cadrage_id, title: r.title ?? null, status: r.status ?? null, createdAt: r.created_at }));
   } else if (v === "adr_sans_fonctionnalite") {
     items = (await pool().query(
       `SELECT a.artifact_id, a.title, a.path, a.status, a.created_at
@@ -3582,99 +3600,99 @@ export async function cardinalityReport({ projectId } = {}) {
   };
 }
 
-// --- Liaisons RECETTE ↔ sprint / fonctionnalité(s) / ADR(s) -----------------
+// --- Liaisons CADRAGE ↔ sprint / fonctionnalité(s) / ADR(s) -----------------
 
-export async function linkRecetteSprint({ recetteId, sprintId } = {}) {
+export async function linkCadrageSprint({ cadrageId, sprintId } = {}) {
   await ensureSchema();
-  const rec = await getRecetteById(recetteId);
-  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const rec = await getCadrageById(cadrageId);
+  if (!rec) throw new Error(`cadrage inconnu : ${cadrageId}`);
   const s = await getSprint(sprintId);
   if (!s) throw new Error(`sprint inconnu : ${sprintId}`);
   const ins = await pool().query(
-    "INSERT INTO recette_sprints (recette_id, sprint_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-    [rec.recetteId, s.id],
+    "INSERT INTO cadrage_sprints (cadrage_id, sprint_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.cadrageId, s.id],
   );
-  return { ok: true, recetteId: rec.recetteId, sprintId: s.id, linked: ins.rowCount > 0 };
+  return { ok: true, cadrageId: rec.cadrageId, sprintId: s.id, linked: ins.rowCount > 0 };
 }
 
-export async function unlinkRecetteSprint({ recetteId, sprintId } = {}) {
+export async function unlinkCadrageSprint({ cadrageId, sprintId } = {}) {
   await ensureSchema();
-  if (!recetteId || !sprintId) throw new Error("recetteId et sprintId requis");
+  if (!cadrageId || !sprintId) throw new Error("cadrageId et sprintId requis");
   const del = await pool().query(
-    "DELETE FROM recette_sprints WHERE recette_id = $1 AND sprint_id = $2",
-    [String(recetteId), String(sprintId)],
+    "DELETE FROM cadrage_sprints WHERE cadrage_id = $1 AND sprint_id = $2",
+    [String(cadrageId), String(sprintId)],
   );
-  return { ok: true, recetteId: String(recetteId), sprintId: String(sprintId), unlinked: del.rowCount > 0 };
+  return { ok: true, cadrageId: String(cadrageId), sprintId: String(sprintId), unlinked: del.rowCount > 0 };
 }
 
-export async function linkRecetteFeature({ recetteId, featureId } = {}) {
+export async function linkCadrageFeature({ cadrageId, featureId } = {}) {
   await ensureSchema();
-  const rec = await getRecetteById(recetteId);
-  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const rec = await getCadrageById(cadrageId);
+  if (!rec) throw new Error(`cadrage inconnu : ${cadrageId}`);
   const f = await getFeature(featureId);
   if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
   const ins = await pool().query(
-    "INSERT INTO recette_fonctionnalites (recette_id, fonctionnalite_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-    [rec.recetteId, f.id],
+    "INSERT INTO cadrage_fonctionnalites (cadrage_id, fonctionnalite_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.cadrageId, f.id],
   );
-  return { ok: true, recetteId: rec.recetteId, featureId: f.id, linked: ins.rowCount > 0 };
+  return { ok: true, cadrageId: rec.cadrageId, featureId: f.id, linked: ins.rowCount > 0 };
 }
 
-export async function unlinkRecetteFeature({ recetteId, featureId } = {}) {
+export async function unlinkCadrageFeature({ cadrageId, featureId } = {}) {
   await ensureSchema();
-  if (!recetteId || !featureId) throw new Error("recetteId et featureId requis");
+  if (!cadrageId || !featureId) throw new Error("cadrageId et featureId requis");
   const del = await pool().query(
-    "DELETE FROM recette_fonctionnalites WHERE recette_id = $1 AND fonctionnalite_id = $2",
-    [String(recetteId), String(featureId)],
+    "DELETE FROM cadrage_fonctionnalites WHERE cadrage_id = $1 AND fonctionnalite_id = $2",
+    [String(cadrageId), String(featureId)],
   );
-  return { ok: true, recetteId: String(recetteId), featureId: String(featureId), unlinked: del.rowCount > 0 };
+  return { ok: true, cadrageId: String(cadrageId), featureId: String(featureId), unlinked: del.rowCount > 0 };
 }
 
-export async function linkRecetteAdr({ recetteId, adrId } = {}) {
+export async function linkCadrageAdr({ cadrageId, adrId } = {}) {
   await ensureSchema();
-  const rec = await getRecetteById(recetteId);
-  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const rec = await getCadrageById(cadrageId);
+  if (!rec) throw new Error(`cadrage inconnu : ${cadrageId}`);
   const adr = await getAdr(adrId);
   if (!adr) throw new Error(`ADR inconnue (kind='adr-tech' attendu) : ${adrId}`);
   const ins = await pool().query(
-    "INSERT INTO recette_adr (recette_id, adr_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-    [rec.recetteId, adr.adrId],
+    "INSERT INTO cadrage_adr (cadrage_id, adr_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.cadrageId, adr.adrId],
   );
-  return { ok: true, recetteId: rec.recetteId, adrId: adr.adrId, linked: ins.rowCount > 0 };
+  return { ok: true, cadrageId: rec.cadrageId, adrId: adr.adrId, linked: ins.rowCount > 0 };
 }
 
-export async function unlinkRecetteAdr({ recetteId, adrId } = {}) {
+export async function unlinkCadrageAdr({ cadrageId, adrId } = {}) {
   await ensureSchema();
-  if (!recetteId || !adrId) throw new Error("recetteId et adrId requis");
+  if (!cadrageId || !adrId) throw new Error("cadrageId et adrId requis");
   const del = await pool().query(
-    "DELETE FROM recette_adr WHERE recette_id = $1 AND adr_id = $2",
-    [String(recetteId), String(adrId)],
+    "DELETE FROM cadrage_adr WHERE cadrage_id = $1 AND adr_id = $2",
+    [String(cadrageId), String(adrId)],
   );
-  return { ok: true, recetteId: String(recetteId), adrId: String(adrId), unlinked: del.rowCount > 0 };
+  return { ok: true, cadrageId: String(cadrageId), adrId: String(adrId), unlinked: del.rowCount > 0 };
 }
 
-// Recette ↔ règle métier (T-20260922-070103-ncs1). Miroir de `linkRecetteFeature`.
-export async function linkRecetteRule({ recetteId, ruleId } = {}) {
+// Cadrage ↔ règle métier (T-20260922-070103-ncs1). Miroir de `linkCadrageFeature`.
+export async function linkCadrageRule({ cadrageId, ruleId } = {}) {
   await ensureSchema();
-  const rec = await getRecetteById(recetteId);
-  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const rec = await getCadrageById(cadrageId);
+  if (!rec) throw new Error(`cadrage inconnu : ${cadrageId}`);
   const rule = await getRule(ruleId);
   if (!rule) throw new Error(`règle métier inconnue : ${ruleId}`);
   const ins = await pool().query(
-    "INSERT INTO recette_regles (recette_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-    [rec.recetteId, rule.id],
+    "INSERT INTO cadrage_regles (cadrage_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [rec.cadrageId, rule.id],
   );
-  return { ok: true, recetteId: rec.recetteId, ruleId: rule.id, linked: ins.rowCount > 0 };
+  return { ok: true, cadrageId: rec.cadrageId, ruleId: rule.id, linked: ins.rowCount > 0 };
 }
 
-export async function unlinkRecetteRule({ recetteId, ruleId } = {}) {
+export async function unlinkCadrageRule({ cadrageId, ruleId } = {}) {
   await ensureSchema();
-  if (!recetteId || !ruleId) throw new Error("recetteId et ruleId requis");
+  if (!cadrageId || !ruleId) throw new Error("cadrageId et ruleId requis");
   const del = await pool().query(
-    "DELETE FROM recette_regles WHERE recette_id = $1 AND regle_id = $2",
-    [String(recetteId), String(ruleId)],
+    "DELETE FROM cadrage_regles WHERE cadrage_id = $1 AND regle_id = $2",
+    [String(cadrageId), String(ruleId)],
   );
-  return { ok: true, recetteId: String(recetteId), ruleId: String(ruleId), unlinked: del.rowCount > 0 };
+  return { ok: true, cadrageId: String(cadrageId), ruleId: String(ruleId), unlinked: del.rowCount > 0 };
 }
 
 // Transaction (BEGIN/COMMIT/ROLLBACK) sur une connexion dédiée.
@@ -3708,7 +3726,7 @@ export async function createTask(task) {
     `INSERT INTO tasks
        (id, request, title, project, workspace, type, audit_target, priority, deadline,
         budget_maxsteps, budget_maxcost, scope, acceptance_criteria,
-        constraints, dependencies, created_at, created_by, session_id, recette_class, recette_id, direct_execution, organization_id)
+        constraints, dependencies, created_at, created_by, session_id, cadrage_class, cadrage_id, direct_execution, organization_id)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`,
     [
       task.id,
@@ -3729,8 +3747,8 @@ export async function createTask(task) {
       nowIso(),
       createdBy,
       task.sessionId ?? null,
-      task.recetteClass ?? null,
-      task.recetteId ?? null,
+      task.cadrageClass ?? null,
+      task.cadrageId ?? null,
       task.directExecution ? 1 : 0,
       organizationId,
     ],
@@ -3743,7 +3761,7 @@ export async function createTask(task) {
   );
   // LIENS OPTIONNELS (T6) — NON BLOQUANTS : sprint explicite OU sprint par
   // défaut (si le projet n'a AUCUN sprint), fonctionnalités, ADR PROPOSÉES
-  // (l'humain valide en recette). Chaque garde est en try/catch : la création
+  // (l'humain valide en cadrage). Chaque garde est en try/catch : la création
   // ne peut JAMAIS échouer à cause d'un lien.
   try {
     if (task.sprintId) await linkTaskSprint({ taskId: task.id, sprintId: task.sprintId });
@@ -3758,13 +3776,13 @@ export async function createTask(task) {
     try { await proposeTaskAdr({ taskId: task.id, adrId: aid, by: createdBy, reason: "lien ADR proposé à la création (T6)" }); } catch {}
   }
   // ÉMERGENCE de la TÂCHE (ADR-001 §5) via la garde partagée : créée hors sprint
-  // (`hors_sprint`), après clôture (`apres_cloture`), issue d'une recette
-  // (`recette`) ou sans fonctionnalité dans le sprint courant
+  // (`hors_sprint`), après clôture (`apres_cloture`), issue d'un cadrage
+  // (`cadrage`) ou sans fonctionnalité dans le sprint courant
   // (`sans_fonctionnalite`) → marquée émergente, TRACÉE et NON BLOQUANTE.
   // Jamais rétroactif (les tâches existantes ne sont pas re-marquées — T9).
   const hasFeature = Array.isArray(task.featureIds) && task.featureIds.length > 0;
-  const fromRecette = !!task.recetteId;
-  const emergence = await classifyEmergence(task.project, { kind: "element", hasFeature, fromRecette });
+  const fromCadrage = !!task.cadrageId;
+  const emergence = await classifyEmergence(task.project, { kind: "element", hasFeature, fromCadrage });
   if (emergence.emergent) {
     await pool().query(
       "UPDATE tasks SET emergent = 1, emergent_origin = $2 WHERE id = $1",
@@ -3827,7 +3845,7 @@ export async function listTaskLinks(taskId) {
   await ensureSchema();
   const res = await pool().query(
     `SELECT l.linked_task_id, l.description, l.relation_type, l.created_at,
-            t.request AS linked_request, t.recette_status AS linked_recette,
+            t.request AS linked_request, t.cadrage_status AS linked_cadrage,
             (SELECT x.status FROM executions x WHERE x.task_id = l.linked_task_id ORDER BY attempt DESC LIMIT 1) AS linked_status,
             (SELECT COUNT(*) FROM plans p WHERE p.task_id = l.linked_task_id) AS linked_plans,
             (SELECT COUNT(*) FROM artifacts a WHERE a.content_id = l.linked_task_id AND a.doc_type = ANY($2)) AS linked_artifacts
@@ -3843,7 +3861,7 @@ export async function listTaskLinks(taskId) {
     relationType: r.relation_type || "linked",
     createdAt: r.created_at,
     linkedRequest: r.linked_request ?? null,
-    linkedRecette: r.linked_recette ?? null,
+    linkedCadrage: r.linked_cadrage ?? null,
     linkedStatus: r.linked_status ?? null,
     linkedPlans: Number(r.linked_plans) || 0,
     linkedArtifacts: Number(r.linked_artifacts) || 0,
@@ -3856,7 +3874,7 @@ export async function listTaskLinks(taskId) {
 export async function listTaskEmergentFrom(sourceTaskId) {
   await ensureSchema();
   const res = await pool().query(
-    `SELECT t.id, t.request, t.title, t.recette_status,
+    `SELECT t.id, t.request, t.title, t.cadrage_status,
             (SELECT x.status FROM executions x WHERE x.task_id = t.id ORDER BY attempt DESC LIMIT 1) AS status,
             l.description AS link_reason
      FROM task_links l
@@ -3869,7 +3887,7 @@ export async function listTaskEmergentFrom(sourceTaskId) {
     taskId: r.id,
     request: r.request,
     title: r.title ?? null,
-    recetteStatus: r.recette_status ?? "pending",
+    cadrageStatus: r.cadrage_status ?? "pending",
     status: r.status ?? "queued",
     reason: r.link_reason ?? null,
   }));
@@ -3895,9 +3913,9 @@ function rowToTask(row) {
     createdAt: row.created_at,
     createdBy: row.created_by,
     sessionId: row.session_id,
-    recetteStatus: row.recette_status ?? "pending",
-    recetteClass: row.recette_class ?? null,
-    recetteId: row.recette_id ?? null,
+    cadrageStatus: row.cadrage_status ?? "pending",
+    cadrageClass: row.cadrage_class ?? null,
+    cadrageId: row.cadrage_id ?? null,
     title: row.title ?? null,
     directExecution: !!row.direct_execution,
     emergent: !!row.emergent,
@@ -4188,8 +4206,8 @@ export async function applyTransition({ taskId, to, by, note }) {
         );
       }
     }
-    // v0.8.0 : PLUS de recette automatique par tâche — la recette est une
-    // opération de PROJET (0..N tâches), créée par l'utilisateur (onglet Recettes).
+    // v0.8.0 : PLUS de cadrage automatique par tâche — le cadrage est une
+    // opération de PROJET (0..N tâches), créée par l'utilisateur (onglet Cadrages).
     return { from, to };
   });
   return {
@@ -4921,7 +4939,7 @@ export const DOC_ATTACHMENT_SOURCES = ["registry", "import", "ref"];
 // (panneau orchestrator-panel) et la tâche T-20260920-162801-jxtr.
 // Une SEULE table `artifacts` porte tous les artefacts, identifiés par le
 // couple (doc_type, content_id). `kind` est la NATURE, distincte de `doc_type`.
-export const DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file", "plan", "task_synthese", "task_report", "audit_report", "recette_report", "recette_doc", "e2e_report", "e2e_video", "piece", "autre"];
+export const DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file", "plan", "task_synthese", "task_report", "audit_report", "cadrage_report", "cadrage_doc", "e2e_report", "e2e_video", "piece", "autre"];
 // Famille « pièce client » (ADR-001) : matière première des sprints. Une pièce
 // est un artefact `doc_type='piece'`, `content_id = projectId` (le PROJET est
 // l'entité porteuse), `kind='autre'` ; les métadonnées vivent dans `meta` (JSONB).
@@ -4941,15 +4959,15 @@ export const PIECE_LINK_SECURITY_NOTE = "Lien public : toute personne disposant 
 export const DOCS_DOC_TYPES = ["adr", "specs", "gherkin", "project_doc", "adr_file"];
 // Famille « task » : artefacts rattachés à une tâche (content_id = taskId).
 export const TASK_DOC_TYPES = ["plan", "task_synthese", "task_report", "audit_report", "autre"];
-// Famille « recette » : documents d'appui et rapports de recette.
-export const RECETTE_DOC_TYPES = ["recette_report", "recette_doc"];
+// Famille « cadrage » : documents d'appui et rapports de cadrage.
+export const CADRAGE_DOC_TYPES = ["cadrage_report", "cadrage_doc"];
 // Pièces jointes d'une ÉVALUATION (recette évaluateur) — artefacts
-// `doc_type='evaluation_doc'`, `content_id` = evaluationId. Famille ISOLÉE des
-// pièces client : sa garde CIBLÉE est `assertEvaluationDocAllowed` (voir plus
+// `doc_type='recette_doc'`, `content_id` = recetteId. Famille ISOLÉE des
+// pièces client : sa garde CIBLÉE est `assertRecetteDocAllowed` (voir plus
 // bas), qui ADMET explicitement les PHOTOS et VIDÉOS (preuves visuelles de
 // l'évaluateur). La garde photo/vidéo des pièces client (`assertPieceAllowed`)
 // ne s'applique PAS ici.
-export const EVALUATION_DOC_TYPES = ["evaluation_doc"];
+export const RECETTE_DOC_TYPES = ["recette_doc"];
 // Natures ADMISES d'une pièce d'ÉVALUATION (recette évaluateur, ADR-003) :
 // lien | document | photo | video | maquette | performance. DISTINCTE de
 // `PIECE_NATURES` (pièces client de sprint) : les PHOTOS et VIDÉOS y sont
@@ -4958,11 +4976,11 @@ export const EVALUATION_DOC_TYPES = ["evaluation_doc"];
 // servie par le panneau comme page statique (URL) ; `performance` = rapport de
 // test de performance (durées réseau + Core Web Vitals + stress) préprod.
 // CONVERGENCE (ADR-003) : aucune table neuve, ce sont 2 natures SUPPLÉMENTAIRES
-// de la famille `doc_type='evaluation_doc'`.
-export const EVALUATION_DOC_NATURES = ["lien", "document", "photo", "video", "maquette", "performance"];
+// de la famille `doc_type='recette_doc'`.
+export const RECETTE_DOC_NATURES = ["lien", "document", "photo", "video", "maquette", "performance"];
 // Extension de fichier → nature d'évaluation. Les extensions photo/vidéo sont
 // résolues EXPLICITEMENT (au lieu d'être refusées comme pour les pièces client).
-export const EVALUATION_DOC_NATURE_BY_EXT = {
+export const RECETTE_DOC_NATURE_BY_EXT = {
   ".md": "document", ".markdown": "document", ".pdf": "document", ".docx": "document",
   ".jpg": "photo", ".jpeg": "photo", ".png": "photo", ".gif": "photo", ".webp": "photo",
   ".heic": "photo", ".bmp": "photo", ".tiff": "photo",
@@ -4971,9 +4989,9 @@ export const EVALUATION_DOC_NATURE_BY_EXT = {
 // Répertoire de stockage des MAQUETTES d'évaluation (pages statiques HTML/CSS/JS
 // servies par le PANNEAU comme page accessible par URL). Il DOIT coïncider avec
 // `EVALUATION_MAQUETTE_DIR` du panneau (server.mjs) : le tool MCP
-// `evaluation_maquette_add` écrit ici, et le panneau sert ces fichiers via
-// `GET /api/evaluations/:id/maquette/*`. Surchargeable par env (worktree / test).
-export const EVALUATION_MAQUETTE_DIR =
+// `recette_maquette_add` écrit ici, et le panneau sert ces fichiers via
+// `GET /api/recettes/:id/maquette/*`. Surchargeable par env (worktree / test).
+export const RECETTE_MAQUETTE_DIR =
   process.env.EVALUATION_MAQUETTE_DIR || "/root/orchestrator-panel/storage/evaluation-maquettes";
 // Garde d'un chemin RELATIF de fichier de maquette : refuse l'absolu et toute
 // remontée (`..`) — les fichiers restent confinés au dossier de la maquette.
@@ -5365,7 +5383,7 @@ export async function listDocs({ kind, status, projectId, repoId, includeRepoDoc
   return enrichDocs(rows);
 }
 
-// Docs applicables à un PROJET (contextes test-agent / recette) : docs portés
+// Docs applicables à un PROJET (contextes test-agent / cadrage) : docs portés
 // par le projet + docs portés par chacun de ses repos. Chaque doc enrichi d'une
 // liste d'origines (projectIds/repoIds) pour l'affichage contexte.
 export async function docsForProjectContext(projectId) {
@@ -5501,10 +5519,10 @@ function rowToAdrConflict(r) {
 
 // ---------------------------------------------------------------------------
 // Vigilances ADR (item 126) — points de vigilance ADR remontés par une session
-// de RECETTE / TEST : ADR manquante (type='missing') ou conflit d'ADR
+// de CADRAGE / TEST : ADR manquante (type='missing') ou conflit d'ADR
 // (type='conflict'). HISTORIQUE APPEND-ONLY (aucun DELETE) ; seul `status`
 // transite `open → resolved` avec une raison TRACÉE (`resolution`).
-// Un point ouvert rattaché à une recette BLOQUE sa terminaison (confirmRecette).
+// Un point ouvert rattaché à un cadrage BLOQUE sa terminaison (confirmCadrage).
 // ---------------------------------------------------------------------------
 export const ADR_VIGILANCE_TYPES = ["missing", "conflict"];
 export const ADR_VIGILANCE_STATUS = ["open", "resolved"];
@@ -5515,7 +5533,7 @@ function rowToAdrVigilance(r) {
   return {
     vigilanceId: r.vigilance_id,
     project: r.project,
-    recetteId: r.recette_id ?? null,
+    cadrageId: r.cadrage_id ?? null,
     taskId: r.task_id ?? null,
     sessionId: r.session_id ?? null,
     type: r.type,
@@ -5535,7 +5553,7 @@ function rowToAdrVigilance(r) {
 }
 
 // Raison EXPLICITE et normalisée d'un point de vigilance — réutilisée par la
-// garde de terminaison (`confirmRecette`) et par l'UI (« Terminer la recette »
+// garde de terminaison (`confirmCadrage`) et par l'UI (« Terminer le cadrage »
 // bloqué avec la raison). Ex : « ADR manquant pour [entité] » /
 // « Conflit d'ADR : [ancienne] vs [nouvelle] ».
 export function adrVigilanceReason(v) {
@@ -5553,14 +5571,14 @@ async function insertAdrVigilance(fields = {}) {
   const vigilanceId = fields.vigilanceId || `adr-vig-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
     `INSERT INTO adr_vigilances
-       (vigilance_id, project, recette_id, task_id, session_id, type, status, entity,
+       (vigilance_id, project, cadrage_id, task_id, session_id, type, status, entity,
         description, adr_id, related_adr_id, conflict_id, resolution, resolution_kind,
         created_at, created_by, resolved_at, resolved_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
     [
       vigilanceId,
       String(fields.project),
-      fields.recetteId ? String(fields.recetteId) : null,
+      fields.cadrageId ? String(fields.cadrageId) : null,
       fields.taskId ? String(fields.taskId) : null,
       fields.sessionId ? String(fields.sessionId) : null,
       fields.type,
@@ -5940,10 +5958,10 @@ export async function convertAdr({
 // Signale un conflit code ↔ ADR. Le conflit est TOUJOURS persisté ; si `taskId`
 // est fourni, une décision humaine `kind='conflict'` est créée en plus (résolue
 // ⇒ conflit clôturé par resolveDecisionAndTransition). Aucune violation silencieuse.
-// `recetteId` (OPTIONNEL, rétrocompat) : un conflit signalé PENDANT une recette
-// devient aussi un POINT DE VIGILANCE GLOBALE de la recette (bloquant sa
+// `cadrageId` (OPTIONNEL, rétrocompat) : un conflit signalé PENDANT un cadrage
+// devient aussi un POINT DE VIGILANCE GLOBALE du cadrage (bloquant sa
 // terminaison) — en plus de la ligne `adr_conflicts`.
-export async function reportAdrConflict({ adrId, taskId, recetteId, description, by, entity, relatedAdrId } = {}) {
+export async function reportAdrConflict({ adrId, taskId, cadrageId, description, by, entity, relatedAdrId } = {}) {
   await ensureSchema();
   if (!adrId) throw new Error("adrId requis");
   const desc = description === undefined || description === null ? "" : String(description).trim();
@@ -5970,14 +5988,14 @@ export async function reportAdrConflict({ adrId, taskId, recetteId, description,
   const conflict = rowToAdrConflict(
     (await pool().query("SELECT * FROM adr_conflicts WHERE conflict_id = $1", [conflictId])).rows[0],
   );
-  // Point de vigilance GLOBAL de recette (uniquement si `recetteId` — comportement
-  // inchangé sans lui). Le projet est celui de la recette.
+  // Point de vigilance GLOBAL de cadrage (uniquement si `cadrageId` — comportement
+  // inchangé sans lui). Le projet est celui du cadrage.
   let vigilance = null;
-  if (recetteId) {
-    const r = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [String(recetteId)])).rows[0];
-    if (!r) throw new Error(`recette inconnue : ${recetteId}`);
+  if (cadrageId) {
+    const r = (await pool().query("SELECT project FROM cadrages WHERE cadrage_id = $1", [String(cadrageId)])).rows[0];
+    if (!r) throw new Error(`cadrage inconnu : ${cadrageId}`);
     const vigilanceId = await insertAdrVigilance({
-      project: r.project, recetteId, taskId,
+      project: r.project, cadrageId, taskId,
       type: "conflict", status: "open",
       entity: entity ?? null, description: desc,
       adrId, relatedAdrId: relatedAdrId || null, conflictId,
@@ -6002,21 +6020,21 @@ export async function listAdrConflicts({ adrId, status } = {}) {
   return rows.map(rowToAdrConflict);
 }
 
-// Signale une ADR MANQUANTE pour une entité réellement discutée (recette/test).
+// Signale une ADR MANQUANTE pour une entité réellement discutée (cadrage/test).
 // Exige `entity` ET `description` (évite les fausses alertes). Résout le projet :
-// recette → `recettes.project`, sinon tâche → `tasks.project`, sinon `projectId`.
+// cadrage → `cadrages.project`, sinon tâche → `tasks.project`, sinon `projectId`.
 // `proposedAdrId` (optionnel) référence l'ADR Proposé créée depuis la session.
 // Retourne le point de vigilance (avec `reason` explicite).
-export async function reportAdrMissing({ recetteId, taskId, projectId, entity, description, proposedAdrId, sessionId, by } = {}) {
+export async function reportAdrMissing({ cadrageId, taskId, projectId, entity, description, proposedAdrId, sessionId, by } = {}) {
   await ensureSchema();
   const ent = entity === undefined || entity === null ? "" : String(entity).trim();
   if (!ent) throw new Error("entity requis (entité réellement discutée)");
   const desc = description === undefined || description === null ? "" : String(description).trim();
   if (!desc) throw new Error("description requise");
   let project = projectId ? String(projectId) : null;
-  if (!project && recetteId) {
-    const r = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [String(recetteId)])).rows[0];
-    if (!r) throw new Error(`recette inconnue : ${recetteId}`);
+  if (!project && cadrageId) {
+    const r = (await pool().query("SELECT project FROM cadrages WHERE cadrage_id = $1", [String(cadrageId)])).rows[0];
+    if (!r) throw new Error(`cadrage inconnu : ${cadrageId}`);
     project = r.project;
   }
   if (!project && taskId) {
@@ -6024,27 +6042,27 @@ export async function reportAdrMissing({ recetteId, taskId, projectId, entity, d
     if (!t) throw new Error(`tâche inconnue : ${taskId}`);
     project = t.project;
   }
-  if (!project) throw new Error("projectId requis (ou recetteId/taskId permettant de le résoudre)");
+  if (!project) throw new Error("projectId requis (ou cadrageId/taskId permettant de le résoudre)");
   if (proposedAdrId && !(await getAdr(proposedAdrId))) {
     throw new Error(`ADR proposée inconnue (kind='adr-tech' attendu) : ${proposedAdrId}`);
   }
   const vigilanceId = await insertAdrVigilance({
-    project, recetteId, taskId, sessionId,
+    project, cadrageId, taskId, sessionId,
     type: "missing", status: "open", entity: ent, description: desc,
     adrId: proposedAdrId || null, by,
   });
   return getAdrVigilance(vigilanceId);
 }
 
-// HISTORIQUE des points de vigilance ADR — filtrable (projet, recette, type,
+// HISTORIQUE des points de vigilance ADR — filtrable (projet, cadrage, type,
 // statut, plage de dates) et APPEND-ONLY (lecture seule). Chaque point porte sa
 // `reason` explicite (réutilisée par la garde de terminaison et l'UI).
-export async function listAdrVigilances({ projectId, recetteId, type, status, from, to, limit = 500 } = {}) {
+export async function listAdrVigilances({ projectId, cadrageId, type, status, from, to, limit = 500 } = {}) {
   await ensureSchema();
   const conds = [];
   const params = [];
   if (projectId) { params.push(String(projectId)); conds.push(`project = $${params.length}`); }
-  if (recetteId) { params.push(String(recetteId)); conds.push(`recette_id = $${params.length}`); }
+  if (cadrageId) { params.push(String(cadrageId)); conds.push(`cadrage_id = $${params.length}`); }
   if (type) { params.push(String(type)); conds.push(`type = $${params.length}`); }
   if (status) { params.push(String(status)); conds.push(`status = $${params.length}`); }
   if (from) { params.push(String(from)); conds.push(`created_at >= $${params.length}`); }
@@ -6112,16 +6130,16 @@ export async function deleteTask(taskId) {
   return { taskId, deleted: true };
 }
 
-// --- Recette (acceptation humaine après déploiement) ------------------------
-export async function resolveRecette({ taskId, status, resolution, by }) {
+// --- Cadrage (acceptation humaine après déploiement) ------------------------
+export async function resolveCadrage({ taskId, status, resolution, by }) {
   await ensureSchema();
   const task = await getTask(taskId);
   if (!task) throw new Error(`tâche inconnue : ${taskId}`);
   const exec = await getCurrentExecution(taskId);
   if (!exec || exec.status !== "done") {
-    throw new Error(`recette impossible : la tâche ${taskId} doit être au statut "done" (actuel : ${exec?.status || "inconnu"})`);
+    throw new Error(`cadrage impossible : la tâche ${taskId} doit être au statut "done" (actuel : ${exec?.status || "inconnu"})`);
   }
-  if (!["approved", "rejected"].includes(status)) throw new Error(`statut de recette invalide : ${status}`);
+  if (!["approved", "rejected"].includes(status)) throw new Error(`statut de cadrage invalide : ${status}`);
 
   const ts = nowIso();
   const by_ = by || "human";
@@ -6135,7 +6153,7 @@ export async function resolveRecette({ taskId, status, resolution, by }) {
     if (lockRes.rowCount === 0) throw new Error(`conflit d'écriture (version) sur ${taskId}`);
 
     const existing = (await client.query(
-      "SELECT decision_id FROM decisions WHERE task_id = $1 AND kind = 'recette' AND status = 'awaiting' ORDER BY id LIMIT 1",
+      "SELECT decision_id FROM decisions WHERE task_id = $1 AND kind = 'cadrage' AND status = 'awaiting' ORDER BY id LIMIT 1",
       [taskId],
     )).rows[0];
     if (existing) {
@@ -6148,27 +6166,27 @@ export async function resolveRecette({ taskId, status, resolution, by }) {
       decisionId = `DEC-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
       await client.query(
         `INSERT INTO decisions (decision_id, task_id, kind, status, requested_at, requested_by, session_id, expires_at, detail, permission_id)
-         VALUES ($1,$2,'recette',$3,$4,$5,NULL,NULL,$6,NULL)`,
-        [decisionId, taskId, status, ts, by_, "Validation de recette (acceptation humaine après déploiement)"],
+         VALUES ($1,$2,'cadrage',$3,$4,$5,NULL,NULL,$6,NULL)`,
+        [decisionId, taskId, status, ts, by_, "Validation de cadrage (acceptation humaine après déploiement)"],
       );
     }
 
-    await client.query("UPDATE tasks SET recette_status = $1 WHERE id = $2", [status, taskId]);
+    await client.query("UPDATE tasks SET cadrage_status = $1 WHERE id = $2", [status, taskId]);
 
     await client.query(
       "INSERT INTO events (event_id, task_id, ts, type, by, detail) VALUES ($1,$2,$3,'CLOSED',$4,$5)",
-      [`${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, taskId, ts, by_, JSON.stringify({ kind: "recette", status, remarks: resolution ?? null, at: ts })],
+      [`${taskId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, taskId, ts, by_, JSON.stringify({ kind: "cadrage", status, remarks: resolution ?? null, at: ts })],
     );
   });
 
-  return { ok: true, taskId, recetteStatus: status, decisionId, task: await getTask(taskId) };
+  return { ok: true, taskId, cadrageStatus: status, decisionId, task: await getTask(taskId) };
 }
 
-// Remet la recette à `pending` (début d'une reprise après rejet de recette).
-export async function resetRecette(taskId) {
+// Remet le cadrage à `pending` (début d'une reprise après rejet de cadrage).
+export async function resetCadrage(taskId) {
   await ensureSchema();
   if (!(await getTask(taskId))) throw new Error(`tâche inconnue : ${taskId}`);
-  await pool().query("UPDATE tasks SET recette_status = 'pending' WHERE id = $1", [taskId]);
+  await pool().query("UPDATE tasks SET cadrage_status = 'pending' WHERE id = $1", [taskId]);
   return getTask(taskId);
 }
 
@@ -6291,9 +6309,9 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
     await resolveDecision(decisionId, status, resolution);
     return { decision: await getDecision(decisionId), transitioned: false };
   }
-  if (decision.kind === "recette") {
-    const r = await resolveRecette({ taskId: decision.taskId, status, resolution, by });
-    return { decision: await getDecision(decisionId), transitioned: false, recetteStatus: r.recetteStatus };
+  if (decision.kind === "cadrage") {
+    const r = await resolveCadrage({ taskId: decision.taskId, status, resolution, by });
+    return { decision: await getDecision(decisionId), transitioned: false, cadrageStatus: r.cadrageStatus };
   }
 
   const task = await getTask(decision.taskId);
@@ -6329,7 +6347,7 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
         "UPDATE adr_conflicts SET status = 'resolved' WHERE decision_id = $1",
         [decisionId],
       );
-      // Lève AUSSI le point de vigilance ADR de recette lié (item 126) : trancher
+      // Lève AUSSI le point de vigilance ADR de cadrage lié (item 126) : trancher
       // le conflit (décision humaine) ne doit pas laisser de blocage orphelin.
       await client.query(
         `UPDATE adr_vigilances
@@ -6375,103 +6393,103 @@ export async function resolveDecisionAndTransition({ decisionId, status, resolut
 }
 
 // ===========================================================================
-// Recette (opération de vérification) — v0.8.0 (objet de premier niveau, projet)
+// Cadrage (opération de vérification) — v0.8.0 (objet de premier niveau, projet)
 // ===========================================================================
 
-// Crée une recette de PROJET (titre + 0..N tâches couvertes) et la passe en cours.
+// Crée un cadrage de PROJET (titre + 0..N tâches couvertes) et le passe en cours.
 // `sprintId`/`featureIds`/`ruleIds`/`adrIds` (T6, OPTIONNELS) : liens posés à la
 // création (NON bloquants). Sans `sprintId`, rattachement au SPRINT PAR DÉFAUT si
-// le projet n'a aucun sprint. Un signal de cardinalité est tracé (recette → ≥1 ADR
+// le projet n'a aucun sprint. Un signal de cardinalité est tracé (cadrage → ≥1 ADR
 // + ≥1 fonctionnalité + 1 sprint).
-export async function startRecette({ project, projects, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status = "pending", sessionId = null, organizationId, createdBy }) {
+export async function startCadrage({ project, projects, title, description, taskIds, sprintId, featureIds, ruleIds, adrIds, status = "pending", sessionId = null, organizationId, createdBy }) {
   await ensureSchema();
-  // 1 recette = 1 PROJET unique. Les repos transverses du projet (project_repos)
-  // sont la portée de la recette — pas d'ajout de projets supplémentaires.
+  // 1 cadrage = 1 PROJET unique. Les repos transverses du projet (project_repos)
+  // sont la portée du cadrage — pas d'ajout de projets supplémentaires.
   const projs = [...new Set(((projects && projects.length ? projects : (project ? [project] : [])).map((p) => p && String(p).trim()).filter(Boolean)))];
-  if (projs.length === 0) throw new Error("un projet requis pour une recette");
-  if (projs.length > 1) throw new Error(`1 recette = 1 projet (reçu ${projs.length}) : ${projs.join(", ")} — les repos transverses du projet couvrent la portée`);
+  if (projs.length === 0) throw new Error("un projet requis pour un cadrage");
+  if (projs.length > 1) throw new Error(`1 cadrage = 1 projet (reçu ${projs.length}) : ${projs.join(", ")} — les repos transverses du projet couvrent la portée`);
   const p = projs[0];
   await assertProjectExists(p);
   const org = organizationId || await orgIdOfProject(p) || await defaultOrganizationId();
-  const recetteId = `RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const cadrageId = `CT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
-    "INSERT INTO recettes (recette_id, project, title, description, session_id, status, created_at, organization_id, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-    [recetteId, p, title || `Recette ${p}`, description ?? null, sessionId, status, nowIso(), org, createdBy ?? null],
+    "INSERT INTO cadrages (cadrage_id, project, title, description, session_id, status, created_at, organization_id, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    [cadrageId, p, title || `Cadrage ${p}`, description ?? null, sessionId, status, nowIso(), org, createdBy ?? null],
   );
   for (const t of taskIds || []) {
-    if (t) await linkRecetteTask(recetteId, t);
+    if (t) await linkCadrageTask(cadrageId, t);
   }
   // LIENS OPTIONNELS (T6) — NON BLOQUANTS : sprint explicite OU sprint par
   // défaut (si le projet n'a aucun sprint), fonctionnalités, ADR.
   try {
-    if (sprintId) await linkRecetteSprint({ recetteId, sprintId });
-    else await ensureDefaultSprintLink({ entityType: "recette", entityId: recetteId, projectId: p, by: createdBy });
+    if (sprintId) await linkCadrageSprint({ cadrageId, sprintId });
+    else await ensureDefaultSprintLink({ entityType: "cadrage", entityId: cadrageId, projectId: p, by: createdBy });
   } catch {}
   for (const fid of Array.isArray(featureIds) ? featureIds : []) {
     if (!fid) continue;
-    try { await linkRecetteFeature({ recetteId, featureId: fid }); } catch {}
+    try { await linkCadrageFeature({ cadrageId, featureId: fid }); } catch {}
   }
   for (const rid of Array.isArray(ruleIds) ? ruleIds : []) {
     if (!rid) continue;
-    try { await linkRecetteRule({ recetteId, ruleId: rid }); } catch {}
+    try { await linkCadrageRule({ cadrageId, ruleId: rid }); } catch {}
   }
   for (const aid of Array.isArray(adrIds) ? adrIds : []) {
     if (!aid) continue;
-    try { await linkRecetteAdr({ recetteId, adrId: aid }); } catch {}
+    try { await linkCadrageAdr({ cadrageId, adrId: aid }); } catch {}
   }
   // SIGNAL de cardinalité (traçage, NON bloquant).
-  try { await recordCardinalitySignal({ entityType: "recette", entityId: recetteId, projectId: p, by: createdBy }); } catch {}
-  return getRecetteById(recetteId);
+  try { await recordCardinalitySignal({ entityType: "cadrage", entityId: cadrageId, projectId: p, by: createdBy }); } catch {}
+  return getCadrageById(cadrageId);
 }
 
-// Rattache une tâche à une recette (couverture). Garde : la tâche doit appartenir
-// au PROJET de la recette (1 recette = 1 projet — les repos transverses du projet
+// Rattache une tâche à un cadrage (couverture). Garde : la tâche doit appartenir
+// au PROJET du cadrage (1 cadrage = 1 projet — les repos transverses du projet
 // sont la portée, pas des projets supplémentaires).
-export async function linkRecetteTask(recetteId, taskId) {
+export async function linkCadrageTask(cadrageId, taskId) {
   await ensureSchema();
-  const rec = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
-  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  const rec = (await pool().query("SELECT project FROM cadrages WHERE cadrage_id = $1", [cadrageId])).rows[0];
+  if (!rec) throw new Error(`cadrage inconnu : ${cadrageId}`);
   const t = (await pool().query("SELECT project FROM tasks WHERE id = $1", [taskId])).rows[0];
   if (!t) throw new Error(`tâche inconnue : ${taskId}`);
   if (t.project && t.project !== rec.project) {
-    throw new Error(`la tâche ${taskId} appartient au projet ${t.project}, différent du projet de la recette (${rec.project})`);
+    throw new Error(`la tâche ${taskId} appartient au projet ${t.project}, différent du projet du cadrage (${rec.project})`);
   }
   await pool().query(
-    "INSERT INTO recette_tasks (recette_id, task_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-    [recetteId, taskId],
+    "INSERT INTO cadrage_tasks (cadrage_id, task_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [cadrageId, taskId],
   );
-  return recetteId;
+  return cadrageId;
 }
 
-// Détache une tâche d'une recette (la tâche reste historiquement intacte).
-export async function unlinkRecetteTask(recetteId, taskId) {
+// Détache une tâche d'un cadrage (la tâche reste historiquement intacte).
+export async function unlinkCadrageTask(cadrageId, taskId) {
   await ensureSchema();
   await pool().query(
-    "DELETE FROM recette_tasks WHERE recette_id = $1 AND task_id = $2",
-    [recetteId, taskId],
+    "DELETE FROM cadrage_tasks WHERE cadrage_id = $1 AND task_id = $2",
+    [cadrageId, taskId],
   );
-  return getRecetteById(recetteId);
+  return getCadrageById(cadrageId);
 }
 
-// Liste les recettes d'un projet (ou toutes) — 1 recette = 1 projet (`recettes.project`).
-export async function listProjectRecettes(project) {
+// Liste les cadrages d'un projet (ou toutes) — 1 cadrage = 1 projet (`cadrages.project`).
+export async function listProjectCadrages(project) {
   await ensureSchema();
   const rows = (await pool().query(
     `SELECT r.*,
-            (SELECT COUNT(*) FROM recette_tasks rt WHERE rt.recette_id = r.recette_id) AS tasks_count,
-            (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = r.recette_id) AS items_count
-     FROM recettes r
+            (SELECT COUNT(*) FROM cadrage_tasks rt WHERE rt.cadrage_id = r.cadrage_id) AS tasks_count,
+            (SELECT COUNT(*) FROM cadrage_items i WHERE i.cadrage_id = r.cadrage_id) AS items_count
+     FROM cadrages r
      ${project ? "WHERE r.project = $1" : ""}
      ORDER BY r.created_at DESC`,
     project ? [project] : [],
   )).rows;
-  return Promise.all(rows.map((r) => rowToRecetteSummary(r)));
+  return Promise.all(rows.map((r) => rowToCadrageSummary(r)));
 }
 
-async function rowToRecetteSummary(r) {
+async function rowToCadrageSummary(r) {
   const repos = await reposOfProject(r.project);
   return {
-    recetteId: r.recette_id,
+    cadrageId: r.cadrage_id,
     project: r.project,
     repos,
     title: r.title,
@@ -6486,20 +6504,20 @@ async function rowToRecetteSummary(r) {
   };
 }
 
-// Recette couvrant une tâche (via recette_tasks) — pour l'affichage côté tâche.
-export async function getRecette(taskId) {
+// Cadrage couvrant une tâche (via cadrage_tasks) — pour l'affichage côté tâche.
+export async function getCadrage(taskId) {
   await ensureSchema();
   const r = (await pool().query(
-    `SELECT r.* FROM recettes r
-     JOIN recette_tasks rt ON rt.recette_id = r.recette_id
+    `SELECT r.* FROM cadrages r
+     JOIN cadrage_tasks rt ON rt.cadrage_id = r.cadrage_id
      WHERE rt.task_id = $1 ORDER BY r.created_at DESC LIMIT 1`,
     [taskId],
   )).rows[0];
   if (!r) return null;
-  return getRecetteById(r.recette_id);
+  return getCadrageById(r.cadrage_id);
 }
 
-// Repos transverses d'un projet (project_repos) — la portée réelle d'une recette
+// Repos transverses d'un projet (project_repos) — la portée réelle d'un cadrage
 // de ce projet. Ex: le projet mada-talk traverse les repos [mada-talk, oniria].
 async function reposOfProject(project) {
   if (!project) return [];
@@ -6512,22 +6530,22 @@ async function reposOfProject(project) {
   return rows.map((x) => ({ repoId: x.repo_id, role: x.role ?? null, name: x.name ?? x.repo_id, repoDir: x.repo_dir ?? null, e2eRepoDir: x.e2e_repo_dir ?? null, e2eBaseUrl: x.e2e_base_url ?? null }));
 }
 
-export async function getRecetteById(recetteId) {
+export async function getCadrageById(cadrageId) {
   await ensureSchema();
   const r = (await pool().query(
-    `SELECT r.*, (SELECT COUNT(*) FROM recette_tasks rt WHERE rt.recette_id = r.recette_id) AS tasks_count,
-            (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = r.recette_id) AS items_count
-     FROM recettes r WHERE r.recette_id = $1`,
-    [recetteId],
+    `SELECT r.*, (SELECT COUNT(*) FROM cadrage_tasks rt WHERE rt.cadrage_id = r.cadrage_id) AS tasks_count,
+            (SELECT COUNT(*) FROM cadrage_items i WHERE i.cadrage_id = r.cadrage_id) AS items_count
+     FROM cadrages r WHERE r.cadrage_id = $1`,
+    [cadrageId],
   )).rows[0];
   if (!r) return null;
   const tasks = (await pool().query(
-    "SELECT task_id FROM recette_tasks WHERE recette_id = $1 ORDER BY task_id",
-    [recetteId],
+    "SELECT task_id FROM cadrage_tasks WHERE cadrage_id = $1 ORDER BY task_id",
+    [cadrageId],
   )).rows.map((x) => x.task_id);
   const items = (await pool().query(
-    "SELECT id, content, classification, discussion, scope, project, title, acceptance, exec_order, vigilance, test_intent, doc_intent, status, created_task_id, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
-    [recetteId],
+    "SELECT id, content, classification, discussion, scope, project, title, acceptance, exec_order, vigilance, test_intent, doc_intent, status, created_task_id, created_at FROM cadrage_items WHERE cadrage_id = $1 ORDER BY id ASC",
+    [cadrageId],
   )).rows.map((i) => ({
     itemId: Number(i.id),
     content: i.content,
@@ -6545,37 +6563,37 @@ export async function getRecetteById(recetteId) {
     createdTaskId: i.created_task_id ?? null,
     createdAt: i.created_at,
   }));
-  const documents = await listRecetteDocuments(recetteId);
+  const documents = await listCadrageDocuments(cadrageId);
   const repos = await reposOfProject(r.project);
-  // Points de vigilance ADR (item 126) — historique append-only de la recette
+  // Points de vigilance ADR (item 126) — historique append-only du cadrage
   // (+ sous-ensemble OUVERT qui BLOQUE la terminaison).
-  const adrVigilances = await listAdrVigilances({ recetteId });
-  // Liens N:N recette↔sprint / fonctionnalité(s) / ADR(s) (T5/A023) — lecture
-  // ADDITIVE des tables T1 (`recette_sprints`, `recette_fonctionnalites`,
-  // `recette_adr`). N'altère ni `recette_start` ni `recette_item_*`.
+  const adrVigilances = await listAdrVigilances({ cadrageId });
+  // Liens N:N cadrage↔sprint / fonctionnalité(s) / ADR(s) (T5/A023) — lecture
+  // ADDITIVE des tables T1 (`cadrage_sprints`, `cadrage_fonctionnalites`,
+  // `cadrage_adr`). N'altère ni `cadrage_start` ni `cadrage_item_*`.
   const [sprintRows, featureRows, ruleRows, adrRows] = await Promise.all([
     pool().query(
-      `SELECT s.* FROM sprints s JOIN recette_sprints rs ON rs.sprint_id = s.id
-        WHERE rs.recette_id = $1 ORDER BY s.created_at ASC`, [recetteId]),
+      `SELECT s.* FROM sprints s JOIN cadrage_sprints rs ON rs.sprint_id = s.id
+        WHERE rs.cadrage_id = $1 ORDER BY s.created_at ASC`, [cadrageId]),
     pool().query(
-      `SELECT f.* FROM fonctionnalites f JOIN recette_fonctionnalites rf ON rf.fonctionnalite_id = f.id
-        WHERE rf.recette_id = $1 ORDER BY f.ref ASC`, [recetteId]),
+      `SELECT f.* FROM fonctionnalites f JOIN cadrage_fonctionnalites rf ON rf.fonctionnalite_id = f.id
+        WHERE rf.cadrage_id = $1 ORDER BY f.ref ASC`, [cadrageId]),
     pool().query(
-      `SELECT rm.* FROM regles_metier rm JOIN recette_regles rr ON rr.regle_id = rm.id
-        WHERE rr.recette_id = $1 ORDER BY rm.ref ASC`, [recetteId]),
+      `SELECT rm.* FROM regles_metier rm JOIN cadrage_regles rr ON rr.regle_id = rm.id
+        WHERE rr.cadrage_id = $1 ORDER BY rm.ref ASC`, [cadrageId]),
     pool().query(
       `SELECT a.artifact_id, a.title, a.doc_type, a.kind, a.path FROM artifacts a
-         JOIN recette_adr ra ON ra.adr_id = a.artifact_id
-        WHERE ra.recette_id = $1 ORDER BY a.artifact_id ASC`, [recetteId]),
+         JOIN cadrage_adr ra ON ra.adr_id = a.artifact_id
+        WHERE ra.cadrage_id = $1 ORDER BY a.artifact_id ASC`, [cadrageId]),
   ]);
   const sprints = sprintRows.rows.map(rowToSprint);
   const fonctionnalites = featureRows.rows.map(rowToFonctionnalite);
   const regles = ruleRows.rows.map(rowToRegle);
   const adrs = adrRows.rows.map((a) => ({ adrId: a.artifact_id, title: a.title ?? null, docType: a.doc_type, kind: a.kind ?? null, path: a.path ?? null }));
   // Éléments de recette évaluateur REPRIS par ce cadrage (traçage additif).
-  const evaluationItems = await listCadrageEvaluationItems({ recetteId });
+  const recetteItems = await listCadrageRecetteItems({ cadrageId });
   return {
-    recetteId: r.recette_id,
+    cadrageId: r.cadrage_id,
     project: r.project,
     repos,
     title: r.title,
@@ -6592,34 +6610,34 @@ export async function getRecetteById(recetteId) {
     fonctionnalites,
     regles,
     adrs,
-    evaluationItems,
+    recetteItems,
     adrVigilances,
     adrVigilancesOpen: adrVigilances.filter((v) => v.status === "open"),
   };
 }
 
-// --- Documents de recette (rebasés sur `artifacts`) ------------------------
-// Un document de recette est un artefact `doc_type` ∈ {recette_doc,
-// recette_report}, `content_id` = recetteId. `documentId` reste un ENTIER
+// --- Documents de cadrage (rebasés sur `artifacts`) ------------------------
+// Un document de cadrage est un artefact `doc_type` ∈ {cadrage_doc,
+// cadrage_report}, `content_id` = cadrageId. `documentId` reste un ENTIER
 // (= artifacts.id IDENTITY) pour la rétrocompat des routes panneau `[0-9]+`.
-export async function addRecetteDocument({ recetteId, title, nature, source, path, artifactId }) {
+export async function addCadrageDocument({ cadrageId, title, nature, source, path, artifactId }) {
   await ensureSchema();
-  let docType = "recette_doc";
+  let docType = "cadrage_doc";
   if (artifactId) {
     const a = (await pool().query("SELECT kind FROM artifacts WHERE artifact_id = $1", [artifactId])).rows[0];
-    if (a && a.kind === "report") docType = "recette_report";
+    if (a && a.kind === "report") docType = "cadrage_report";
   }
-  const id = `ART-REC-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const id = `ART-CAD-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
     `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
      VALUES ($1,$2,$3,'report',$4,$5,$6,$7,$8,$9)`,
-    [id, docType, String(recetteId), title ?? null, nature ?? null, source || "import", path ?? null,
+    [id, docType, String(cadrageId), title ?? null, nature ?? null, source || "import", path ?? null,
      artifactId ? { artifactId } : null, nowIso()],
   );
-  return listRecetteDocuments(recetteId);
+  return listCadrageDocuments(cadrageId);
 }
 
-export async function listRecetteDocuments(recetteId) {
+export async function listCadrageDocuments(cadrageId) {
   await ensureSchema();
   const rows = (await pool().query(
     `SELECT d.id, d.artifact_id, d.content_id, d.title, d.nature, d.source, d.path, d.created_at,
@@ -6627,11 +6645,11 @@ export async function listRecetteDocuments(recetteId) {
      FROM artifacts d
      LEFT JOIN artifacts a ON a.artifact_id = (d.meta->>'artifactId')
      WHERE d.content_id = $1 AND d.doc_type = ANY($2) ORDER BY d.id ASC`,
-    [String(recetteId), RECETTE_DOC_TYPES],
+    [String(cadrageId), CADRAGE_DOC_TYPES],
   )).rows;
   return rows.map((r) => ({
     documentId: Number(r.id),
-    recetteId: r.content_id,
+    cadrageId: r.content_id,
     title: r.title || r.artifact_title || (r.path ? r.path.split("/").pop() : null) || null,
     nature: r.nature,
     source: r.source,
@@ -6642,36 +6660,36 @@ export async function listRecetteDocuments(recetteId) {
   }));
 }
 
-export async function removeRecetteDocument(documentId) {
+export async function removeCadrageDocument(documentId) {
   await ensureSchema();
   const r = (await pool().query(
     "DELETE FROM artifacts WHERE id = $1 AND doc_type = ANY($2) RETURNING content_id",
-    [documentId, RECETTE_DOC_TYPES],
+    [documentId, CADRAGE_DOC_TYPES],
   )).rows[0];
   return r ? r.content_id : null;
 }
 
-export async function addRecetteItem({ recetteId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent }) {
+export async function addCadrageItem({ cadrageId, project, content, classification, discussion, scope, title, acceptance, execOrder, vigilance, testIntent, docIntent }) {
   await ensureSchema();
-  if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
-  // 1 item cible le PROJET de la recette (1 recette = 1 projet). Défaut : `recettes.project`.
-  const rec = (await pool().query("SELECT project FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
-  if (!rec) throw new Error(`recette inconnue : ${recetteId}`);
+  if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de cadrage");
+  // 1 item cible le PROJET du cadrage (1 cadrage = 1 projet). Défaut : `cadrages.project`.
+  const rec = (await pool().query("SELECT project FROM cadrages WHERE cadrage_id = $1", [cadrageId])).rows[0];
+  if (!rec) throw new Error(`cadrage inconnu : ${cadrageId}`);
   const recProj = rec.project;
   const given = project && String(project).trim() ? String(project).trim() : recProj;
-  if (given !== recProj) throw new Error(`1 item cible le projet de la recette (${recProj}) — reçu ${given} (les repos transverses sont des repos, pas des projets)`);
+  if (given !== recProj) throw new Error(`1 item cible le projet du cadrage (${recProj}) — reçu ${given} (les repos transverses sont des repos, pas des projets)`);
   const target = recProj;
   const intent = normalizeTestIntent(testIntent);
   const docIntentNorm = normalizeDocIntent(docIntent);
   const r = (await pool().query(
-    `INSERT INTO recette_items (recette_id, project, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, test_intent, doc_intent, status, created_at)
+    `INSERT INTO cadrage_items (cadrage_id, project, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, test_intent, doc_intent, status, created_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'open',$13) RETURNING id`,
-    [recetteId, target, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, title ?? null, acceptance ?? null, execOrder ?? null, vigilance ?? null, intent ? JSON.stringify(intent) : null, docIntentNorm ? JSON.stringify(docIntentNorm) : null, nowIso()],
+    [cadrageId, target, String(content).trim(), classification || "rework", discussion ?? null, scope && scope.length ? JSON.stringify(scope) : null, title ?? null, acceptance ?? null, execOrder ?? null, vigilance ?? null, intent ? JSON.stringify(intent) : null, docIntentNorm ? JSON.stringify(docIntentNorm) : null, nowIso()],
   )).rows[0];
-  return getRecetteItem(Number(r.id));
+  return getCadrageItem(Number(r.id));
 }
 
-// Valide/normalise une intention TEST capturée en recette.
+// Valide/normalise une intention TEST capturée en cadrage.
 function normalizeTestIntent(intent) {
   if (!intent) return null;
   const action = intent.action || (intent.testAction) || null;
@@ -6688,7 +6706,7 @@ function normalizeTestIntent(intent) {
   return out;
 }
 
-// Valide/normalise une intention DOCUMENT capturée en recette (ADR/specs/Gherkin).
+// Valide/normalise une intention DOCUMENT capturée en cadrage (ADR/specs/Gherkin).
 function normalizeDocIntent(intent) {
   if (!intent) return null;
   const action = intent.action || null;
@@ -6705,12 +6723,12 @@ function normalizeDocIntent(intent) {
   return out;
 }
 
-export async function updateRecetteItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId }) {
+export async function updateCadrageItem({ itemId, content, classification, discussion, scope, project, title, acceptance, execOrder, vigilance, testIntent, docIntent, status, createdTaskId }) {
   await ensureSchema();
   const sets = [];
   const params = [];
   if (content !== undefined) {
-    if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de recette");
+    if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément de cadrage");
     params.push(String(content).trim()); sets.push(`content = $${params.length}`);
   }
   if (classification) { params.push(classification); sets.push(`classification = $${params.length}`); }
@@ -6733,20 +6751,20 @@ export async function updateRecetteItem({ itemId, content, classification, discu
   }
   if (status) { params.push(status); sets.push(`status = $${params.length}`); }
   if (createdTaskId !== undefined) { params.push(createdTaskId); sets.push(`created_task_id = $${params.length}`); }
-  if (!sets.length) return getRecetteItem(itemId);
+  if (!sets.length) return getCadrageItem(itemId);
   params.push(itemId);
-  await pool().query(`UPDATE recette_items SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
-  return getRecetteItem(itemId);
+  await pool().query(`UPDATE cadrage_items SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+  return getCadrageItem(itemId);
 }
 
-async function getRecetteItem(itemId) {
+async function getCadrageItem(itemId) {
   const r = (await pool().query(
-    "SELECT id, recette_id, project, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, test_intent, doc_intent, status, created_task_id, created_at FROM recette_items WHERE id = $1",
+    "SELECT id, cadrage_id, project, content, classification, discussion, scope, title, acceptance, exec_order, vigilance, test_intent, doc_intent, status, created_task_id, created_at FROM cadrage_items WHERE id = $1",
     [itemId],
   )).rows[0];
   return r ? {
     itemId: Number(r.id),
-    recetteId: r.recette_id,
+    cadrageId: r.cadrage_id,
     project: r.project ?? null,
     content: r.content,
     classification: r.classification,
@@ -6785,122 +6803,122 @@ function parseDocIntent(raw) {
 }
 
 
-// Supprime un élément de recette. Garde : refus si une tâche a déjà été créée
+// Supprime un élément de cadrage. Garde : refus si une tâche a déjà été créée
 // depuis cet élément (statut task_created) — on ne supprime pas une preuve.
-export async function deleteRecetteItem({ itemId }) {
+export async function deleteCadrageItem({ itemId }) {
   await ensureSchema();
   const r = (await pool().query(
-    "SELECT id, status, created_task_id FROM recette_items WHERE id = $1",
+    "SELECT id, status, created_task_id FROM cadrage_items WHERE id = $1",
     [Number(itemId)],
   )).rows[0];
-  if (!r) throw new Error(`élément de recette introuvable : ${itemId}`);
+  if (!r) throw new Error(`élément de cadrage introuvable : ${itemId}`);
   if (r.status === "task_created" || r.created_task_id) {
     throw new Error(`impossible de supprimer : une tâche (${r.created_task_id || "?"}) a déjà été créée depuis cet élément`);
   }
-  await pool().query("DELETE FROM recette_items WHERE id = $1", [Number(itemId)]);
+  await pool().query("DELETE FROM cadrage_items WHERE id = $1", [Number(itemId)]);
   return { ok: true, itemId: Number(itemId) };
 }
 
-// Associe une session lancée à une recette + passe en cours.
-export async function setRecetteSession({ recetteId, sessionId }) {
+// Associe une session lancée à un cadrage + passe en cours.
+export async function setCadrageSession({ cadrageId, sessionId }) {
   await ensureSchema();
   await pool().query(
-    "UPDATE recettes SET status = 'in_progress', session_id = COALESCE($1, session_id) WHERE recette_id = $2",
-    [sessionId ?? null, recetteId],
+    "UPDATE cadrages SET status = 'in_progress', session_id = COALESCE($1, session_id) WHERE cadrage_id = $2",
+    [sessionId ?? null, cadrageId],
   );
-  return getRecetteById(recetteId);
+  return getCadrageById(cadrageId);
 }
 
-// Marque la recette TERMINÉE (faite) + toutes les tâches couvertes recette_status='done'.
+// Marque le cadrage TERMINÉ (faite) + toutes les tâches couvertes cadrage_status='done'.
 // GARDE ADR (item 126) : refuse tant qu'un point de vigilance ADR (ADR manquante /
-// conflit) est OUVERT sur la recette, avec la RAISON EXPLICITE de chaque point.
+// conflit) est OUVERT sur le cadrage, avec la RAISON EXPLICITE de chaque point.
 // La levée se fait par résolution (adr_vigilance_resolve : ADR créée / dépréciation
 // actée / décision) ou par décision explicite de l'utilisateur (raison tracée).
-export async function confirmRecette({ recetteId, confirmedBy }) {
+export async function confirmCadrage({ cadrageId, confirmedBy }) {
   await ensureSchema();
-  const open = await listAdrVigilances({ recetteId, status: "open" });
+  const open = await listAdrVigilances({ cadrageId, status: "open" });
   if (open.length) {
     throw new Error(
       `terminaison bloquée : ${open.map(adrVigilanceReason).join(" ; ")} — résolvez chaque point (adr_vigilance_resolve) ou levez-le explicitement avec une raison tracée`,
     );
   }
   const r = (await pool().query(
-    "UPDATE recettes SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE recette_id = $3 RETURNING recette_id",
-    [nowIso(), confirmedBy ?? "human", recetteId],
+    "UPDATE cadrages SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE cadrage_id = $3 RETURNING cadrage_id",
+    [nowIso(), confirmedBy ?? "human", cadrageId],
   )).rows[0];
-  if (!r) throw new Error(`recette inconnue : ${recetteId}`);
-  const tasks = (await pool().query("SELECT task_id FROM recette_tasks WHERE recette_id = $1", [recetteId])).rows.map((x) => x.task_id);
+  if (!r) throw new Error(`cadrage inconnu : ${cadrageId}`);
+  const tasks = (await pool().query("SELECT task_id FROM cadrage_tasks WHERE cadrage_id = $1", [cadrageId])).rows.map((x) => x.task_id);
   for (const t of tasks) {
-    await pool().query("UPDATE tasks SET recette_status = 'done' WHERE id = $1", [t]);
-    // Résout les décisions recette legacy encore 'awaiting' de la tâche couverte.
+    await pool().query("UPDATE tasks SET cadrage_status = 'done' WHERE id = $1", [t]);
+    // Résout les décisions cadrage legacy encore 'awaiting' de la tâche couverte.
     await pool().query(
-      `UPDATE decisions SET status = 'approved', resolved_at = $1, resolution = 'Recette close via le framework recette (v0.8)'
-       WHERE task_id = $2 AND kind = 'recette' AND status = 'awaiting'`,
+      `UPDATE decisions SET status = 'approved', resolved_at = $1, resolution = 'Cadrage clos via le framework cadrage (v0.8)'
+       WHERE task_id = $2 AND kind = 'cadrage' AND status = 'awaiting'`,
       [nowIso(), t],
     );
   }
-  return getRecetteById(recetteId);
+  return getCadrageById(cadrageId);
 }
 
-// Supprime une RECETTE ENTIÈRE (cadrage technique, table `recettes`) + nettoyage
+// Supprime un CADRAGE ENTIER (cadrage technique, table `cadrages`) + nettoyage
 // en CASCADE de toute sa famille polymorphe, dans une transaction unique.
-// Retourne `null` si la recette est INCONNUE (miroir deleteSprint/deleteFeature).
+// Retourne `null` si le cadrage est INCONNU (miroir deleteSprint/deleteFeature).
 // AUCUN `force` : la cascade est complète — la confirmation est portée par
 // l'appelant (panneau : double confirmation ; MCP : appel explicite).
 //
 // Ordre FK (enfants d'abord) :
-//   1. cadrage_evaluation_items (lien — l'élément d'évaluation reste)
-//   2. recette_sprints / _fonctionnalites / _regles / _adr / _projects (legacy)
-//   3. recette_tasks (lien — la tâche reste intacte) / recette_items
-//   4. artifacts (doc_type ∈ RECETTE_DOC_TYPES, content_id = recetteId) — les
+//   1. cadrage_recette_items (lien — l'élément d'évaluation reste)
+//   2. cadrage_sprints / _fonctionnalites / _regles / _adr / _projects (legacy)
+//   3. cadrage_tasks (lien — la tâche reste intacte) / cadrage_items
+//   4. artifacts (doc_type ∈ CADRAGE_DOC_TYPES, content_id = cadrageId) — les
 //      liens artifact_projects/artifact_repos cascadent (FK ON DELETE CASCADE)
 //   5. adr_vigilances (points de vigilance liés)
-//   6. batches.recette_id → NULL (aucune FK : évite un batch orphelin)
-//   7. cardinality_signals `open` de la recette (aucune FK : évite un signal
+//   6. batches.cadrage_id → NULL (aucune FK : évite un batch orphelin)
+//   7. cardinality_signals `open` du cadrage (aucune FK : évite un signal
 //      orphelin)
-//   8. recettes
+//   8. cadrages
 //
 // NOTE `adr_vigilances` : la table est déclarée « HISTORIQUE APPEND-ONLY » pour
-// son cycle de vie NOMINAL (open → resolved), mais sa FK `recette_id` est
+// son cycle de vie NOMINAL (open → resolved), mais sa FK `cadrage_id` est
 // explicitement ON DELETE CASCADE (schema.sql) et le critère d'acceptation exige
-// le nettoyage des points de vigilance liés à une recette erronée. La suppression
+// le nettoyage des points de vigilance liés à un cadrage erroné. La suppression
 // est donc explicite ici (miroir exact de la FK déclarée). Alternative
-// « détachement » (UPDATE adr_vigilances SET recette_id = NULL ...) documentée
+// « détachement » (UPDATE adr_vigilances SET cadrage_id = NULL ...) documentée
 // pour revue humaine (plan §9).
-export async function deleteRecette(recetteId) {
+export async function deleteCadrage(cadrageId) {
   await ensureSchema();
-  if (!recetteId || !String(recetteId).trim()) throw new Error("recetteId requis");
-  const rid = String(recetteId).trim();
-  const exists = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [rid])).rows[0];
+  if (!cadrageId || !String(cadrageId).trim()) throw new Error("cadrageId requis");
+  const rid = String(cadrageId).trim();
+  const exists = (await pool().query("SELECT cadrage_id FROM cadrages WHERE cadrage_id = $1", [rid])).rows[0];
   if (!exists) return null;
   const detached = await withTransaction(async (client) => {
-    const evaluationItems = (await client.query("DELETE FROM cadrage_evaluation_items WHERE recette_id = $1", [rid])).rowCount;
-    const sprints = (await client.query("DELETE FROM recette_sprints WHERE recette_id = $1", [rid])).rowCount;
-    const fonctionnalites = (await client.query("DELETE FROM recette_fonctionnalites WHERE recette_id = $1", [rid])).rowCount;
-    const regles = (await client.query("DELETE FROM recette_regles WHERE recette_id = $1", [rid])).rowCount;
-    const adrs = (await client.query("DELETE FROM recette_adr WHERE recette_id = $1", [rid])).rowCount;
-    const projects = (await client.query("DELETE FROM recette_projects WHERE recette_id = $1", [rid])).rowCount;
-    const tasks = (await client.query("DELETE FROM recette_tasks WHERE recette_id = $1", [rid])).rowCount;
-    const items = (await client.query("DELETE FROM recette_items WHERE recette_id = $1", [rid])).rowCount;
+    const recetteItems = (await client.query("DELETE FROM cadrage_recette_items WHERE cadrage_id = $1", [rid])).rowCount;
+    const sprints = (await client.query("DELETE FROM cadrage_sprints WHERE cadrage_id = $1", [rid])).rowCount;
+    const fonctionnalites = (await client.query("DELETE FROM cadrage_fonctionnalites WHERE cadrage_id = $1", [rid])).rowCount;
+    const regles = (await client.query("DELETE FROM cadrage_regles WHERE cadrage_id = $1", [rid])).rowCount;
+    const adrs = (await client.query("DELETE FROM cadrage_adr WHERE cadrage_id = $1", [rid])).rowCount;
+    const projects = (await client.query("DELETE FROM cadrage_projects WHERE cadrage_id = $1", [rid])).rowCount;
+    const tasks = (await client.query("DELETE FROM cadrage_tasks WHERE cadrage_id = $1", [rid])).rowCount;
+    const items = (await client.query("DELETE FROM cadrage_items WHERE cadrage_id = $1", [rid])).rowCount;
     const documents = (await client.query(
       "DELETE FROM artifacts WHERE content_id = $1 AND doc_type = ANY($2)",
-      [rid, RECETTE_DOC_TYPES],
+      [rid, CADRAGE_DOC_TYPES],
     )).rowCount;
-    const vigilances = (await client.query("DELETE FROM adr_vigilances WHERE recette_id = $1", [rid])).rowCount;
-    const batchesDetached = (await client.query("UPDATE batches SET recette_id = NULL WHERE recette_id = $1", [rid])).rowCount;
+    const vigilances = (await client.query("DELETE FROM adr_vigilances WHERE cadrage_id = $1", [rid])).rowCount;
+    const batchesDetached = (await client.query("UPDATE batches SET cadrage_id = NULL WHERE cadrage_id = $1", [rid])).rowCount;
     await client.query(
-      "DELETE FROM cardinality_signals WHERE entity_type = 'recette' AND entity_id = $1 AND status = 'open'",
+      "DELETE FROM cardinality_signals WHERE entity_type = 'cadrage' AND entity_id = $1 AND status = 'open'",
       [rid],
     );
-    await client.query("DELETE FROM recettes WHERE recette_id = $1", [rid]);
-    return { evaluationItems, sprints, fonctionnalites, regles, adrs, projects, tasks, items, documents, vigilances, batchesDetached };
+    await client.query("DELETE FROM cadrages WHERE cadrage_id = $1", [rid]);
+    return { recetteItems, sprints, fonctionnalites, regles, adrs, projects, tasks, items, documents, vigilances, batchesDetached };
   });
-  return { recetteId: rid, deleted: true, detached };
+  return { cadrageId: rid, deleted: true, detached };
 }
 
 // ===========================================================================
 // ÉVALUATIONS — « Recette » de l'ÉVALUATEUR PRODUIT (T-20260922-100650-sbc1).
-// Objet de PREMIER NIVEAU DISTINCT de `recettes` (Cadrage technique exécuteur).
+// Objet de PREMIER NIVEAU DISTINCT de `cadrages` (Cadrage technique exécuteur).
 // L'évaluateur décrit le PARCOURS ÉVALUÉ, rattache 1..N fonctionnalités (verdict
 // porté par le lien) + 1..N règles métier, enregistre des ÉLÉMENTS
 // (recommandation | problème) et joint des PIÈCES. Cycle de vie :
@@ -6908,67 +6926,67 @@ export async function deleteRecette(recetteId) {
 // ===========================================================================
 
 // Catégories / sévérités / statuts de suivi d'un élément d'évaluation.
-export const EVALUATION_ITEM_CATEGORIES = ["recommandation", "probleme"];
-export const EVALUATION_ITEM_SEVERITIES = ["low", "medium", "high", "critical"];
-export const EVALUATION_ITEM_STATUSES = ["open", "treated", "dismissed"];
+export const RECETTE_ITEM_CATEGORIES = ["recommandation", "probleme"];
+export const RECETTE_ITEM_SEVERITIES = ["low", "medium", "high", "critical"];
+export const RECETTE_ITEM_STATUSES = ["open", "treated", "dismissed"];
 // DÉCISION ADMIN « à traiter » (ou non) — DISTINCTE du statut de suivi
 // `status` : l'admin marque chaque élément ; l'exécuteur n'accède qu'aux
 // éléments `a_traiter` (ADR-001).
-export const EVALUATION_ITEM_DECISIONS = ["pending", "a_traiter", "non_retenu"];
+export const RECETTE_ITEM_DECISIONS = ["pending", "a_traiter", "non_retenu"];
 // Verdicts possibles d'une fonctionnalité évaluée.
-export const EVALUATION_VERDICTS = ["conforme", "non_conforme", "a_ameliorer"];
+export const RECETTE_VERDICTS = ["conforme", "non_conforme", "a_ameliorer"];
 
 function normalizeVerdict(v) {
-  return EVALUATION_VERDICTS.includes(v) ? v : null;
+  return RECETTE_VERDICTS.includes(v) ? v : null;
 }
 
-// Crée une recette évaluateur (EVAL-*, status 'pending'). `created_by` est
+// Crée une recette évaluateur (RECT-*, status 'pending'). `created_by` est
 // renseigné (indispensable au filtre propriétaire côté panneau). Les liens
-// fonctionnalités/règles sont OPTIONNELS et NON bloquants (comme `startRecette`).
-export async function startEvaluation({ project, title, description, featureIds, ruleIds, organizationId, createdBy }) {
+// fonctionnalités/règles sont OPTIONNELS et NON bloquants (comme `startCadrage`).
+export async function startRecette({ project, title, description, featureIds, ruleIds, organizationId, createdBy }) {
   await ensureSchema();
   const p = project && String(project).trim();
   if (!p) throw new Error("un projet requis pour une évaluation");
   await assertProjectExists(p);
   const org = organizationId || await orgIdOfProject(p) || await defaultOrganizationId();
-  const evaluationId = `EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const recetteId = `RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
-    `INSERT INTO evaluations (evaluation_id, project, title, description, status, created_at, organization_id, created_by)
+    `INSERT INTO recettes (recette_id, project, title, description, status, created_at, organization_id, created_by)
      VALUES ($1,$2,$3,$4,'pending',$5,$6,$7)`,
-    [evaluationId, p, title || `Recette ${p}`, description ?? null, nowIso(), org, createdBy ?? null],
+    [recetteId, p, title || `Recette ${p}`, description ?? null, nowIso(), org, createdBy ?? null],
   );
   for (const fid of Array.isArray(featureIds) ? featureIds : []) {
     if (!fid) continue;
-    try { await linkEvaluationFeature({ evaluationId, featureId: fid }); } catch {}
+    try { await linkRecetteFeature({ recetteId, featureId: fid }); } catch {}
   }
   for (const rid of Array.isArray(ruleIds) ? ruleIds : []) {
     if (!rid) continue;
-    try { await linkEvaluationRule({ evaluationId, ruleId: rid }); } catch {}
+    try { await linkRecetteRule({ recetteId, ruleId: rid }); } catch {}
   }
-  return getEvaluationById(evaluationId);
+  return getRecetteById(recetteId);
 }
 
 // Liste les évaluations d'un projet (ou toutes).
-export async function listProjectEvaluations(project) {
+export async function listProjectRecettes(project) {
   await ensureSchema();
   const rows = (await pool().query(
     `SELECT e.*,
-            (SELECT COUNT(*) FROM evaluation_items i WHERE i.evaluation_id = e.evaluation_id) AS items_count,
-            (SELECT COUNT(*) FROM evaluation_items i WHERE i.evaluation_id = e.evaluation_id AND i.decision = 'a_traiter') AS treatable_count,
-            (SELECT COUNT(*) FROM evaluation_fonctionnalites ef WHERE ef.evaluation_id = e.evaluation_id) AS features_count,
-            (SELECT COUNT(*) FROM evaluation_regles er WHERE er.evaluation_id = e.evaluation_id) AS rules_count
-     FROM evaluations e
+            (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = e.recette_id) AS items_count,
+            (SELECT COUNT(*) FROM recette_items i WHERE i.recette_id = e.recette_id AND i.decision = 'a_traiter') AS treatable_count,
+            (SELECT COUNT(*) FROM recette_fonctionnalites ef WHERE ef.recette_id = e.recette_id) AS features_count,
+            (SELECT COUNT(*) FROM recette_regles er WHERE er.recette_id = e.recette_id) AS rules_count
+     FROM recettes e
      ${project ? "WHERE e.project = $1" : ""}
      ORDER BY e.created_at DESC`,
     project ? [project] : [],
   )).rows;
-  return Promise.all(rows.map(rowToEvaluationSummary));
+  return Promise.all(rows.map(rowToRecetteSummary));
 }
 
-async function rowToEvaluationSummary(r) {
+async function rowToRecetteSummary(r) {
   const repos = await reposOfProject(r.project);
   return {
-    evaluationId: r.evaluation_id,
+    recetteId: r.recette_id,
     project: r.project,
     repos,
     title: r.title,
@@ -6987,28 +7005,28 @@ async function rowToEvaluationSummary(r) {
 }
 
 // Détail complet : éléments + verdicts (fonctionnalités) + règles + pièces.
-export async function getEvaluationById(evaluationId) {
+export async function getRecetteById(recetteId) {
   await ensureSchema();
-  const r = (await pool().query("SELECT * FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
+  const r = (await pool().query("SELECT * FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
   if (!r) return null;
   const itemRows = (await pool().query(
-    "SELECT id, content, category, severity, discussion, status, decision, decided_at, decided_by, created_at FROM evaluation_items WHERE evaluation_id = $1 ORDER BY id ASC",
-    [evaluationId],
+    "SELECT id, content, category, severity, discussion, status, decision, decided_at, decided_by, created_at FROM recette_items WHERE recette_id = $1 ORDER BY id ASC",
+    [recetteId],
   )).rows;
-  const documents = await listEvaluationDocuments(evaluationId);
+  const documents = await listRecetteDocuments(recetteId);
   // Reprises « par le cadrage X » (traçage) — une requête pour tous les items.
   const reprisRows = itemRows.length ? (await pool().query(
-    `SELECT cei.evaluation_item_id, cei.recette_id, cei.created_at, cei.taken_by, r.title
-       FROM cadrage_evaluation_items cei
-       LEFT JOIN recettes r ON r.recette_id = cei.recette_id
-      WHERE cei.evaluation_item_id = ANY($1) ORDER BY cei.created_at ASC`,
+    `SELECT cei.recette_item_id, cei.cadrage_id, cei.created_at, cei.taken_by, r.title
+       FROM cadrage_recette_items cei
+       LEFT JOIN cadrages r ON r.cadrage_id = cei.cadrage_id
+      WHERE cei.recette_item_id = ANY($1) ORDER BY cei.created_at ASC`,
     [itemRows.map((i) => Number(i.id))],
   )).rows : [];
   const reprisByItem = new Map();
   for (const x of reprisRows) {
-    const k = Number(x.evaluation_item_id);
+    const k = Number(x.recette_item_id);
     if (!reprisByItem.has(k)) reprisByItem.set(k, []);
-    reprisByItem.get(k).push({ cadrageId: x.recette_id, title: x.title ?? null, createdAt: x.created_at, takenBy: x.taken_by ?? null });
+    reprisByItem.get(k).push({ cadrageId: x.cadrage_id, title: x.title ?? null, createdAt: x.created_at, takenBy: x.taken_by ?? null });
   }
   const items = itemRows.map((i) => ({
     itemId: Number(i.id),
@@ -7028,11 +7046,11 @@ export async function getEvaluationById(evaluationId) {
   const [featureRows, ruleRows] = await Promise.all([
     pool().query(
       `SELECT f.*, ef.verdict, ef.verdict_comment FROM fonctionnalites f
-         JOIN evaluation_fonctionnalites ef ON ef.fonctionnalite_id = f.id
-        WHERE ef.evaluation_id = $1 ORDER BY f.ref ASC`, [evaluationId]),
+         JOIN recette_fonctionnalites ef ON ef.fonctionnalite_id = f.id
+        WHERE ef.recette_id = $1 ORDER BY f.ref ASC`, [recetteId]),
     pool().query(
-      `SELECT rm.* FROM regles_metier rm JOIN evaluation_regles er ON er.regle_id = rm.id
-        WHERE er.evaluation_id = $1 ORDER BY rm.ref ASC`, [evaluationId]),
+      `SELECT rm.* FROM regles_metier rm JOIN recette_regles er ON er.regle_id = rm.id
+        WHERE er.recette_id = $1 ORDER BY rm.ref ASC`, [recetteId]),
   ]);
   const fonctionnalites = featureRows.rows.map((x) => ({
     ...rowToFonctionnalite(x),
@@ -7041,7 +7059,7 @@ export async function getEvaluationById(evaluationId) {
   }));
   const regles = ruleRows.rows.map(rowToRegle);
   return {
-    evaluationId: r.evaluation_id,
+    recetteId: r.recette_id,
     project: r.project,
     repos,
     title: r.title,
@@ -7061,54 +7079,54 @@ export async function getEvaluationById(evaluationId) {
 }
 
 // ASSOCIE une session IA DÉDIÉE (agent-recette ÉVALUATEUR) à une évaluation
-// EXISTANTE (tool `evaluation_session_set`). Miroir de `setSprintSession` :
+// EXISTANTE (tool `recette_session_set`). Miroir de `setSprintSession` :
 // n'écrit QUE `session_id` (l'évaluation n'a pas d'`updated_at` ni de statut
 // piloté par ce rattachement). `sessionId` null détache la session.
-export async function setEvaluationSession(evaluationId, sessionId) {
+export async function setRecetteSession(recetteId, sessionId) {
   await ensureSchema();
-  if (!evaluationId) throw new Error("evaluationId requis");
-  const id = String(evaluationId);
-  const row = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [id])).rows[0];
+  if (!recetteId) throw new Error("recetteId requis");
+  const id = String(recetteId);
+  const row = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [id])).rows[0];
   if (!row) throw new Error(`évaluation inconnue : ${id}`);
   await pool().query(
-    "UPDATE evaluations SET session_id = $1 WHERE evaluation_id = $2",
+    "UPDATE recettes SET session_id = $1 WHERE recette_id = $2",
     [sessionId != null ? String(sessionId) : null, id],
   );
-  return getEvaluationById(id);
+  return getRecetteById(id);
 }
 
 // Éléments ACCESSIBLES À L'EXÉCUTEUR : uniquement ceux que l'admin a marqués
 // « à traiter » (`decision='a_traiter'`). Contexte de sélection d'un cadrage
 // technique. Filtre `project` optionnel. Inclut le traçage `reprisPar`.
-export async function listTreatableEvaluationItems({ project } = {}) {
+export async function listTreatableRecetteItems({ project } = {}) {
   await ensureSchema();
   const rows = (await pool().query(
-    `SELECT i.id, i.evaluation_id, i.content, i.category, i.severity, i.discussion, i.status,
+    `SELECT i.id, i.recette_id, i.content, i.category, i.severity, i.discussion, i.status,
             i.decision, i.decided_at, i.decided_by, i.created_at,
-            e.title AS evaluation_title, e.project
-       FROM evaluation_items i
-       JOIN evaluations e ON e.evaluation_id = i.evaluation_id
+            e.title AS recette_title, e.project
+       FROM recette_items i
+       JOIN recettes e ON e.recette_id = i.recette_id
       WHERE i.decision = 'a_traiter'${project ? " AND e.project = $1" : ""}
       ORDER BY i.id ASC`,
     project ? [project] : [],
   )).rows;
   const reprisRows = rows.length ? (await pool().query(
-    `SELECT cei.evaluation_item_id, cei.recette_id, cei.created_at, cei.taken_by, r.title
-       FROM cadrage_evaluation_items cei
-       LEFT JOIN recettes r ON r.recette_id = cei.recette_id
-      WHERE cei.evaluation_item_id = ANY($1) ORDER BY cei.created_at ASC`,
+    `SELECT cei.recette_item_id, cei.cadrage_id, cei.created_at, cei.taken_by, r.title
+       FROM cadrage_recette_items cei
+       LEFT JOIN cadrages r ON r.cadrage_id = cei.cadrage_id
+      WHERE cei.recette_item_id = ANY($1) ORDER BY cei.created_at ASC`,
     [rows.map((i) => Number(i.id))],
   )).rows : [];
   const reprisByItem = new Map();
   for (const x of reprisRows) {
-    const k = Number(x.evaluation_item_id);
+    const k = Number(x.recette_item_id);
     if (!reprisByItem.has(k)) reprisByItem.set(k, []);
-    reprisByItem.get(k).push({ cadrageId: x.recette_id, title: x.title ?? null, createdAt: x.created_at, takenBy: x.taken_by ?? null });
+    reprisByItem.get(k).push({ cadrageId: x.cadrage_id, title: x.title ?? null, createdAt: x.created_at, takenBy: x.taken_by ?? null });
   }
   return rows.map((i) => ({
     itemId: Number(i.id),
-    evaluationId: i.evaluation_id,
-    evaluationTitle: i.evaluation_title ?? null,
+    recetteId: i.recette_id,
+    recetteTitle: i.recette_title ?? null,
     project: i.project,
     category: i.category,
     severity: i.severity,
@@ -7123,53 +7141,53 @@ export async function listTreatableEvaluationItems({ project } = {}) {
   }));
 }
 
-// --- Reprise d'un élément de recette par un CADRAGE technique ---------------
-// Lien ADDITIF cadrage (`recettes`) ↔ élément (`evaluation_items`). GARDE :
+// --- Reprise d'un élément de cadrage par un CADRAGE technique ---------------
+// Lien ADDITIF cadrage (`cadrages`) ↔ élément (`recette_items`). GARDE :
 // on ne reprend QUE des éléments `decision='a_traiter'` (ADR-001/002).
-export async function linkCadrageEvaluationItem({ recetteId, itemId, by } = {}) {
+export async function linkCadrageRecetteItem({ cadrageId, itemId, by } = {}) {
   await ensureSchema();
-  if (!recetteId || itemId === undefined || itemId === null) throw new Error("recetteId et itemId requis");
-  const rec = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
-  if (!rec) throw new Error(`cadrage inconnu : ${recetteId}`);
-  const item = (await pool().query("SELECT id, decision FROM evaluation_items WHERE id = $1", [Number(itemId)])).rows[0];
+  if (!cadrageId || itemId === undefined || itemId === null) throw new Error("cadrageId et itemId requis");
+  const rec = (await pool().query("SELECT cadrage_id FROM cadrages WHERE cadrage_id = $1", [cadrageId])).rows[0];
+  if (!rec) throw new Error(`cadrage inconnu : ${cadrageId}`);
+  const item = (await pool().query("SELECT id, decision FROM recette_items WHERE id = $1", [Number(itemId)])).rows[0];
   if (!item) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
   if (item.decision !== "a_traiter") {
     throw new Error(`élément ${itemId} non « à traiter » (décision = ${item.decision}) : reprise refusée`);
   }
   const ins = await pool().query(
-    `INSERT INTO cadrage_evaluation_items (recette_id, evaluation_item_id, created_at, taken_by)
-     VALUES ($1,$2,$3,$4) ON CONFLICT (recette_id, evaluation_item_id) DO NOTHING`,
-    [String(recetteId), Number(itemId), nowIso(), by ?? null],
+    `INSERT INTO cadrage_recette_items (cadrage_id, recette_item_id, created_at, taken_by)
+     VALUES ($1,$2,$3,$4) ON CONFLICT (cadrage_id, recette_item_id) DO NOTHING`,
+    [String(cadrageId), Number(itemId), nowIso(), by ?? null],
   );
-  return { ok: true, recetteId: String(recetteId), itemId: Number(itemId), linked: ins.rowCount > 0 };
+  return { ok: true, cadrageId: String(cadrageId), itemId: Number(itemId), linked: ins.rowCount > 0 };
 }
 
-export async function unlinkCadrageEvaluationItem({ recetteId, itemId } = {}) {
+export async function unlinkCadrageRecetteItem({ cadrageId, itemId } = {}) {
   await ensureSchema();
-  if (!recetteId || itemId === undefined || itemId === null) throw new Error("recetteId et itemId requis");
+  if (!cadrageId || itemId === undefined || itemId === null) throw new Error("cadrageId et itemId requis");
   const del = await pool().query(
-    "DELETE FROM cadrage_evaluation_items WHERE recette_id = $1 AND evaluation_item_id = $2",
-    [String(recetteId), Number(itemId)],
+    "DELETE FROM cadrage_recette_items WHERE cadrage_id = $1 AND recette_item_id = $2",
+    [String(cadrageId), Number(itemId)],
   );
-  return { ok: true, recetteId: String(recetteId), itemId: Number(itemId), unlinked: del.rowCount > 0 };
+  return { ok: true, cadrageId: String(cadrageId), itemId: Number(itemId), unlinked: del.rowCount > 0 };
 }
 
-export async function listCadrageEvaluationItems({ recetteId } = {}) {
+export async function listCadrageRecetteItems({ cadrageId } = {}) {
   await ensureSchema();
-  if (!recetteId) throw new Error("recetteId requis");
+  if (!cadrageId) throw new Error("cadrageId requis");
   const rows = (await pool().query(
-    `SELECT i.id, i.evaluation_id, i.content, i.category, i.severity, i.discussion, i.status, i.decision, i.created_at,
-            e.title AS evaluation_title
-       FROM cadrage_evaluation_items cei
-       JOIN evaluation_items i ON i.id = cei.evaluation_item_id
-       JOIN evaluations e ON e.evaluation_id = i.evaluation_id
-      WHERE cei.recette_id = $1 ORDER BY i.id ASC`,
-    [String(recetteId)],
+    `SELECT i.id, i.recette_id, i.content, i.category, i.severity, i.discussion, i.status, i.decision, i.created_at,
+            e.title AS recette_title
+       FROM cadrage_recette_items cei
+       JOIN recette_items i ON i.id = cei.recette_item_id
+       JOIN recettes e ON e.recette_id = i.recette_id
+      WHERE cei.cadrage_id = $1 ORDER BY i.id ASC`,
+    [String(cadrageId)],
   )).rows;
   return rows.map((i) => ({
     itemId: Number(i.id),
-    evaluationId: i.evaluation_id,
-    evaluationTitle: i.evaluation_title ?? null,
+    recetteId: i.recette_id,
+    recetteTitle: i.recette_title ?? null,
     category: i.category,
     severity: i.severity,
     content: i.content,
@@ -7179,22 +7197,22 @@ export async function listCadrageEvaluationItems({ recetteId } = {}) {
 }
 
 // --- Éléments (recommandation | problème) ----------------------------------
-export async function addEvaluationItem({ evaluationId, content, category, severity, discussion }) {
+export async function addRecetteItem({ recetteId, content, category, severity, discussion }) {
   await ensureSchema();
   if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément d'évaluation");
-  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
-  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
-  const cat = EVALUATION_ITEM_CATEGORIES.includes(category) ? category : "recommandation";
-  const sev = EVALUATION_ITEM_SEVERITIES.includes(severity) ? severity : "medium";
+  const ev = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${recetteId}`);
+  const cat = RECETTE_ITEM_CATEGORIES.includes(category) ? category : "recommandation";
+  const sev = RECETTE_ITEM_SEVERITIES.includes(severity) ? severity : "medium";
   const r = (await pool().query(
-    `INSERT INTO evaluation_items (evaluation_id, content, category, severity, discussion, status, created_at)
+    `INSERT INTO recette_items (recette_id, content, category, severity, discussion, status, created_at)
      VALUES ($1,$2,$3,$4,$5,'open',$6) RETURNING id`,
-    [evaluationId, String(content).trim(), cat, sev, discussion ?? null, nowIso()],
+    [recetteId, String(content).trim(), cat, sev, discussion ?? null, nowIso()],
   )).rows[0];
-  return getEvaluationItem(Number(r.id));
+  return getRecetteItem(Number(r.id));
 }
 
-export async function updateEvaluationItem({ itemId, content, category, severity, discussion, status }) {
+export async function updateRecetteItem({ itemId, content, category, severity, discussion, status }) {
   await ensureSchema();
   const sets = [];
   const params = [];
@@ -7202,48 +7220,48 @@ export async function updateEvaluationItem({ itemId, content, category, severity
     if (!content || !String(content).trim()) throw new Error("contenu requis pour un élément d'évaluation");
     params.push(String(content).trim()); sets.push(`content = $${params.length}`);
   }
-  if (category !== undefined) { params.push(EVALUATION_ITEM_CATEGORIES.includes(category) ? category : "recommandation"); sets.push(`category = $${params.length}`); }
-  if (severity !== undefined) { params.push(EVALUATION_ITEM_SEVERITIES.includes(severity) ? severity : "medium"); sets.push(`severity = $${params.length}`); }
+  if (category !== undefined) { params.push(RECETTE_ITEM_CATEGORIES.includes(category) ? category : "recommandation"); sets.push(`category = $${params.length}`); }
+  if (severity !== undefined) { params.push(RECETTE_ITEM_SEVERITIES.includes(severity) ? severity : "medium"); sets.push(`severity = $${params.length}`); }
   if (discussion !== undefined) { params.push(discussion); sets.push(`discussion = $${params.length}`); }
-  if (status !== undefined) { params.push(EVALUATION_ITEM_STATUSES.includes(status) ? status : "open"); sets.push(`status = $${params.length}`); }
-  if (!sets.length) return getEvaluationItem(itemId);
+  if (status !== undefined) { params.push(RECETTE_ITEM_STATUSES.includes(status) ? status : "open"); sets.push(`status = $${params.length}`); }
+  if (!sets.length) return getRecetteItem(itemId);
   params.push(Number(itemId));
-  const r = await pool().query(`UPDATE evaluation_items SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING id`, params);
+  const r = await pool().query(`UPDATE recette_items SET ${sets.join(", ")} WHERE id = $${params.length} RETURNING id`, params);
   if (!r.rows[0]) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
-  return getEvaluationItem(Number(itemId));
+  return getRecetteItem(Number(itemId));
 }
 
-export async function deleteEvaluationItem({ itemId }) {
+export async function deleteRecetteItem({ itemId }) {
   await ensureSchema();
-  const r = await pool().query("DELETE FROM evaluation_items WHERE id = $1 RETURNING id", [Number(itemId)]);
+  const r = await pool().query("DELETE FROM recette_items WHERE id = $1 RETURNING id", [Number(itemId)]);
   if (!r.rows[0]) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
   return { ok: true, itemId: Number(itemId) };
 }
 
 // DÉCISION ADMIN « à traiter » (ou non) d'un élément — action TRACÉE,
-// DISTINCTE du statut de suivi (`updateEvaluationItem`). `decision` ∈
-// EVALUATION_ITEM_DECISIONS ; `by` = auteur de la décision.
-export async function setEvaluationItemDecision({ itemId, decision, by } = {}) {
+// DISTINCTE du statut de suivi (`updateRecetteItem`). `decision` ∈
+// RECETTE_ITEM_DECISIONS ; `by` = auteur de la décision.
+export async function setRecetteItemDecision({ itemId, decision, by } = {}) {
   await ensureSchema();
-  if (!EVALUATION_ITEM_DECISIONS.includes(decision)) {
-    throw new Error(`décision invalide : ${decision} (attendu : ${EVALUATION_ITEM_DECISIONS.join(" | ")})`);
+  if (!RECETTE_ITEM_DECISIONS.includes(decision)) {
+    throw new Error(`décision invalide : ${decision} (attendu : ${RECETTE_ITEM_DECISIONS.join(" | ")})`);
   }
   const r = await pool().query(
-    "UPDATE evaluation_items SET decision = $1, decided_at = $2, decided_by = $3 WHERE id = $4 RETURNING id",
+    "UPDATE recette_items SET decision = $1, decided_at = $2, decided_by = $3 WHERE id = $4 RETURNING id",
     [decision, nowIso(), by ?? null, Number(itemId)],
   );
   if (!r.rows[0]) throw new Error(`élément d'évaluation introuvable : ${itemId}`);
-  return getEvaluationItem(Number(itemId));
+  return getRecetteItem(Number(itemId));
 }
 
-async function getEvaluationItem(itemId) {
+async function getRecetteItem(itemId) {
   const r = (await pool().query(
-    "SELECT id, evaluation_id, content, category, severity, discussion, status, decision, decided_at, decided_by, created_at FROM evaluation_items WHERE id = $1",
+    "SELECT id, recette_id, content, category, severity, discussion, status, decision, decided_at, decided_by, created_at FROM recette_items WHERE id = $1",
     [itemId],
   )).rows[0];
   return r ? {
     itemId: Number(r.id),
-    evaluationId: r.evaluation_id,
+    recetteId: r.recette_id,
     content: r.content,
     category: r.category,
     severity: r.severity,
@@ -7257,112 +7275,112 @@ async function getEvaluationItem(itemId) {
 }
 
 // --- Liens fonctionnalités (verdict porté par le lien) ---------------------
-export async function linkEvaluationFeature({ evaluationId, featureId, verdict, verdictComment } = {}) {
+export async function linkRecetteFeature({ recetteId, featureId, verdict, verdictComment } = {}) {
   await ensureSchema();
-  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
-  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const ev = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${recetteId}`);
   const f = await getFeature(featureId);
   if (!f) throw new Error(`fonctionnalité inconnue : ${featureId}`);
   const v = normalizeVerdict(verdict);
   const ins = await pool().query(
-    `INSERT INTO evaluation_fonctionnalites (evaluation_id, fonctionnalite_id, verdict, verdict_comment)
+    `INSERT INTO recette_fonctionnalites (recette_id, fonctionnalite_id, verdict, verdict_comment)
      VALUES ($1,$2,$3,$4)
-     ON CONFLICT (evaluation_id, fonctionnalite_id) DO UPDATE
-       SET verdict = COALESCE(EXCLUDED.verdict, evaluation_fonctionnalites.verdict),
-           verdict_comment = COALESCE(EXCLUDED.verdict_comment, evaluation_fonctionnalites.verdict_comment)`,
-    [evaluationId, f.id, v, verdictComment ?? null],
+     ON CONFLICT (recette_id, fonctionnalite_id) DO UPDATE
+       SET verdict = COALESCE(EXCLUDED.verdict, recette_fonctionnalites.verdict),
+           verdict_comment = COALESCE(EXCLUDED.verdict_comment, recette_fonctionnalites.verdict_comment)`,
+    [recetteId, f.id, v, verdictComment ?? null],
   );
-  return { ok: true, evaluationId, featureId: f.id, verdict: v, linked: ins.rowCount > 0 };
+  return { ok: true, recetteId, featureId: f.id, verdict: v, linked: ins.rowCount > 0 };
 }
 
-export async function unlinkEvaluationFeature({ evaluationId, featureId } = {}) {
+export async function unlinkRecetteFeature({ recetteId, featureId } = {}) {
   await ensureSchema();
-  if (!evaluationId || !featureId) throw new Error("evaluationId et featureId requis");
+  if (!recetteId || !featureId) throw new Error("recetteId et featureId requis");
   const del = await pool().query(
-    "DELETE FROM evaluation_fonctionnalites WHERE evaluation_id = $1 AND fonctionnalite_id = $2",
-    [String(evaluationId), String(featureId)],
+    "DELETE FROM recette_fonctionnalites WHERE recette_id = $1 AND fonctionnalite_id = $2",
+    [String(recetteId), String(featureId)],
   );
-  return { ok: true, evaluationId: String(evaluationId), featureId: String(featureId), unlinked: del.rowCount > 0 };
+  return { ok: true, recetteId: String(recetteId), featureId: String(featureId), unlinked: del.rowCount > 0 };
 }
 
 // --- Liens règles métier ----------------------------------------------------
-export async function linkEvaluationRule({ evaluationId, ruleId } = {}) {
+export async function linkRecetteRule({ recetteId, ruleId } = {}) {
   await ensureSchema();
-  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
-  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const ev = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${recetteId}`);
   const rule = await getRule(ruleId);
   if (!rule) throw new Error(`règle métier inconnue : ${ruleId}`);
   const ins = await pool().query(
-    "INSERT INTO evaluation_regles (evaluation_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
-    [evaluationId, rule.id],
+    "INSERT INTO recette_regles (recette_id, regle_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+    [recetteId, rule.id],
   );
-  return { ok: true, evaluationId, ruleId: rule.id, linked: ins.rowCount > 0 };
+  return { ok: true, recetteId, ruleId: rule.id, linked: ins.rowCount > 0 };
 }
 
-export async function unlinkEvaluationRule({ evaluationId, ruleId } = {}) {
+export async function unlinkRecetteRule({ recetteId, ruleId } = {}) {
   await ensureSchema();
-  if (!evaluationId || !ruleId) throw new Error("evaluationId et ruleId requis");
+  if (!recetteId || !ruleId) throw new Error("recetteId et ruleId requis");
   const del = await pool().query(
-    "DELETE FROM evaluation_regles WHERE evaluation_id = $1 AND regle_id = $2",
-    [String(evaluationId), String(ruleId)],
+    "DELETE FROM recette_regles WHERE recette_id = $1 AND regle_id = $2",
+    [String(recetteId), String(ruleId)],
   );
-  return { ok: true, evaluationId: String(evaluationId), ruleId: String(ruleId), unlinked: del.rowCount > 0 };
+  return { ok: true, recetteId: String(recetteId), ruleId: String(ruleId), unlinked: del.rowCount > 0 };
 }
 
 // Positionne le VERDICT d'une fonctionnalité DÉJÀ rattachée à l'évaluation.
-export async function setEvaluationVerdict({ evaluationId, fonctionnaliteId, verdict, verdictComment } = {}) {
+export async function setRecetteVerdict({ recetteId, fonctionnaliteId, verdict, verdictComment } = {}) {
   await ensureSchema();
   const v = normalizeVerdict(verdict);
   const r = await pool().query(
-    `UPDATE evaluation_fonctionnalites SET verdict = $1, verdict_comment = $2
-      WHERE evaluation_id = $3 AND fonctionnalite_id = $4 RETURNING fonctionnalite_id`,
-    [v, verdictComment ?? null, evaluationId, fonctionnaliteId],
+    `UPDATE recette_fonctionnalites SET verdict = $1, verdict_comment = $2
+      WHERE recette_id = $3 AND fonctionnalite_id = $4 RETURNING fonctionnalite_id`,
+    [v, verdictComment ?? null, recetteId, fonctionnaliteId],
   );
-  if (!r.rows[0]) throw new Error(`fonctionnalité ${fonctionnaliteId} non rattachée à l'évaluation ${evaluationId}`);
-  return { ok: true, evaluationId, fonctionnaliteId, verdict: v };
+  if (!r.rows[0]) throw new Error(`fonctionnalité ${fonctionnaliteId} non rattachée à l'évaluation ${recetteId}`);
+  return { ok: true, recetteId, fonctionnaliteId, verdict: v };
 }
 
 // --- Pièces jointes (lien / document / photo / vidéo) -----------------------
 // `itemId` (optionnel) rattache la pièce à un ÉLÉMENT précis (via `meta.itemId`),
 // sans table nouvelle ; sans `itemId`, la pièce reste au niveau de l'évaluation.
-export async function addEvaluationDocument({ evaluationId, title, nature, source, path, artifactId, itemId }) {
+export async function addRecetteDocument({ recetteId, title, nature, source, path, artifactId, itemId }) {
   await ensureSchema();
-  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
-  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const ev = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${recetteId}`);
   // GARDE CIBLÉE : valide la nature d'une pièce d'ÉVALUATION (photos/vidéos
   // ADMISES) et retourne la nature RÉSOLUE. La garde des pièces client
   // (`assertPieceAllowed`) ne s'applique PAS à cette famille.
-  const resolvedNature = assertEvaluationDocAllowed({ nature, path });
-  const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const resolvedNature = assertRecetteDocAllowed({ nature, path });
+  const id = `ART-RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const meta = {
     ...(artifactId ? { artifactId } : {}),
     ...(itemId !== undefined && itemId !== null && itemId !== "" ? { itemId: Number(itemId) } : {}),
   };
   await pool().query(
     `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
-     VALUES ($1,'evaluation_doc',$2,'autre',$3,$4,$5,$6,$7,$8)`,
-    [id, String(evaluationId), title ?? null, resolvedNature, source || "import", path ?? null,
+     VALUES ($1,'recette_doc',$2,'autre',$3,$4,$5,$6,$7,$8)`,
+    [id, String(recetteId), title ?? null, resolvedNature, source || "import", path ?? null,
      Object.keys(meta).length ? meta : null, nowIso()],
   );
-  return listEvaluationDocuments(evaluationId);
+  return listRecetteDocuments(recetteId);
 }
 
 // DÉPOSE une MAQUETTE (HTML/CSS/JS, données mock) rattachée à une évaluation et
 // retourne une URL consultable. Les fichiers sont écrits sous
-// `EVALUATION_MAQUETTE_DIR/<evaluationId>/<slug>/` et le PANNEAU les sert comme
-// page statique (`GET /api/evaluations/:id/maquette/*`). Nature de pièce
-// `maquette` (famille `evaluation_doc`) : `meta.url` / `meta.maquetteDir` /
+// `RECETTE_MAQUETTE_DIR/<recetteId>/<slug>/` et le PANNEAU les sert comme
+// page statique (`GET /api/recettes/:id/maquette/*`). Nature de pièce
+// `maquette` (famille `recette_doc`) : `meta.url` / `meta.maquetteDir` /
 // `meta.entry` / `meta.files`. `itemId` (optionnel) rattache la maquette à un
 // ÉLÉMENT précis. Aucune table neuve (convergence ADR-003).
-export async function addEvaluationMaquette({ evaluationId, title, entry, files, itemId } = {}) {
+export async function addRecetteMaquette({ recetteId, title, entry, files, itemId } = {}) {
   await ensureSchema();
-  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
-  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  const ev = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${recetteId}`);
   const list = Array.isArray(files) ? files : [];
   if (!list.length) throw new Error("files requis (au moins un fichier { path, content })");
   const entryRel = assertSafeMaquettePath(entry || "index.html");
   const slug = maquetteSlug(title);
-  const dir = join(EVALUATION_MAQUETTE_DIR, String(evaluationId), slug);
+  const dir = join(RECETTE_MAQUETTE_DIR, String(recetteId), slug);
   mkdirSync(dir, { recursive: true });
   const written = [];
   for (const f of list) {
@@ -7376,30 +7394,30 @@ export async function addEvaluationMaquette({ evaluationId, title, entry, files,
   if (!written.includes(entryRel)) {
     throw new Error(`entry '${entryRel}' absent des fichiers fournis (${written.join(", ")})`);
   }
-  const url = `/api/evaluations/${encodeURIComponent(String(evaluationId))}/maquette/${slug}/${entryRel}`;
-  const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const url = `/api/recettes/${encodeURIComponent(String(recetteId))}/maquette/${slug}/${entryRel}`;
+  const id = `ART-RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const meta = {
     url, maquetteDir: dir, entry: entryRel, slug, files: written,
     ...(itemId !== undefined && itemId !== null && itemId !== "" ? { itemId: Number(itemId) } : {}),
   };
   await pool().query(
     `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
-     VALUES ($1,'evaluation_doc',$2,'autre',$3,'maquette','import',$4,$5,$6)`,
-    [id, String(evaluationId), title ?? `Maquette ${slug}`, join(dir, entryRel), meta, nowIso()],
+     VALUES ($1,'recette_doc',$2,'autre',$3,'maquette','import',$4,$5,$6)`,
+    [id, String(recetteId), title ?? `Maquette ${slug}`, join(dir, entryRel), meta, nowIso()],
   );
-  const documents = await listEvaluationDocuments(evaluationId);
-  return { ok: true, evaluationId: String(evaluationId), url, maquetteDir: dir, entry: entryRel, document: documents.find((d) => d.artifactId === id) || null, documents };
+  const documents = await listRecetteDocuments(recetteId);
+  return { ok: true, recetteId: String(recetteId), url, maquetteDir: dir, entry: entryRel, document: documents.find((d) => d.artifactId === id) || null, documents };
 }
 
 // ENREGISTRE un RAPPORT DE PERFORMANCE (test préprod : durées réseau, timings,
 // Core Web Vitals, stress) comme pièce d'évaluation de nature `performance`.
 // `meta` porte le résumé (`metrics`) et le chemin du rapport (`reportPath`).
 // `e2eTestId` (optionnel) rattache la mesure à un test Playwright existant.
-export async function addEvaluationPerfResult({ evaluationId, title, reportPath, metrics, summary, itemId, e2eTestId } = {}) {
+export async function addRecettePerfResult({ recetteId, title, reportPath, metrics, summary, itemId, e2eTestId } = {}) {
   await ensureSchema();
-  const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
-  if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
-  const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const ev = (await pool().query("SELECT recette_id FROM recettes WHERE recette_id = $1", [recetteId])).rows[0];
+  if (!ev) throw new Error(`évaluation inconnue : ${recetteId}`);
+  const id = `ART-RECT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const meta = {
     ...(reportPath ? { reportPath: String(reportPath) } : {}),
     ...(metrics && typeof metrics === "object" ? { metrics } : {}),
@@ -7409,16 +7427,16 @@ export async function addEvaluationPerfResult({ evaluationId, title, reportPath,
   };
   await pool().query(
     `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
-     VALUES ($1,'evaluation_doc',$2,'autre',$3,'performance','import',$4,$5,$6)`,
-    [id, String(evaluationId), title ?? "Rapport de performance", reportPath ?? null, Object.keys(meta).length ? meta : null, nowIso()],
+     VALUES ($1,'recette_doc',$2,'autre',$3,'performance','import',$4,$5,$6)`,
+    [id, String(recetteId), title ?? "Rapport de performance", reportPath ?? null, Object.keys(meta).length ? meta : null, nowIso()],
   );
-  const documents = await listEvaluationDocuments(evaluationId);
-  return { ok: true, evaluationId: String(evaluationId), document: documents.find((d) => d.artifactId === id) || null, documents };
+  const documents = await listRecetteDocuments(recetteId);
+  return { ok: true, recetteId: String(recetteId), document: documents.find((d) => d.artifactId === id) || null, documents };
 }
 
-export async function listEvaluationDocuments(evaluationId, { itemId } = {}) {
+export async function listRecetteDocuments(recetteId, { itemId } = {}) {
   await ensureSchema();
-  const params = [String(evaluationId), EVALUATION_DOC_TYPES];
+  const params = [String(recetteId), RECETTE_DOC_TYPES];
   let filter = "";
   if (itemId !== undefined && itemId !== null && itemId !== "") {
     params.push(String(Number(itemId)));
@@ -7434,7 +7452,7 @@ export async function listEvaluationDocuments(evaluationId, { itemId } = {}) {
   )).rows;
   return rows.map((r) => ({
     documentId: Number(r.id),
-    evaluationId: r.content_id,
+    recetteId: r.content_id,
     title: r.title || r.artifact_title || (r.path ? r.path.split("/").pop() : null) || null,
     nature: r.nature,
     source: r.source,
@@ -7446,33 +7464,33 @@ export async function listEvaluationDocuments(evaluationId, { itemId } = {}) {
   }));
 }
 
-export async function removeEvaluationDocument(documentId) {
+export async function removeRecetteDocument(documentId) {
   await ensureSchema();
   const row = (await pool().query(
     "SELECT content_id, nature, meta FROM artifacts WHERE id = $1 AND doc_type = ANY($2)",
-    [documentId, EVALUATION_DOC_TYPES],
+    [documentId, RECETTE_DOC_TYPES],
   )).rows[0];
   if (!row) return null;
   // Nettoyage des fichiers physiques d'une MAQUETTE (`meta.maquetteDir`),
   // confiné au répertoire des maquettes d'évaluation (garde anti-traversée).
   const meta = row.meta && typeof row.meta === "object" ? row.meta : parseDocMeta(row.meta);
   const dir = meta && typeof meta === "object" ? meta.maquetteDir : null;
-  if (dir && String(dir).startsWith(EVALUATION_MAQUETTE_DIR + "/")) {
+  if (dir && String(dir).startsWith(RECETTE_MAQUETTE_DIR + "/")) {
     try { rmSync(String(dir), { recursive: true, force: true }); } catch { /* best-effort */ }
   }
-  await pool().query("DELETE FROM artifacts WHERE id = $1 AND doc_type = ANY($2)", [documentId, EVALUATION_DOC_TYPES]);
+  await pool().query("DELETE FROM artifacts WHERE id = $1 AND doc_type = ANY($2)", [documentId, RECETTE_DOC_TYPES]);
   return row.content_id;
 }
 
 // Clôture (`pending→in_progress→done`) SANS créer de tâche (ADR-001).
-export async function confirmEvaluation({ evaluationId, confirmedBy } = {}) {
+export async function confirmRecette({ recetteId, confirmedBy } = {}) {
   await ensureSchema();
   const r = (await pool().query(
-    "UPDATE evaluations SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE evaluation_id = $3 RETURNING evaluation_id",
-    [nowIso(), confirmedBy ?? "human", evaluationId],
+    "UPDATE recettes SET status = 'done', confirmed_at = $1, confirmed_by = $2 WHERE recette_id = $3 RETURNING recette_id",
+    [nowIso(), confirmedBy ?? "human", recetteId],
   )).rows[0];
-  if (!r) throw new Error(`évaluation inconnue : ${evaluationId}`);
-  return getEvaluationById(evaluationId);
+  if (!r) throw new Error(`évaluation inconnue : ${recetteId}`);
+  return getRecetteById(recetteId);
 }
 
 // ===========================================================================
@@ -8253,7 +8271,7 @@ export async function batchReadiness(batchId) {
   });
 }
 
-export async function createBatch({ project, title, recetteId, taskIds, maxParallel = 2, sessionId = null, launchMode = "batch", createdBy }) {
+export async function createBatch({ project, title, cadrageId, taskIds, maxParallel = 2, sessionId = null, launchMode = "batch", createdBy }) {
   await ensureSchema();
   if (!project || !String(project).trim()) throw new Error("projet requis pour un batch");
   if (!title || !String(title).trim()) throw new Error("titre requis pour un batch");
@@ -8261,9 +8279,9 @@ export async function createBatch({ project, title, recetteId, taskIds, maxParal
   const mode = ["batch", "session", "manual"].includes(launchMode) ? launchMode : "batch";
   const id = `BATCH-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   await pool().query(
-    `INSERT INTO batches (id, project, title, recette_id, session_id, max_parallel, launch_mode, status, created_at, created_by)
+    `INSERT INTO batches (id, project, title, cadrage_id, session_id, max_parallel, launch_mode, status, created_at, created_by)
      VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9)`,
-    [id, String(project).trim(), String(title).trim(), recetteId ?? null, sessionId ?? null, Math.max(1, Math.min(8, maxParallel || 2)), mode, nowIso(), createdBy ?? null],
+    [id, String(project).trim(), String(title).trim(), cadrageId ?? null, sessionId ?? null, Math.max(1, Math.min(8, maxParallel || 2)), mode, nowIso(), createdBy ?? null],
   );
   for (const [i, t] of (taskIds || []).entries()) {
     if (!t) continue;
@@ -8295,7 +8313,7 @@ export async function getBatch(batchId) {
     batchId: b.id,
     project: b.project,
     title: b.title,
-    recetteId: b.recette_id ?? null,
+    cadrageId: b.cadrage_id ?? null,
     sessionId: b.session_id ?? null,
     maxParallel: b.max_parallel,
     launchMode: b.launch_mode ?? "batch",
@@ -8316,7 +8334,7 @@ export async function listBatches(project) {
     project ? [project] : [],
   )).rows;
   return rows.map((b) => ({
-    batchId: b.id, project: b.project, title: b.title, recetteId: b.recette_id ?? null,
+    batchId: b.id, project: b.project, title: b.title, cadrageId: b.cadrage_id ?? null,
     sessionId: b.session_id ?? null, maxParallel: b.max_parallel, launchMode: b.launch_mode ?? "batch",
     status: b.status, createdAt: b.created_at, createdBy: b.created_by, tasksCount: Number(b.tasks_count),
   }));
@@ -8599,12 +8617,12 @@ export function assertPieceAllowed({ nature, path, url, filename } = {}) {
 // ADMET explicitement les PHOTOS et VIDÉOS, à l'import de fichier COMME pour un
 // lien externe. AUCUN refus d'extension photo/vidéo ni d'hôte vidéo n'est
 // appliqué ici — l'évaluateur joint des preuves visuelles à ses éléments.
-// Elle VALIDE seulement que la nature résolue ∈ `EVALUATION_DOC_NATURES` et
-// retourne cette nature RÉSOLUE (persistée par `addEvaluationDocument`).
+// Elle VALIDE seulement que la nature résolue ∈ `RECETTE_DOC_NATURES` et
+// retourne cette nature RÉSOLUE (persistée par `addRecetteDocument`).
 // Résolution : URL → 'lien' ; sinon nature explicite ; sinon extension
-// (`EVALUATION_DOC_NATURE_BY_EXT`, repli 'document' si localisation présente).
+// (`RECETTE_DOC_NATURE_BY_EXT`, repli 'document' si localisation présente).
 // Tolérance legacy : ni nature ni localisation → `null` (rien à qualifier).
-export function assertEvaluationDocAllowed({ nature, path, url, filename } = {}) {
+export function assertRecetteDocAllowed({ nature, path, url, filename } = {}) {
   const p = path ? String(path).trim() : null;
   const u = url ? String(url).trim() : null;
   const f = filename ? String(filename).trim() : null;
@@ -8614,16 +8632,16 @@ export function assertEvaluationDocAllowed({ nature, path, url, filename } = {})
     if (u) {
       nat = "lien";
     } else {
-      nat = EVALUATION_DOC_NATURE_BY_EXT[pieceExtOf(f || p)] || "";
+      nat = RECETTE_DOC_NATURE_BY_EXT[pieceExtOf(f || p)] || "";
       if (!nat) {
         if (!p && !f) return null; // legacy : pièce sans nature ni localisation
         nat = "document";
       }
     }
   }
-  if (!EVALUATION_DOC_NATURES.includes(nat)) {
+  if (!RECETTE_DOC_NATURES.includes(nat)) {
     throw new Error(
-      `nature de pièce d'évaluation invalide : ${nature || "(absente)"} (attendu : ${EVALUATION_DOC_NATURES.join(" | ")})`,
+      `nature de pièce d'évaluation invalide : ${nature || "(absente)"} (attendu : ${RECETTE_DOC_NATURES.join(" | ")})`,
     );
   }
   return nat;

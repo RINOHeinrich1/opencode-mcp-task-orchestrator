@@ -33,9 +33,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at     TEXT NOT NULL,
   created_by     TEXT,
   session_id     TEXT,                             -- session opencode qui a créé la tâche
-  recette_status TEXT NOT NULL DEFAULT 'pending',  -- recette : pending (pas faite) | in_progress (en cours) | done (faite)
-  recette_class  TEXT,                             -- si tâche issue d'une recette : rework | bug | improvement | feature
-  recette_id     TEXT,                             -- recette SOURCE si la tâche a été générée par une recette
+  cadrage_status TEXT NOT NULL DEFAULT 'pending',  -- cadrage : pending (pas faite) | in_progress (en cours) | done (faite)
+  cadrage_class  TEXT,                             -- si tâche issue d'un cadrage : rework | bug | improvement | feature
+  cadrage_id     TEXT,                             -- cadrage SOURCE si la tâche a été générée par un cadrage
   title          TEXT,                             -- titre court de la tâche (obligatoire)
   direct_execution INTEGER NOT NULL DEFAULT 0,     -- 1 = exécution directe via build-notify (pas d'atomic-plan)
   emergent       INTEGER NOT NULL DEFAULT 0,      -- 1 = émergente (hors sprint / après clôture)
@@ -52,7 +52,7 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS emergent_origin TEXT;
 CREATE INDEX IF NOT EXISTS idx_tasks_emergent ON tasks(project) WHERE emergent = 1;
 
 -- Organisations : tenant de premier niveau (multi-organisation). Toutes les
--- entités de 1er niveau (projets, repos, tâches, recettes, tests, docs,
+-- entités de 1er niveau (projets, repos, tâches, cadrages, tests, docs,
 -- artefacts) portent `organization_id`. Un utilisateur appartient à une org.
 CREATE TABLE IF NOT EXISTS organizations (
   id          TEXT PRIMARY KEY,                 -- slug (ex. onirtech)
@@ -138,7 +138,7 @@ CREATE INDEX IF NOT EXISTS idx_task_repos_repo ON task_repos(repo_id);
 -- `recette_documents` + `doc_attachments` ; tâche T-20260920-162801-jxtr).
 -- Identifiée par le couple (doc_type, content_id) :
 --   doc_type   : type d'artefact (taxonomie énumérée — cf. nomenclature-doc-type.md)
---   content_id : identifiant de l'entité porteuse (taskId/recetteId/projectId/docId)
+--   content_id : identifiant de l'entité porteuse (taskId/cadrageId/projectId/docId)
 --   kind       : NATURE de l'artefact (plan | audit | report | autre)
 -- `content_type` est un nom RÉSERVÉ (futur « type d'artefact ») : JAMAIS créé.
 -- Champs ADR structurés conservés : status/context/decision/consequences/
@@ -153,7 +153,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   kind            TEXT NOT NULL DEFAULT 'autre',         -- NATURE : plan | audit | report | autre
   title           TEXT,
   path            TEXT,
-  nature          TEXT,                                  -- liaison libre (recette : à quoi sert)
+  nature          TEXT,                                  -- liaison libre (cadrage : à quoi sert)
   source          TEXT NOT NULL DEFAULT 'import',        -- import | artifact | registry | ref
   meta            JSONB,                                 -- champs propres à une famille
   description     TEXT,
@@ -282,12 +282,12 @@ CREATE TABLE IF NOT EXISTS deployments (
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_task ON deployments(task_id);
 
--- Décisions humaines (validation de plan, review/merge, recette) avec échéance & escalade.
+-- Décisions humaines (validation de plan, review/merge, cadrage) avec échéance & escalade.
 CREATE TABLE IF NOT EXISTS decisions (
   id             INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
   decision_id    TEXT PRIMARY KEY,
   task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  kind           TEXT NOT NULL DEFAULT 'validation',  -- validation | review | permission | recette
+  kind           TEXT NOT NULL DEFAULT 'validation',  -- validation | review | permission | cadrage
   status         TEXT NOT NULL DEFAULT 'awaiting',    -- awaiting | approved | rejected | expired
   requested_at   TEXT NOT NULL,
   requested_by   TEXT,
@@ -330,86 +330,86 @@ CREATE INDEX IF NOT EXISTS idx_task_links_task ON task_links(task_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_task_links_uniq ON task_links(task_id, linked_task_id);
 
 -- ===========================================================================
--- Recette (opération de vérification) — v0.8.0
+-- Cadrage (opération de vérification) — v0.8.0
 -- Objet de premier niveau rattaché à un PROJET, avec titre, session propre,
--- couvrant 0..N tâches (recette_tasks). Les éléments identifiés pendant la
--- recette deviennent de NOUVELLES tâches.
+-- couvrant 0..N tâches (cadrage_tasks). Les éléments identifiés pendant la
+-- cadrage deviennent de NOUVELLES tâches.
 -- ===========================================================================
-CREATE TABLE IF NOT EXISTS recettes (
-  recette_id   TEXT PRIMARY KEY,            -- RECT-<ts>-<rand>
+CREATE TABLE IF NOT EXISTS cadrages (
+  cadrage_id   TEXT PRIMARY KEY,            -- CT-<ts>-<rand>
   project      TEXT NOT NULL,               -- projet rattaché (contexte obligatoire)
-  title        TEXT NOT NULL,               -- titre court compréhensible (ex: "Recette du module chatbot")
+  title        TEXT NOT NULL,               -- titre court compréhensible (ex: "Cadrage du module chatbot")
   description  TEXT,                        -- description longue (détail du périmètre vérifié)
-  task_id      TEXT,                        -- legacy (une seule tâche) — associations via recette_tasks
-  session_id   TEXT,                        -- session dédiée agent-recette
+  task_id      TEXT,                        -- legacy (une seule tâche) — associations via cadrage_tasks
+  session_id   TEXT,                        -- session dédiée agent-cadrage
   status       TEXT NOT NULL DEFAULT 'pending',  -- pending (pas faite) | in_progress (en cours) | done (faite)
   created_at   TEXT NOT NULL,
   confirmed_at TEXT,
   confirmed_by TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_recettes_project ON recettes(project);
+CREATE INDEX IF NOT EXISTS idx_cadrages_project ON cadrages(project);
 
--- Tâches couvertes par une recette (0..N).
-CREATE TABLE IF NOT EXISTS recette_tasks (
-  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+-- Tâches couvertes par un cadrage (0..N).
+CREATE TABLE IF NOT EXISTS cadrage_tasks (
+  cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  PRIMARY KEY (recette_id, task_id)
+  PRIMARY KEY (cadrage_id, task_id)
 );
-CREATE INDEX IF NOT EXISTS idx_recette_tasks_task ON recette_tasks(task_id);
+CREATE INDEX IF NOT EXISTS idx_cadrage_tasks_task ON cadrage_tasks(task_id);
 
--- Projets rattachés à une recette — LÉGACY multi-projets (1..N), PLUS UTILISÉE.
--- Depuis v0.9.34 : 1 recette = 1 PROJET unique (`recettes.project`) ; la portée
+-- Projets rattachés à un cadrage — LÉGACY multi-projets (1..N), PLUS UTILISÉE.
+-- Depuis v0.9.34 : 1 cadrage = 1 PROJET unique (`cadrages.project`) ; la portée
 -- réelle est couverte par les REPOS TRANSVERSES du projet (`project_repos`,
 -- ADR 11 — ex: mada-talk traverse les repos mada-talk et oniria). La table est
--- conservée pour l'historique des anciennes recettes multi-projets (aucune
+-- conservée pour l'historique des anciennes cadrages multi-projets (aucune
 -- écriture/lecture par la logique actuelle).
-CREATE TABLE IF NOT EXISTS recette_projects (
-  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS cadrage_projects (
+  cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   project    TEXT NOT NULL,
-  PRIMARY KEY (recette_id, project)
+  PRIMARY KEY (cadrage_id, project)
 );
-CREATE INDEX IF NOT EXISTS idx_recette_projects_project ON recette_projects(project);
+CREATE INDEX IF NOT EXISTS idx_cadrage_projects_project ON cadrage_projects(project);
 
--- Éléments détectés pendant la recette (remarques, demandes, constats…).
-CREATE TABLE IF NOT EXISTS recette_items (
+-- Éléments détectés pendant le cadrage (remarques, demandes, constats…).
+CREATE TABLE IF NOT EXISTS cadrage_items (
   id               INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  recette_id       TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  cadrage_id       TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   project          TEXT,                    -- projet cible de l'élément (1 item = 1 projet) ; NULL legacy
   content          TEXT NOT NULL,           -- la remarque / demande / constat
   classification   TEXT NOT NULL DEFAULT 'rework',  -- rework | bug | improvement | feature
   discussion       TEXT,                    -- échanges liés
-  scope            TEXT,                    -- JSON array de chemins (périmètre suggéré, rempli par l'agent-recette)
+  scope            TEXT,                    -- JSON array de chemins (périmètre suggéré, rempli par l'agent-cadrage)
   status           TEXT NOT NULL DEFAULT 'open',    -- open | task_created
   created_task_id  TEXT,                    -- tâche créée après confirmation
   exec_order       INTEGER,                 -- ordre d'exécution recommandé (même n = parallèle)
   vigilance        TEXT,                    -- point de vigilance / écart sémantique
-  test_intent      TEXT,                    -- JSON : besoin TEST capturé en recette
+  test_intent      TEXT,                    -- JSON : besoin TEST capturé en cadrage
   doc_intent       TEXT,                    -- JSON : besoin DOCUMENT (ADR/specs/Gherkin) capturé
   created_at       TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id);
+CREATE INDEX IF NOT EXISTS idx_cadrage_items_cadrage ON cadrage_items(cadrage_id);
 
--- LEGACY : `recette_documents` (documents de recette) est fusionnée dans
--- `artifacts` (`doc_type` ∈ {recette_doc, recette_report}, `content_id` =
--- recetteId) — T-20260920-162801-jxtr. Table neutralisée (renommée
+-- LEGACY : `recette_documents` (documents de cadrage) est fusionnée dans
+-- `artifacts` (`doc_type` ∈ {cadrage_doc, cadrage_report}, `content_id` =
+-- cadrageId) — T-20260920-162801-jxtr. Table neutralisée (renommée
 -- `legacy_recette_documents`) par le script de migration ; JAMAIS supprimée.
 
--- Points de vigilance ADR remontés par les sessions de RECETTE / TEST (item 126) :
+-- Points de vigilance ADR remontés par les sessions de CADRAGE / TEST (item 126) :
 -- une ADR MANQUANTE pour une entité réellement discutée, ou un CONFLIT d'ADR
--- signalé pendant la recette. HISTORIQUE APPEND-ONLY : aucune suppression ; seul
+-- signalé pendant le cadrage. HISTORIQUE APPEND-ONLY : aucune suppression ; seul
 -- `status` transite `open → resolved` (resolved_at/resolution/resolved_by sont
--- AJOUTÉS, jamais effacés). Un point OUVERT rattaché à une recette BLOQUE sa
--- terminaison (`confirmRecette`) avec une raison explicite.
+-- AJOUTÉS, jamais effacés). Un point OUVERT rattaché à un cadrage BLOQUE sa
+-- terminaison (`confirmCadrage`) avec une raison explicite.
 --   type            : missing (ADR manquante) | conflict (conflit d'ADR)
 --   status          : open | resolved
 --   resolution_kind : adr_created | adr_deprecated | manual | decision
--- NB : placée APRÈS `recettes` (FK) — ordre requis par PostgreSQL.
+-- NB : placée APRÈS `cadrages` (FK) — ordre requis par PostgreSQL.
 CREATE TABLE IF NOT EXISTS adr_vigilances (
   vigilance_id    TEXT PRIMARY KEY,                 -- adr-vig-<ts>-<rand>
-  project         TEXT NOT NULL,                    -- projet de la recette (filtre historique)
-  recette_id      TEXT REFERENCES recettes(recette_id) ON DELETE CASCADE,
+  project         TEXT NOT NULL,                    -- projet du cadrage (filtre historique)
+  cadrage_id      TEXT REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   task_id         TEXT REFERENCES tasks(id) ON DELETE SET NULL,
-  session_id      TEXT,                             -- session recette/test d'origine (traçage)
+  session_id      TEXT,                             -- session cadrage/test d'origine (traçage)
   type            TEXT NOT NULL,                    -- missing | conflict
   status          TEXT NOT NULL DEFAULT 'open',     -- open | resolved
   entity          TEXT,                             -- entité/constat (type='missing')
@@ -425,7 +425,7 @@ CREATE TABLE IF NOT EXISTS adr_vigilances (
   resolved_by     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_adr_vigilances_project ON adr_vigilances(project);
-CREATE INDEX IF NOT EXISTS idx_adr_vigilances_recette ON adr_vigilances(recette_id);
+CREATE INDEX IF NOT EXISTS idx_adr_vigilances_cadrage ON adr_vigilances(cadrage_id);
 CREATE INDEX IF NOT EXISTS idx_adr_vigilances_status ON adr_vigilances(status);
 CREATE INDEX IF NOT EXISTS idx_adr_vigilances_type ON adr_vigilances(type);
 
@@ -652,7 +652,7 @@ CREATE INDEX IF NOT EXISTS idx_e2e_vars_project ON e2e_vars(project);
 
 -- ===========================================================================
 -- Batch d'orchestration (v0.9.0) : groupe de tâches pilotées par UNE session
--- d'orchestration. Source naturelle = recette (recette_id), ou ad-hoc.
+-- d'orchestration. Source naturelle = cadrage (cadrage_id), ou ad-hoc.
 -- La READINESS et la MATRICE DE CONFLIT sont CALCULÉES (pas stockées) depuis :
 --   - dépendances (tasks.dependencies) → précédence ;
 --   - fichiers déclarés (plans.file / absolute_path) + réels (plan_commits.files)
@@ -665,7 +665,7 @@ CREATE TABLE IF NOT EXISTS batches (
   id            TEXT PRIMARY KEY,                 -- BATCH-<ts>-<rand>
   project       TEXT NOT NULL,                    -- projet cible
   title         TEXT NOT NULL,
-  recette_id    TEXT,                             -- source naturelle (nullable si ad-hoc)
+  cadrage_id    TEXT,                             -- source naturelle (nullable si ad-hoc)
   session_id    TEXT,                             -- session d'orchestration unique
   max_parallel  INTEGER NOT NULL DEFAULT 2,       -- plafond d'écrivains simultanés
   launch_mode   TEXT NOT NULL DEFAULT 'batch',    -- batch (worker auto) | session (session unique) | manual (aucun auto)
@@ -674,7 +674,7 @@ CREATE TABLE IF NOT EXISTS batches (
   created_by    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_batches_project ON batches(project);
-CREATE INDEX IF NOT EXISTS idx_batches_recette ON batches(recette_id);
+CREATE INDEX IF NOT EXISTS idx_batches_cadrage ON batches(cadrage_id);
 
 CREATE TABLE IF NOT EXISTS batch_tasks (
   batch_id  TEXT NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
@@ -699,7 +699,7 @@ CREATE TABLE IF NOT EXISTS fonctionnalites (
   user_story       TEXT NOT NULL,                  -- « En tant que <rôle>, je peux … »
   sourced_piece_id TEXT,                           -- pièce client source (artifacts.artifact_id)
   emergent         INTEGER NOT NULL DEFAULT 0,     -- 1 = émergente (hors sprint / après clôture)
-  emergent_origin  TEXT,                           -- hors_sprint | apres_cloture | sans_piece | recette
+  emergent_origin  TEXT,                           -- hors_sprint | apres_cloture | sans_piece | cadrage
   implemented      INTEGER NOT NULL DEFAULT 0,     -- 1 = implémentée (état explicite, T-20260921-133134-yz2i)
   implemented_origin TEXT,                         -- ecosystem | hors_ecosystem (origine de l'implémentation)
   implemented_at   TEXT,                           -- horodatage de la qualification
@@ -900,50 +900,50 @@ ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS validated_at TEXT;
 ALTER TABLE task_adr ADD COLUMN IF NOT EXISTS reason TEXT;
 CREATE INDEX IF NOT EXISTS idx_task_adr_status ON task_adr(status);
 
-CREATE TABLE IF NOT EXISTS recette_sprints (
-  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS cadrage_sprints (
+  cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   sprint_id  TEXT NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
-  PRIMARY KEY (recette_id, sprint_id)
+  PRIMARY KEY (cadrage_id, sprint_id)
 );
-CREATE INDEX IF NOT EXISTS idx_recette_sprints_sprint ON recette_sprints(sprint_id);
+CREATE INDEX IF NOT EXISTS idx_cadrage_sprints_sprint ON cadrage_sprints(sprint_id);
 
-CREATE TABLE IF NOT EXISTS recette_fonctionnalites (
-  recette_id        TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS cadrage_fonctionnalites (
+  cadrage_id        TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
-  PRIMARY KEY (recette_id, fonctionnalite_id)
+  PRIMARY KEY (cadrage_id, fonctionnalite_id)
 );
-CREATE INDEX IF NOT EXISTS idx_recette_fonctionnalites_feat ON recette_fonctionnalites(fonctionnalite_id);
+CREATE INDEX IF NOT EXISTS idx_cadrage_fonctionnalites_feat ON cadrage_fonctionnalites(fonctionnalite_id);
 
-CREATE TABLE IF NOT EXISTS recette_adr (
-  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS cadrage_adr (
+  cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   adr_id     TEXT NOT NULL REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
-  PRIMARY KEY (recette_id, adr_id)
+  PRIMARY KEY (cadrage_id, adr_id)
 );
-CREATE INDEX IF NOT EXISTS idx_recette_adr_adr ON recette_adr(adr_id);
+CREATE INDEX IF NOT EXISTS idx_cadrage_adr_adr ON cadrage_adr(adr_id);
 
--- Recette ↔ règle métier (T-20260922-070103-ncs1). Miroir EXACT de la DDL
--- posée dans `migrate()` (db.mjs). Miroir DDL de `recette_fonctionnalites`.
-CREATE TABLE IF NOT EXISTS recette_regles (
-  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
+-- Cadrage ↔ règle métier (T-20260922-070103-ncs1). Miroir EXACT de la DDL
+-- posée dans `migrate()` (db.mjs). Miroir DDL de `cadrage_fonctionnalites`.
+CREATE TABLE IF NOT EXISTS cadrage_regles (
+  cadrage_id TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
   regle_id   TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
-  PRIMARY KEY (recette_id, regle_id)
+  PRIMARY KEY (cadrage_id, regle_id)
 );
-CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id);
+CREATE INDEX IF NOT EXISTS idx_cadrage_regles_regle ON cadrage_regles(regle_id);
 
 -- ===========================================================================
 -- ÉVALUATIONS — « Recette » de l'ÉVALUATEUR PRODUIT (T-20260922-100650-sbc1).
--- Objet de PREMIER NIVEAU, DISTINCT de `recettes` (qui porte désormais le
+-- Objet de PREMIER NIVEAU, DISTINCT de `cadrages` (qui porte désormais le
 -- CADRAGE TECHNIQUE côté exécuteur). L'évaluateur décrit le PARCOURS ÉVALUÉ
 -- (`description`), rattache 1..N FONCTIONNALITÉS (le VERDICT est porté par le
 -- lien) + 1..N RÈGLES MÉTIER, enregistre des ÉLÉMENTS (recommandation |
 -- problème, catégorie + sévérité + suivi) et joint des PIÈCES (lien / document
--- / photo / vidéo via `artifacts`, `doc_type='evaluation_doc'`).
+-- / photo / vidéo via `artifacts`, `doc_type='recette_doc'`).
 -- Cycle de vie : pending | in_progress | done. AUCUNE conversion en tâches.
 -- `created_by` est indispensable au filtre propriétaire (l'évaluateur ne voit
 -- que SES recettes : `recetteOwnerScope`). Miroir DDL dans `migrate()` (db.mjs).
 -- ===========================================================================
-CREATE TABLE IF NOT EXISTS evaluations (
-  evaluation_id   TEXT PRIMARY KEY,                 -- EVAL-<ts>-<rand>
+CREATE TABLE IF NOT EXISTS recettes (
+  recette_id   TEXT PRIMARY KEY,                 -- RECT-<ts>-<rand>
   project         TEXT NOT NULL,                    -- projet (produit) rattaché
   title           TEXT NOT NULL,                    -- titre court
   description     TEXT,                             -- PARCOURS ÉVALUÉ (description longue)
@@ -955,31 +955,31 @@ CREATE TABLE IF NOT EXISTS evaluations (
   created_by      TEXT,                             -- propriétaire (filtre évaluateur)
   session_id      TEXT                              -- session dédiée agent-recette (évaluateur)
 );
-CREATE INDEX IF NOT EXISTS idx_evaluations_project ON evaluations(project);
-CREATE INDEX IF NOT EXISTS idx_evaluations_created_by ON evaluations(created_by);
+CREATE INDEX IF NOT EXISTS idx_recettes_project ON recettes(project);
+CREATE INDEX IF NOT EXISTS idx_recettes_created_by ON recettes(created_by);
 
 -- Fonctionnalités évaluées (1..N). Le VERDICT est porté par le LIEN.
-CREATE TABLE IF NOT EXISTS evaluation_fonctionnalites (
-  evaluation_id     TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS recette_fonctionnalites (
+  recette_id     TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
   fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
   verdict           TEXT,                           -- conforme | non_conforme | a_ameliorer | NULL
   verdict_comment   TEXT,
-  PRIMARY KEY (evaluation_id, fonctionnalite_id)
+  PRIMARY KEY (recette_id, fonctionnalite_id)
 );
-CREATE INDEX IF NOT EXISTS idx_evaluation_fonctionnalites_feat ON evaluation_fonctionnalites(fonctionnalite_id);
+CREATE INDEX IF NOT EXISTS idx_recette_fonctionnalites_feat ON recette_fonctionnalites(fonctionnalite_id);
 
--- Règles métier évaluées (1..N). Miroir de `evaluation_fonctionnalites`.
-CREATE TABLE IF NOT EXISTS evaluation_regles (
-  evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+-- Règles métier évaluées (1..N). Miroir de `recette_fonctionnalites`.
+CREATE TABLE IF NOT EXISTS recette_regles (
+  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
   regle_id      TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
-  PRIMARY KEY (evaluation_id, regle_id)
+  PRIMARY KEY (recette_id, regle_id)
 );
-CREATE INDEX IF NOT EXISTS idx_evaluation_regles_regle ON evaluation_regles(regle_id);
+CREATE INDEX IF NOT EXISTS idx_recette_regles_regle ON recette_regles(regle_id);
 
 -- Éléments évalués : RECOMMANDATION ou PROBLÈME (catégorie + sévérité + suivi).
-CREATE TABLE IF NOT EXISTS evaluation_items (
+CREATE TABLE IF NOT EXISTS recette_items (
   id            INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  evaluation_id TEXT NOT NULL REFERENCES evaluations(evaluation_id) ON DELETE CASCADE,
+  recette_id TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
   content       TEXT NOT NULL,                      -- la recommandation / le problème
   category      TEXT NOT NULL DEFAULT 'recommandation', -- recommandation | probleme
   severity      TEXT NOT NULL DEFAULT 'medium',     -- low | medium | high | critical
@@ -990,23 +990,23 @@ CREATE TABLE IF NOT EXISTS evaluation_items (
   decided_by    TEXT,                               -- auteur de la décision admin
   created_at    TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_evaluation_items_evaluation ON evaluation_items(evaluation_id);
+CREATE INDEX IF NOT EXISTS idx_recette_items_recette ON recette_items(recette_id);
 
 -- REPRISE d'un élément de recette évaluateur par un CADRAGE TECHNIQUE
--- (`recettes`, alias `cadrage_*`) : lien ADDITIF (traçage « repris par le
+-- (`cadrages`, alias `cadrage_*`) : lien ADDITIF (traçage « repris par le
 -- cadrage X »). Miroir EXACT de la DDL posée dans `migrate()` (db.mjs).
-CREATE TABLE IF NOT EXISTS cadrage_evaluation_items (
-  recette_id         TEXT NOT NULL REFERENCES recettes(recette_id) ON DELETE CASCADE,
-  evaluation_item_id INTEGER NOT NULL REFERENCES evaluation_items(id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS cadrage_recette_items (
+  cadrage_id         TEXT NOT NULL REFERENCES cadrages(cadrage_id) ON DELETE CASCADE,
+  recette_item_id INTEGER NOT NULL REFERENCES recette_items(id) ON DELETE CASCADE,
   created_at         TEXT NOT NULL,
   taken_by           TEXT,
-  PRIMARY KEY (recette_id, evaluation_item_id)
+  PRIMARY KEY (cadrage_id, recette_item_id)
 );
-CREATE INDEX IF NOT EXISTS idx_cadrage_evaluation_items_item ON cadrage_evaluation_items(evaluation_item_id);
+CREATE INDEX IF NOT EXISTS idx_cadrage_recette_items_item ON cadrage_recette_items(recette_item_id);
 
 -- ===========================================================================
 -- CARDINALITÉS HEURISTIQUES (T6, ADR-001 §5). Trace APPEND-ONLY des manques de
--- cardinalité (recette/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
+-- cardinalité (cadrage/tâche/ADR/sprint) — SIGNALEMENT + TRAÇAGE, JAMAIS
 -- bloquant. Miroir EXACT de la DDL posée dans `migrate()` (db.mjs). L'index
 -- partiel unique garantit UN SEUL signal OPEN par entité.
 -- ===========================================================================
