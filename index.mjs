@@ -142,6 +142,7 @@ import {
   buildSprintReport,
   createSprint,
   getSprintDetail,
+  deleteSprint,
   attachPiecesToSprint,
   getSprint,
   listProjectSprints,
@@ -175,11 +176,13 @@ import {
   markFeatureImplemented,
   getFeature,
   listFeatures,
+  deleteFeature,
   registerRule,
   updateRule,
   markRuleImplemented,
   getRule,
   listRules,
+  deleteRule,
   linkFeatureRule,
   unlinkFeatureRule,
   linkFeatureGherkin,
@@ -790,6 +793,19 @@ server.registerTool("sprint_attach_pieces", {
   } catch (e) { return err(e.message); }
 });
 
+server.registerTool("sprint_delete", {
+  description: "SUPPRIME un SPRINT (`SPRINT-*`) et détache ses liens (`sprint_fonctionnalites`/`sprint_regles`/`sprint_pieces` — les entités restent au projet), `migrations.sprint_id` → NULL, et nettoie ses signaux de cardinalité `open`. REFUS DUR (pas de `force`) : sprint PAR DÉFAUT (`is_default=1`, message préfixé `[SPRINT_DEFAULT]`) ; sprint portant des TÂCHES ou RECETTES (`task_sprints`/`recette_sprints`, message préfixé `[SPRINT_LINKED]` — détacher d'abord via `task_sprint_unlink`/`recette_sprint_unlink`). Retourne `{ ok, sprintId, deleted, detached }`.",
+  inputSchema: {
+    sprintId: z.string().describe("Identifiant du sprint (SPRINT-<ts>-<rand>)."),
+  },
+}, async ({ sprintId }) => {
+  try {
+    const r = await deleteSprint(sprintId);
+    if (!r) return err(`sprint inconnu : ${sprintId}`);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
 server.registerTool("sprint_session_set", {
   description: "ASSOCIE la session IA dédiée (agent-sprint) à un sprint EXISTANT (`sprints.session_id`). Miroir de `recette_session_set` MAIS NE TOUCHE PAS au statut du sprint : `open`/`close` (et donc la garde d'émergence) restent pilotés par `sprint_close`/`sprint_reopen`. `sessionId` null détache la session. Retourne `{ ok, sprint }`.",
   inputSchema: {
@@ -988,6 +1004,21 @@ server.registerTool("feature_list", {
   } catch (e) { return err(e.message); }
 });
 
+server.registerTool("feature_delete", {
+  description: "SUPPRIME une FONCTIONNALITÉ (`FEAT-*`) et ses liens (`fonctionnalite_regles`, `fonctionnalite_gherkin`, `fonctionnalite_adr`, `sprint_fonctionnalites`, `task_fonctionnalites`, `recette_fonctionnalites`) en CASCADE. GARDE D'INTÉGRITÉ « ADR ≥ 1 fonctionnalité » : si la suppression ferait perdre à une ADR sa DERNIÈRE fonctionnalité, l'appel est REFUSÉ (message préfixé `[ADR_LAST_FEATURE]`) SAUF si `cascadeAdrs=true` — auquel cas l'ADR orpheline est supprimée dans la MÊME transaction (avant les liens, pour satisfaire le trigger différé). Retourne `{ ok, featureId, deleted, cascadedAdrs }`.",
+  inputSchema: {
+    featureId: z.string().describe("Identifiant de la fonctionnalité (FEAT-<ts>-<rand>)."),
+    cascadeAdrs: z.boolean().optional().describe("true : supprimer aussi les ADR qui perdraient leur dernière fonctionnalité (défaut false → refus explicite)."),
+    by: z.string().optional().describe("Acteur de la suppression."),
+  },
+}, async ({ featureId, cascadeAdrs, by }) => {
+  try {
+    const r = await deleteFeature(featureId, { cascadeAdrs: cascadeAdrs === true, by });
+    if (!r) return err(`fonctionnalité inconnue : ${featureId}`);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
 server.registerTool("rule_register", {
   description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
   inputSchema: {
@@ -1062,6 +1093,19 @@ server.registerTool("rule_list", {
   try {
     const rules = await listRules({ projectId, emergent, search, limit });
     return text(JSON.stringify({ count: rules.length, rules }, null, 2));
+  } catch (e) { return err(e.message); }
+});
+
+server.registerTool("rule_delete", {
+  description: "SUPPRIME une RÈGLE MÉTIER (`RMET-*`) et ses liens (`fonctionnalite_regles`, `sprint_regles`) en CASCADE. Aucun invariant métier. Retourne `{ ok, ruleId, deleted }`.",
+  inputSchema: {
+    ruleId: z.string().describe("Identifiant de la règle (RMET-<ts>-<rand>)."),
+  },
+}, async ({ ruleId }) => {
+  try {
+    const r = await deleteRule(ruleId);
+    if (!r) return err(`règle inconnue : ${ruleId}`);
+    return text(JSON.stringify({ ok: true, ...r }, null, 2));
   } catch (e) { return err(e.message); }
 });
 

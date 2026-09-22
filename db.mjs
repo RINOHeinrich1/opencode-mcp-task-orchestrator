@@ -958,6 +958,62 @@ export async function getSprintDetail(sprintId) {
   };
 }
 
+// SUPPRESSION d'un SPRINT (`sprint_delete`, T-20260922-060057-febv).
+//
+// REFUS DUR (pas de flag `force`) :
+//   - le SPRINT PAR DÉFAUT (`is_default=1`) : ancre des migrations / « ancien
+//     sprint » (`ensureDefaultSprint`, `migrations.sprint_id`) — message
+//     préfixé `[SPRINT_DEFAULT]` ;
+//   - un sprint portant des TÂCHES (`task_sprints`) ou des RECETTES
+//     (`recette_sprints`) : le détachement est EXPLICITE via les tools
+//     `task_sprint_unlink` / `recette_sprint_unlink`, jamais silencieux (perte
+//     de traçabilité) — message préfixé `[SPRINT_LINKED]` avec les compteurs.
+//
+// AUTORISÉ sinon : les liens `sprint_fonctionnalites` / `sprint_regles` /
+// `sprint_pieces` sont détachés (les entités restent au projet), `migrations.
+// sprint_id` passe à `NULL` (FK `ON DELETE SET NULL`), et les signaux de
+// cardinalité `open` du sprint sont nettoyés (aucune FK → évite un orphelin).
+// Retourne `{ sprintId, deleted:true, detached:{fonctionnalites,regles,pieces} }`.
+export async function deleteSprint(sprintId) {
+  await ensureSchema();
+  const sprint = await getSprint(sprintId);
+  if (!sprint) return null;
+  const sid = sprint.id;
+  if (sprint.isDefault) {
+    throw new Error(
+      `[SPRINT_DEFAULT] suppression refusée : le sprint ${sid} est le SPRINT PAR DÉFAUT du projet ` +
+      `« ${sprint.project} » (ancre des migrations / « ancien sprint »). Il ne peut pas être supprimé.`,
+    );
+  }
+  const [taskRow, recetteRow] = await Promise.all([
+    pool().query("SELECT count(*) AS n FROM task_sprints WHERE sprint_id = $1", [sid]),
+    pool().query("SELECT count(*) AS n FROM recette_sprints WHERE sprint_id = $1", [sid]),
+  ]);
+  const taskCount = Number(taskRow.rows[0]?.n) || 0;
+  const recetteCount = Number(recetteRow.rows[0]?.n) || 0;
+  if (taskCount || recetteCount) {
+    throw new Error(
+      `[SPRINT_LINKED] suppression refusée : le sprint ${sid} porte ${taskCount} tâche(s) et ` +
+      `${recetteCount} recette(s) rattachée(s). Détachez-les d'abord ` +
+      `(\`task_sprint_unlink\` / \`recette_sprint_unlink\`).`,
+    );
+  }
+  const detached = await withTransaction(async (client) => {
+    const f = (await client.query("DELETE FROM sprint_fonctionnalites WHERE sprint_id = $1", [sid])).rowCount;
+    const r = (await client.query("DELETE FROM sprint_regles WHERE sprint_id = $1", [sid])).rowCount;
+    const p = (await client.query("DELETE FROM sprint_pieces WHERE sprint_id = $1", [sid])).rowCount;
+    // Signaux de cardinalité `open` du sprint (entity_type/entity_id génériques,
+    // AUCUNE FK) : on évite un signal orphelin après suppression.
+    await client.query(
+      "DELETE FROM cardinality_signals WHERE entity_type = 'sprint' AND entity_id = $1 AND status = 'open'",
+      [sid],
+    );
+    await client.query("DELETE FROM sprints WHERE id = $1", [sid]);
+    return { fonctionnalites: f, regles: r, pieces: p };
+  });
+  return { sprintId: sid, deleted: true, detached };
+}
+
 // Liste des sprints d'un projet (du plus récent au plus ancien). Filtre `status`.
 export async function listProjectSprints(projectId, { status } = {}) {
   await ensureSchema();
@@ -2006,6 +2062,72 @@ export async function getFeature(featureId) {
   };
 }
 
+// SUPPRESSION d'une FONCTIONNALITÉ (`feature_delete`, T-20260922-060057-febv).
+// Détache EXPLICITEMENT les 6 tables de liens (les FK `ON DELETE CASCADE` sont
+// le filet de sécurité), puis supprime la fonctionnalité.
+//
+// GARDE D'INTÉGRITÉ « ADR ≥ 1 fonctionnalité » (invariant métier, trigger
+// différé `trg_fonctionnalite_adr_min`) : si la suppression ferait perdre à une
+// ADR EXISTANTE sa DERNIÈRE fonctionnalité, l'appel est REFUSÉ avec un message
+// préfixé `[ADR_LAST_FEATURE]` (marqueur stable lu par le panneau) — SAUF si
+// `cascadeAdrs=true`. Dans ce cas les ADR devenues orphelines sont supprimées
+// DANS LA MÊME TRANSACTION, AVANT les liens `fonctionnalite_adr`, afin que le
+// CONSTRAINT TRIGGER différé ne les voie plus au COMMIT.
+//
+// Retourne `{ featureId, deleted:true, cascadedAdrs:[…] }` (ou `null` si la
+// fonctionnalité est inconnue).
+export async function deleteFeature(featureId, { cascadeAdrs, by } = {}) {
+  await ensureSchema();
+  const feature = await getFeature(featureId);
+  if (!feature) return null;
+  const fid = feature.id;
+  void by;
+  return withTransaction(async (client) => {
+    // 1) ADR qui perdraient leur DERNIÈRE fonctionnalité si `fid` disparaît.
+    const orphanRows = (await client.query(
+      `SELECT fa.adr_id AS adr_id
+         FROM fonctionnalite_adr fa
+        WHERE fa.fonctionnalite_id = $1
+          AND EXISTS (SELECT 1 FROM artifacts a WHERE a.artifact_id = fa.adr_id)
+          AND NOT EXISTS (SELECT 1 FROM fonctionnalite_adr x
+                           WHERE x.adr_id = fa.adr_id AND x.fonctionnalite_id <> $1)`,
+      [fid],
+    )).rows.map((r) => r.adr_id);
+
+    if (orphanRows.length && cascadeAdrs !== true) {
+      const e = new Error(
+        `[ADR_LAST_FEATURE] suppression refusée : l'ADR ${orphanRows.join(", ")} ` +
+        `perdrait sa dernière fonctionnalité (invariant « ADR ≥ 1 fonctionnalité »). ` +
+        `Rattachez une autre fonctionnalité, supprimez l'ADR (\`doc_delete\`), ` +
+        `ou relancez avec \`cascadeAdrs=true\` pour supprimer aussi l'ADR.`,
+      );
+      e.code = "ADR_LAST_FEATURE";
+      e.adrIds = orphanRows;
+      throw e;
+    }
+
+    // 2) Cascade ADR : supprimer les ADR orphelines AVANT les liens
+    //    `fonctionnalite_adr` (miroir exact de `deleteDoc` : pièces jointes
+    //    `adr_file` puis l'artefact ADR).
+    const cascadedAdrs = [];
+    for (const adrId of orphanRows) {
+      await client.query("DELETE FROM artifacts WHERE content_id = $1 AND doc_type = 'adr_file'", [adrId]);
+      await client.query("DELETE FROM artifacts WHERE artifact_id = $1 AND doc_type = ANY($2)", [adrId, DOCS_DOC_TYPES]);
+      cascadedAdrs.push(adrId);
+    }
+
+    // 3) Détachement explicite des 6 tables de liens (miroir des FK CASCADE).
+    await client.query("DELETE FROM fonctionnalite_regles WHERE fonctionnalite_id = $1", [fid]);
+    await client.query("DELETE FROM fonctionnalite_gherkin WHERE fonctionnalite_id = $1", [fid]);
+    await client.query("DELETE FROM fonctionnalite_adr WHERE fonctionnalite_id = $1", [fid]);
+    await client.query("DELETE FROM sprint_fonctionnalites WHERE fonctionnalite_id = $1", [fid]);
+    await client.query("DELETE FROM task_fonctionnalites WHERE fonctionnalite_id = $1", [fid]);
+    await client.query("DELETE FROM recette_fonctionnalites WHERE fonctionnalite_id = $1", [fid]);
+    await client.query("DELETE FROM fonctionnalites WHERE id = $1", [fid]);
+    return { featureId: fid, deleted: true, cascadedAdrs };
+  });
+}
+
 // Compteurs de LIENS des fonctionnalités — UNE requête bulk (pas de N+1 SQL).
 // `unnest($1::text[])` produit une ligne par id et 6 sous-requêtes `count(*)`
 // comptent les liens de chaque nature. Retourne
@@ -2236,6 +2358,23 @@ export async function getRule(ruleId) {
     fonctionnalites: featRows.rows.map(rowToFonctionnalite),
     sprints: sprintRows.rows.map(rowToSprint),
   };
+}
+
+// SUPPRESSION d'une RÈGLE MÉTIER (`rule_delete`, T-20260922-060057-febv).
+// Aucun invariant métier : les liens `fonctionnalite_regles` / `sprint_regles`
+// sont détachés (FK CASCADE = filet de sécurité), puis la règle est supprimée.
+// Retourne `{ ruleId, deleted:true }` (ou `null` si la règle est inconnue).
+export async function deleteRule(ruleId) {
+  await ensureSchema();
+  const rule = await getRule(ruleId);
+  if (!rule) return null;
+  const rid = rule.id;
+  await withTransaction(async (client) => {
+    await client.query("DELETE FROM fonctionnalite_regles WHERE regle_id = $1", [rid]);
+    await client.query("DELETE FROM sprint_regles WHERE regle_id = $1", [rid]);
+    await client.query("DELETE FROM regles_metier WHERE id = $1", [rid]);
+  });
+  return { ruleId: rid, deleted: true };
 }
 
 // LISTE des règles métier d'un projet. Filtres : `emergent`, recherche
