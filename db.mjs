@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-21-perf-fr-nplus1";
+const SCHEMA_VERSION = "2026-09-22-sprint-filter-roles-regles";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -538,6 +538,8 @@ async function migrate() {
     sourced_piece_id TEXT,
     emergent         INTEGER NOT NULL DEFAULT 0,
     emergent_origin  TEXT,
+    roles            TEXT[] NOT NULL DEFAULT '{}',
+    role_global      INTEGER NOT NULL DEFAULT 0,
     organization_id  TEXT,
     created_at       TEXT NOT NULL,
     updated_at       TEXT,
@@ -587,6 +589,10 @@ async function migrate() {
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_at TEXT");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_by TEXT");
   await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_note TEXT");
+  // RÈGLE MÉTIER — association EXPLICITE de rôles (1..N) ou rôle GLOBAL (T-20260922-064200-e0yw).
+  // Remplace le `roles` DÉRIVÉ des fonctionnalités liées : source de vérité unique.
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS roles TEXT[] NOT NULL DEFAULT '{}'");
+  await pool().query("ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS role_global INTEGER NOT NULL DEFAULT 0");
   await pool().query(`CREATE TABLE IF NOT EXISTS fonctionnalite_regles (
     fonctionnalite_id TEXT NOT NULL REFERENCES fonctionnalites(id) ON DELETE CASCADE,
     regle_id          TEXT NOT NULL REFERENCES regles_metier(id) ON DELETE CASCADE,
@@ -1775,6 +1781,10 @@ function rowToRegle(r) {
     implementedAt: r.implemented_at ?? null,
     implementedBy: r.implemented_by ?? null,
     implementedNote: r.implemented_note ?? null,
+    // Association EXPLICITE de rôles (1..N) ou rôle GLOBAL (T-20260922-064200-e0yw).
+    // `pg` renvoie TEXT[] comme tableau JS natif ; repli `[]` si NULL.
+    roles: Array.isArray(r.roles) ? r.roles : [],
+    roleGlobal: !!r.role_global,
     createdAt: r.created_at,
     updatedAt: r.updated_at ?? null,
     createdBy: r.created_by ?? null,
@@ -2142,6 +2152,9 @@ async function featureLinkCounts(ids) {
             (SELECT count(*) FROM fonctionnalite_gherkin  x WHERE x.fonctionnalite_id = i.id) AS gherkin,
             (SELECT count(*) FROM fonctionnalite_adr      x WHERE x.fonctionnalite_id = i.id) AS adrs,
             (SELECT count(*) FROM sprint_fonctionnalites  x WHERE x.fonctionnalite_id = i.id) AS sprints,
+            (SELECT array_agg(sf.sprint_id)
+               FROM sprint_fonctionnalites sf
+              WHERE sf.fonctionnalite_id = i.id) AS "sprintIds",
             (SELECT count(*) FROM task_fonctionnalites    x WHERE x.fonctionnalite_id = i.id) AS tasks,
             (SELECT count(*) FROM recette_fonctionnalites x WHERE x.fonctionnalite_id = i.id) AS recettes
        FROM unnest($1::text[]) AS i(id)`,
@@ -2153,6 +2166,7 @@ async function featureLinkCounts(ids) {
       gherkin: Number(r.gherkin) || 0,
       adrs: Number(r.adrs) || 0,
       sprints: Number(r.sprints) || 0,
+      sprintIds: Array.from(new Set((r.sprintIds || []).filter(Boolean))).sort(),
       tasks: Number(r.tasks) || 0,
       recettes: Number(r.recettes) || 0,
     };
@@ -2161,11 +2175,11 @@ async function featureLinkCounts(ids) {
 }
 
 // Compteurs de LIENS des règles métier — UNE requête bulk (pas de N+1 SQL).
-// Retourne `{ [id]: { features, sprints, roles } }` (zéros / tableau vide inclus).
-// `roles` = rôles DISTINCTS des fonctionnalités liées (`fonctionnalite_regles` ⨝
-// `fonctionnalites.role`, rôles NULL/vides exclus). Calculé par une 3ᵉ sous-requête
-// scalaire DANS LA MÊME requête `unnest` que les compteurs ⇒ 1 aller-retour, 0 N+1.
-// Le rôle d'une règle = union des rôles de ses fonctionnalités ; `[]` = « Sans rôle ».
+// Retourne `{ [id]: { features, sprints, sprintIds } }` (zéros / tableau vide inclus).
+// `sprintIds` = ids des sprints liés (`sprint_regles`), exposés pour le filtre
+// CLIENT « lié au sprint X » sans N+1. Le `roles` DÉRIVÉ des fonctionnalités liées
+// a été RETIRÉ (T-20260922-064200-e0yw) : les rôles proviennent désormais de la
+// colonne explicite `regles_metier.roles` (via `rowToRegle`), source unique.
 async function ruleLinkCounts(ids) {
   const out = {};
   const list = (ids || []).map((x) => String(x)).filter(Boolean);
@@ -2174,10 +2188,9 @@ async function ruleLinkCounts(ids) {
     `SELECT i.id AS id,
             (SELECT count(*) FROM fonctionnalite_regles x WHERE x.regle_id = i.id) AS features,
             (SELECT count(*) FROM sprint_regles         x WHERE x.regle_id = i.id) AS sprints,
-            (SELECT array_agg(DISTINCT f.role)
-               FROM fonctionnalite_regles x
-               JOIN fonctionnalites f ON f.id = x.fonctionnalite_id
-              WHERE x.regle_id = i.id AND f.role IS NOT NULL AND f.role <> '') AS roles
+            (SELECT array_agg(sr.sprint_id)
+               FROM sprint_regles sr
+              WHERE sr.regle_id = i.id) AS "sprintIds"
        FROM unnest($1::text[]) AS i(id)`,
     [list],
   )).rows;
@@ -2186,7 +2199,7 @@ async function ruleLinkCounts(ids) {
       features: Number(r.features) || 0,
       sprints: Number(r.sprints) || 0,
       // Dédup + tri déterministes (sortie stable pour les options de select).
-      roles: Array.from(new Set((r.roles || []).filter(Boolean))).sort(),
+      sprintIds: Array.from(new Set((r.sprintIds || []).filter(Boolean))).sort(),
     };
   }
   return out;
@@ -2217,17 +2230,49 @@ export async function listFeatures({ projectId, emergent, search, limit } = {}) 
   // UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel (pas de cache
   // périmable — compatible avec le polling `refreshActive()`).
   const counts = await featureLinkCounts(features.map((f) => f.id));
-  return features.map((f) => ({
-    ...f,
-    links: counts[f.id] || { rules: 0, gherkin: 0, adrs: 0, sprints: 0, tasks: 0, recettes: 0 },
-  }));
+  return features.map((f) => {
+    const c = counts[f.id] || {};
+    return {
+      ...f,
+      // `links` STRICTEMENT inchangé (`{ rules, gherkin, adrs, sprints, tasks, recettes }`) :
+      // ré-extraction explicite pour éviter toute fuite de `sprintIds` dans ce contrat.
+      links: {
+        rules: c.rules || 0,
+        gherkin: c.gherkin || 0,
+        adrs: c.adrs || 0,
+        sprints: c.sprints || 0,
+        tasks: c.tasks || 0,
+        recettes: c.recettes || 0,
+      },
+      // Champ ADDITIF : ids des sprints liés ([] = « Sans sprint »), même requête bulk.
+      sprintIds: c.sprintIds || [],
+    };
+  });
+}
+
+// Normalise/valide l'association EXPLICITE de rôles d'une règle métier :
+// **≥1 rôle OU rôle GLOBAL** (garde unique, partagée création/édition).
+// Trim, dédoublonnage, rejet des chaînes vides ; l'ordre est déterministe.
+function normalizeRuleRoles({ roles, roleGlobal } = {}) {
+  const global = !!roleGlobal;
+  let list = [];
+  if (Array.isArray(roles)) {
+    list = roles.map((x) => (x == null ? "" : String(x).trim())).filter(Boolean);
+  } else if (typeof roles === "string" && roles.trim()) {
+    list = [roles.trim()];
+  }
+  list = Array.from(new Set(list));
+  if (!global && !list.length) {
+    throw new Error("au moins 1 rôle ou roleGlobal=true requis");
+  }
+  return { roles: list, roleGlobal: global };
 }
 
 // CRÉATION d'une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3). Mêmes gardes que
 // `registerFeature` (projet, pièce source, émergence). Non émergente ⇒ lien
 // `sprint_regles` au sprint ouvert. `recetteId` optionnel (T6) → origine
 // `recette` (règle métier apparue en recette).
-export async function registerRule({ projectId, ref, content, sourcedPieceId, recetteId, createdBy } = {}) {
+export async function registerRule({ projectId, ref, content, sourcedPieceId, recetteId, roles, roleGlobal, createdBy } = {}) {
   await ensureSchema();
   if (!projectId || !String(projectId).trim()) throw new Error("projectId requis");
   const pid = String(projectId).trim();
@@ -2249,15 +2294,18 @@ export async function registerRule({ projectId, ref, content, sourcedPieceId, re
   )).rows[0];
   if (dup) throw new Error(`référence déjà utilisée pour le projet ${pid} : ${rf} (${dup.id})`);
 
+  // Association EXPLICITE de rôles : garde « ≥1 rôle OU global » (T-20260922-064200-e0yw).
+  const { roles: roleList, roleGlobal: isGlobal } = normalizeRuleRoles({ roles, roleGlobal });
+
   const em = await classifyEmergence(pid, { kind: "element", fromRecette: !!recetteId });
   const org = (await orgIdOfProject(pid)) || (await defaultOrganizationId());
   const id = `RMET-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const ts = nowIso();
   await pool().query(
     `INSERT INTO regles_metier
-       (id, project, ref, content, sourced_piece_id, emergent, emergent_origin, organization_id, created_at, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-    [id, pid, rf, ct, pieceId, em.emergent ? 1 : 0, em.emergentOrigin, org, ts, createdBy ?? null],
+       (id, project, ref, content, sourced_piece_id, emergent, emergent_origin, roles, role_global, organization_id, created_at, created_by)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [id, pid, rf, ct, pieceId, em.emergent ? 1 : 0, em.emergentOrigin, roleList, isGlobal ? 1 : 0, org, ts, createdBy ?? null],
   );
   if (!em.emergent && em.sprintId) {
     await pool().query(
@@ -2271,7 +2319,7 @@ export async function registerRule({ projectId, ref, content, sourcedPieceId, re
 // MODIFICATION partielle d'une RÈGLE MÉTIER ; re-gardage de la pièce source.
 // Étendue (T-20260921-133134-yz2i) : `implemented`/`implementedOrigin`/
 // `implementedNote` qualifient l'état d'implémentation (même helper unique).
-export async function updateRule({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, by } = {}) {
+export async function updateRule({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, roles, roleGlobal, by } = {}) {
   await ensureSchema();
   if (!ruleId) throw new Error("ruleId requis");
   const cur = (await pool().query("SELECT * FROM regles_metier WHERE id = $1", [String(ruleId)])).rows[0];
@@ -2304,6 +2352,15 @@ export async function updateRule({ ruleId, ref, content, sourcedPieceId, impleme
       await assertPieceOwnedByProject(id, cur.project);
       params.push(id); sets.push(`sourced_piece_id = $${params.length}`);
     }
+  }
+  if (roles !== undefined || roleGlobal !== undefined) {
+    // État EFFECTIF en update PARTIEL : champ non fourni ⇒ valeur courante
+    // conservée, puis garde « ≥1 rôle OU global » (T-20260922-064200-e0yw).
+    const effRoles = roles !== undefined ? roles : cur.roles;
+    const effGlobal = roleGlobal !== undefined ? !!roleGlobal : !!cur.role_global;
+    const { roles: roleList, roleGlobal: isGlobal } = normalizeRuleRoles({ roles: effRoles, roleGlobal: effGlobal });
+    params.push(roleList); sets.push(`roles = $${params.length}`);
+    params.push(isGlobal ? 1 : 0); sets.push(`role_global = $${params.length}`);
   }
   if (!sets.length) {
     if (hasImplFields) {
@@ -2398,18 +2455,19 @@ export async function listRules({ projectId, emergent, search, limit } = {}) {
     `SELECT * FROM regles_metier WHERE ${where} ORDER BY ref ASC, created_at ASC LIMIT $${params.length}`, params,
   )).rows;
   const rules = rows.map(rowToRegle);
-  // Compteurs de liens + rôles dérivés portés par la liste (⇒ 0 appel réseau côté
-  // panneau) : UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel.
+  // Compteurs de liens + ids de sprints liés portés par la liste (⇒ 0 appel réseau
+  // côté panneau) : UNE requête bulk, jamais de N+1. Recalculés à CHAQUE appel.
+  // `roles`/`roleGlobal` proviennent de la ligne (`rowToRegle`) — plus de dérivation.
   const counts = await ruleLinkCounts(rules.map((r) => r.id));
   return rules.map((r) => {
-    const c = counts[r.id] || { features: 0, sprints: 0, roles: [] };
+    const c = counts[r.id] || { features: 0, sprints: 0, sprintIds: [] };
     return {
       ...r,
       // `links` STRICTEMENT inchangé (`{ features, sprints }`) : ré-extraction
-      // explicite pour éviter toute fuite de `roles` dans ce contrat existant.
+      // explicite pour éviter toute fuite dans ce contrat existant.
       links: { features: c.features, sprints: c.sprints },
-      // Champ ADDITIF : rôles distincts des fonctionnalités liées ([] = « Sans rôle »).
-      roles: c.roles || [],
+      // Champ ADDITIF : ids des sprints liés ([] = « Sans sprint »).
+      sprintIds: c.sprintIds || [],
     };
   });
 }

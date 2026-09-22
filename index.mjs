@@ -990,7 +990,7 @@ server.registerTool("feature_get", {
 });
 
 server.registerTool("feature_list", {
-  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote` ET le champ additif `links` (compteurs de liens `{rules,gherkin,adrs,sprints,tasks,recettes}`, calculés en UNE requête bulk — plus de N+1 côté panneau). Retourne `{ count, features }`.",
+  description: "LISTE les fonctionnalités d'un projet (tri `ref`). Filtres : `emergent` (booléen), `search` (ref/user_story), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`, le champ additif `links` (compteurs de liens `{rules,gherkin,adrs,sprints,tasks,recettes}`, calculés en UNE requête bulk — plus de N+1 côté panneau) ET le champ additif `sprintIds` (ids des sprints liés via `sprint_fonctionnalites` ; `[]` = « Sans sprint »), issu de la MÊME requête bulk. Retourne `{ count, features }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les fonctionnalités."),
     emergent: z.boolean().optional().describe("Filtre émergence."),
@@ -1020,37 +1020,41 @@ server.registerTool("feature_delete", {
 });
 
 server.registerTool("rule_register", {
-  description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
+  description: "CRÉE une RÈGLE MÉTIER (`RM-xxxx`, ADR-001 §3) : `projectId` + `ref` + `content` requis ; `sourcedPieceId` optionnelle GARDÉE. Association EXPLICITE de rôles OBLIGATOIRE : `roles` (1..N) OU `roleGlobal=true` (s'applique à TOUS les rôles) — sinon l'appel est REFUSÉ. Mêmes règles d'ÉMERGENCE que `feature_register` (sprint ouvert → rattachement `sprint_regles`). `ref` dupliquée → erreur. Retourne le détail (liens inclus).",
   inputSchema: {
     projectId: z.string().describe("Projet de la règle."),
     ref: z.string().describe("Référence de la règle (ex. RM-xxxx)."),
     content: z.string().describe("Contenu de la règle métier."),
     sourcedPieceId: z.string().optional().describe("pieceId de la pièce client SOURCE (optionnel, gardé)."),
     recetteId: z.string().optional().describe("Recette d'origine (optionnel, T6) — marque la règle émergente d'origine `recette`."),
+    roles: z.array(z.string()).optional().describe("Rôles EXPLICITES associés (1..N). Requis si `roleGlobal` n'est pas vrai."),
+    roleGlobal: z.boolean().optional().describe("true = la règle s'applique à TOUS les rôles (dispense de `roles`)."),
     createdBy: z.string().optional().describe("Acteur créateur."),
   },
-}, async ({ projectId, ref, content, sourcedPieceId, recetteId, createdBy }) => {
+}, async ({ projectId, ref, content, sourcedPieceId, recetteId, roles, roleGlobal, createdBy }) => {
   try {
-    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, recetteId, createdBy });
+    const rule = await registerRule({ projectId, ref, content, sourcedPieceId, recetteId, roles, roleGlobal, createdBy });
     return text(JSON.stringify({ ok: true, rule }, null, 2));
   } catch (e) { return err(e.message); }
 });
 
 server.registerTool("rule_update", {
-  description: "MODIFIE partiellement une RÈGLE MÉTIER (champs fournis uniquement) : `ref`, `content`, `sourcedPieceId` (re-gardée), et l'ÉTAT D'IMPLÉMENTATION `implemented`/`implementedOrigin`/`implementedNote`. `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `updated_at` posé. L'émergence reste un axe distinct. Retourne le détail.",
+  description: "MODIFIE partiellement une RÈGLE MÉTIER (champs fournis uniquement) : `ref`, `content`, `sourcedPieceId` (re-gardée), l'ASSOCIATION DE RÔLES `roles` (1..N) / `roleGlobal` (tous les rôles), et l'ÉTAT D'IMPLÉMENTATION `implemented`/`implementedOrigin`/`implementedNote`. Pour l'association, l'état EFFECTIF est évalué (champ non fourni ⇒ valeur courante) puis la garde « ≥1 rôle OU global » s'applique. `implementedOrigin` fourni ⇒ `implemented` forcé à 1 (origine ∈ ecosystem | hors_ecosystem) ; `implemented=false` ⇒ reset de la traçabilité. `updated_at` posé. L'émergence reste un axe distinct. Retourne le détail.",
   inputSchema: {
     ruleId: z.string().describe("Identifiant de la règle (RMET-<ts>-<rand>)."),
     ref: z.string().optional().describe("Nouvelle référence (RM-xxxx)."),
     content: z.string().optional().describe("Nouveau contenu."),
     sourcedPieceId: z.string().optional().describe("Nouvelle pièce source (gardée) ; vide pour détacher."),
+    roles: z.array(z.string()).optional().describe("Rôles EXPLICITES (1..N). Remplace l'association ; `[]` autorisé si `roleGlobal` effectif est vrai."),
+    roleGlobal: z.boolean().optional().describe("true = s'applique à TOUS les rôles (dispense de `roles`)."),
     implemented: z.boolean().optional().describe("État d'implémentation explicite (true/false) ; false ⇒ reset de l'origine et de la traçabilité."),
     implementedOrigin: z.enum(["ecosystem", "hors_ecosystem"]).optional().describe("Origine de l'implémentation — ecosystem | hors_ecosystem. Fournie ⇒ implémentée."),
     implementedNote: z.string().optional().describe("Motif/note libre de la qualification."),
     by: z.string().optional().describe("Acteur de la modification."),
   },
-}, async ({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, by }) => {
+}, async ({ ruleId, ref, content, sourcedPieceId, roles, roleGlobal, implemented, implementedOrigin, implementedNote, by }) => {
   try {
-    const rule = await updateRule({ ruleId, ref, content, sourcedPieceId, implemented, implementedOrigin, implementedNote, by });
+    const rule = await updateRule({ ruleId, ref, content, sourcedPieceId, roles, roleGlobal, implemented, implementedOrigin, implementedNote, by });
     return text(JSON.stringify({ ok: true, rule }, null, 2));
   } catch (e) { return err(e.message); }
 });
@@ -1071,7 +1075,7 @@ server.registerTool("rule_mark_implemented", {
 });
 
 server.registerTool("rule_get", {
-  description: "DÉTAIL d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse), sprints. Expose l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. `err` si inconnue.",
+  description: "DÉTAIL d'une RÈGLE MÉTIER + liens : fonctionnalités (inverse), sprints. Expose l'ASSOCIATION EXPLICITE de rôles `roles` (1..N) / `roleGlobal` (true = tous les rôles) — plus de dérivation depuis les fonctionnalités liées — et l'état d'implémentation `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`. `err` si inconnue.",
   inputSchema: { ruleId: z.string().describe("Identifiant de la règle.") },
 }, async ({ ruleId }) => {
   try {
@@ -1082,7 +1086,7 @@ server.registerTool("rule_get", {
 });
 
 server.registerTool("rule_list", {
-  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`, le champ additif `links` (compteurs de liens `{features,sprints}`, calculés en UNE requête bulk — plus de N+1 côté panneau) ET le champ additif `roles` (tableau des rôles DISTINCTS des fonctionnalités liées via `fonctionnalite_regles` ; `[]` = aucune fonctionnalité liée ou rôles vides ⇒ « Sans rôle »). `links` et `roles` proviennent de la MÊME requête bulk (0 N+1). Retourne `{ count, rules }`.",
+  description: "LISTE les règles métier d'un projet (tri `ref`). Filtres : `emergent`, `search` (ref/content), `limit` (défaut 500). Chaque élément expose `implemented`/`implementedOrigin`/`implementedAt`/`implementedBy`/`implementedNote`, le champ additif `links` (compteurs de liens `{features,sprints}`, calculés en UNE requête bulk — plus de N+1 côté panneau), le champ additif `sprintIds` (ids des sprints liés via `sprint_regles` ; `[]` = « Sans sprint ») ET l'ASSOCIATION EXPLICITE de rôles `roles` (1..N) / `roleGlobal` (true = tous les rôles), lue sur la règle (plus de dérivation depuis les fonctionnalités liées). `links`/`sprintIds` proviennent de la MÊME requête bulk (0 N+1). Retourne `{ count, rules }`.",
   inputSchema: {
     projectId: z.string().describe("Projet dont on liste les règles."),
     emergent: z.boolean().optional().describe("Filtre émergence."),

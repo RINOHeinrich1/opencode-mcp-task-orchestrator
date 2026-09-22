@@ -731,6 +731,8 @@ CREATE TABLE IF NOT EXISTS regles_metier (
   implemented_at   TEXT,
   implemented_by   TEXT,
   implemented_note TEXT,
+  roles            TEXT[] NOT NULL DEFAULT '{}',   -- association EXPLICITE de rôles (1..N) — T-20260922-064200-e0yw
+  role_global      INTEGER NOT NULL DEFAULT 0,     -- 1 = s'applique à TOUS les rôles (dispense de `roles`)
   organization_id  TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT,
@@ -744,6 +746,9 @@ ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_origin TEXT;
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_at TEXT;
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_by TEXT;
 ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS implemented_note TEXT;
+-- Association EXPLICITE de rôles (1..N) ou rôle GLOBAL — miroir idempotent de migrate().
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS roles TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE regles_metier ADD COLUMN IF NOT EXISTS role_global INTEGER NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS sprints (
   id              TEXT PRIMARY KEY,                -- SPRINT-<ts>-<rand>
