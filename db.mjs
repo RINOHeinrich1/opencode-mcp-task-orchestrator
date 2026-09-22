@@ -4648,8 +4648,24 @@ export const TASK_DOC_TYPES = ["plan", "task_synthese", "task_report", "audit_re
 export const RECETTE_DOC_TYPES = ["recette_report", "recette_doc"];
 // Pièces jointes d'une ÉVALUATION (recette évaluateur) — artefacts
 // `doc_type='evaluation_doc'`, `content_id` = evaluationId. Famille ISOLÉE des
-// pièces client (la garde photo/vidéo des pièces client ne s'applique pas ici).
+// pièces client : sa garde CIBLÉE est `assertEvaluationDocAllowed` (voir plus
+// bas), qui ADMET explicitement les PHOTOS et VIDÉOS (preuves visuelles de
+// l'évaluateur). La garde photo/vidéo des pièces client (`assertPieceAllowed`)
+// ne s'applique PAS ici.
 export const EVALUATION_DOC_TYPES = ["evaluation_doc"];
+// Natures ADMISES d'une pièce d'ÉVALUATION (recette évaluateur, ADR-003) :
+// lien | document | photo | video. DISTINCTE de `PIECE_NATURES` (pièces client
+// de sprint) : les PHOTOS et VIDÉOS y sont ADMISES — l'évaluateur joint des
+// preuves visuelles (captures, photos, vidéos de parcours) à ses éléments.
+export const EVALUATION_DOC_NATURES = ["lien", "document", "photo", "video"];
+// Extension de fichier → nature d'évaluation. Les extensions photo/vidéo sont
+// résolues EXPLICITEMENT (au lieu d'être refusées comme pour les pièces client).
+export const EVALUATION_DOC_NATURE_BY_EXT = {
+  ".md": "document", ".markdown": "document", ".pdf": "document", ".docx": "document",
+  ".jpg": "photo", ".jpeg": "photo", ".png": "photo", ".gif": "photo", ".webp": "photo",
+  ".heic": "photo", ".bmp": "photo", ".tiff": "photo",
+  ".mp4": "video", ".mov": "video", ".avi": "video", ".mkv": "video", ".webm": "video", ".m4v": "video",
+};
 // Nature d'un artefact (`kind`) — distincte de `doc_type`.
 export const ARTIFACT_KINDS = ["plan", "audit", "report", "autre"];
 // Domaine d'origine d'un artefact (`source`).
@@ -6911,6 +6927,10 @@ export async function addEvaluationDocument({ evaluationId, title, nature, sourc
   await ensureSchema();
   const ev = (await pool().query("SELECT evaluation_id FROM evaluations WHERE evaluation_id = $1", [evaluationId])).rows[0];
   if (!ev) throw new Error(`évaluation inconnue : ${evaluationId}`);
+  // GARDE CIBLÉE : valide la nature d'une pièce d'ÉVALUATION (photos/vidéos
+  // ADMISES) et retourne la nature RÉSOLUE. La garde des pièces client
+  // (`assertPieceAllowed`) ne s'applique PAS à cette famille.
+  const resolvedNature = assertEvaluationDocAllowed({ nature, path });
   const id = `ART-EVAL-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const meta = {
     ...(artifactId ? { artifactId } : {}),
@@ -6919,7 +6939,7 @@ export async function addEvaluationDocument({ evaluationId, title, nature, sourc
   await pool().query(
     `INSERT INTO artifacts (artifact_id, doc_type, content_id, kind, title, nature, source, path, meta, created_at)
      VALUES ($1,'evaluation_doc',$2,'autre',$3,$4,$5,$6,$7,$8)`,
-    [id, String(evaluationId), title ?? null, nature ?? null, source || "import", path ?? null,
+    [id, String(evaluationId), title ?? null, resolvedNature, source || "import", path ?? null,
      Object.keys(meta).length ? meta : null, nowIso()],
   );
   return listEvaluationDocuments(evaluationId);
@@ -8066,6 +8086,41 @@ export function assertPieceAllowed({ nature, path, url, filename } = {}) {
     if (!u) throw new Error("nature 'lien' exige une URL publique (url)");
   } else if (!p && !f) {
     throw new Error(`nature '${nat}' exige un fichier (path ou filename)`);
+  }
+  return nat;
+}
+
+// GARDE CIBLÉE des natures de PIÈCE D'ÉVALUATION (recette évaluateur, ADR-003).
+// DIFFÉRENCE CLÉ avec `assertPieceAllowed` (pièces client de sprint) : elle
+// ADMET explicitement les PHOTOS et VIDÉOS, à l'import de fichier COMME pour un
+// lien externe. AUCUN refus d'extension photo/vidéo ni d'hôte vidéo n'est
+// appliqué ici — l'évaluateur joint des preuves visuelles à ses éléments.
+// Elle VALIDE seulement que la nature résolue ∈ `EVALUATION_DOC_NATURES` et
+// retourne cette nature RÉSOLUE (persistée par `addEvaluationDocument`).
+// Résolution : URL → 'lien' ; sinon nature explicite ; sinon extension
+// (`EVALUATION_DOC_NATURE_BY_EXT`, repli 'document' si localisation présente).
+// Tolérance legacy : ni nature ni localisation → `null` (rien à qualifier).
+export function assertEvaluationDocAllowed({ nature, path, url, filename } = {}) {
+  const p = path ? String(path).trim() : null;
+  const u = url ? String(url).trim() : null;
+  const f = filename ? String(filename).trim() : null;
+
+  let nat = nature ? String(nature).trim() : "";
+  if (!nat) {
+    if (u) {
+      nat = "lien";
+    } else {
+      nat = EVALUATION_DOC_NATURE_BY_EXT[pieceExtOf(f || p)] || "";
+      if (!nat) {
+        if (!p && !f) return null; // legacy : pièce sans nature ni localisation
+        nat = "document";
+      }
+    }
+  }
+  if (!EVALUATION_DOC_NATURES.includes(nat)) {
+    throw new Error(
+      `nature de pièce d'évaluation invalide : ${nature || "(absente)"} (attendu : ${EVALUATION_DOC_NATURES.join(" | ")})`,
+    );
   }
   return nat;
 }

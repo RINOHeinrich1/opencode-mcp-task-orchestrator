@@ -137,6 +137,7 @@ import {
   DOC_ATTACHMENT_SOURCES,
   DOC_TYPES,
   PIECE_NATURES,
+  EVALUATION_DOC_NATURES,
   addPiece,
   listPieces,
   requalifyDocsAsPieces,
@@ -2689,11 +2690,11 @@ server.registerTool("evaluation_verdict_set", {
 });
 
 server.registerTool("evaluation_doc_add", {
-  description: "Rattache une PIÈCE à une évaluation (lien / document / photo / vidéo) : `nature` libre + `source` (import d'un chemin, ou artifact existant) + `path`/`artifactId`. `itemId` optionnel rattache la pièce à un ÉLÉMENT précis (sinon pièce au niveau de l'évaluation). Famille isolée (`doc_type='evaluation_doc'`).",
+  description: "Rattache une PIÈCE à une évaluation (recette évaluateur) : `nature` (lien | document | photo | video) + `source` (import d'un chemin, ou artifact existant) + `path`/`artifactId`. Les PHOTOS et VIDÉOS sont ADMISES (preuves visuelles : captures, photos, vidéos de parcours) — la garde photo/vidéo des pièces CLIENT de sprint ne s'applique PAS à cette famille. `itemId` optionnel rattache la pièce à un ÉLÉMENT précis (sinon pièce au niveau de l'évaluation). Famille isolée (`doc_type='evaluation_doc'`), validée par la garde ciblée `assertEvaluationDocAllowed`.",
   inputSchema: {
     evaluationId: z.string(),
     title: z.string().optional(),
-    nature: z.string().optional().describe("Nature : lien | document | photo | video."),
+    nature: z.enum(EVALUATION_DOC_NATURES).optional().describe("Nature : lien | document | photo | video (déduite de l'extension si absente ; 'lien' si l'URL est passée en path). PHOTOS et VIDÉOS admises."),
     source: z.enum(["import", "artifact"]).default("import"),
     path: z.string().optional().describe("Chemin / URL de la pièce (mode import)."),
     artifactId: z.string().optional().describe("Artefact existant à lier (mode artifact)."),
