@@ -30,7 +30,7 @@ function pool() {
 // `schema_meta.schema_version` en base est à jour. L'idempotence reste
 // préservée : toute version différente ⇒ rejeu complet (toutes les DDL sont
 // `IF NOT EXISTS`), sous verrou advisory.
-const SCHEMA_VERSION = "2026-09-22-nomenclature-cadrage-recette";
+const SCHEMA_VERSION = "2026-09-23-decisions-carrier";
 // Clé arbitraire du verrou advisory PostgreSQL sérialisant l'apply du schéma
 // entre process concurrents (session-level, libéré dans le `finally`).
 const SCHEMA_LOCK_KEY = 918273645;
@@ -114,6 +114,15 @@ async function ensureSchema() {
 // Migrations idempotentes (colonnes ajoutées après coup).
 async function migrate() {
   await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS plan_id TEXT");
+  // ADR-007 volet 1 — décision de permission INDÉPENDANTE d'une tâche :
+  //  - `task_id` devient NULLABLE (même mécanisme que `artifacts.task_id`) ;
+  //  - `carrier_type`/`carrier_id` portent l'entité rattachée (recette/cadrage/
+  //    e2e_test/migration/sprint/batch) quand il n'y a pas de tâche.
+  // Levée de contrainte (PAS un DROP de colonne) + ajout idempotent + index.
+  await pool().query("ALTER TABLE decisions ALTER COLUMN task_id DROP NOT NULL");
+  await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS carrier_type TEXT");
+  await pool().query("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS carrier_id TEXT");
+  await pool().query("CREATE INDEX IF NOT EXISTS idx_decisions_carrier ON decisions(carrier_type, carrier_id)");
   await pool().query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS audit_target TEXT");
   await pool().query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS main_branch TEXT");
   // Phase 3 — interleaving fin : fichiers par étape de plan (déclarés).
@@ -4062,6 +4071,39 @@ export async function findTaskBySessionChain(sessionId) {
   return null;
 }
 
+// Entités PORTEUSES d'une session non-task (ADR-007 volet 1) : tables du
+// registre portant une colonne `session_id`. L'ORDRE définit la priorité de
+// résolution (une session dédiée est en pratique rattachée à une seule entité).
+const DECISION_CARRIER_SOURCES = [
+  { type: "recette", table: "recettes", idCol: "recette_id", orderCol: "created_at" },
+  { type: "cadrage", table: "cadrages", idCol: "cadrage_id", orderCol: "created_at" },
+  { type: "e2e_test", table: "e2e_tests", idCol: "id", orderCol: "updated_at" },
+  { type: "migration", table: "migrations", idCol: "migration_id", orderCol: "created_at" },
+  { type: "sprint", table: "sprints", idCol: "id", orderCol: "created_at" },
+  { type: "batch", table: "batches", idCol: "id", orderCol: "created_at" },
+];
+
+// Résout l'ENTITÉ PORTEUSE d'une session NON-task (recette, cadrage, test-agent,
+// migration, sprint, batch). Retourne `{ type, id }` ou `null` si aucune entité
+// connue ne porte cette session (session libre). Permet de tracer une décision
+// de permission hors tâche (ADR-007 volet 1).
+export async function findCarrierBySession(sessionId) {
+  if (!sessionId) return null;
+  await ensureSchema();
+  for (const src of DECISION_CARRIER_SOURCES) {
+    try {
+      const res = await pool().query(
+        `SELECT ${src.idCol} AS id FROM ${src.table} WHERE session_id = $1 ORDER BY ${src.orderCol} DESC LIMIT 1`,
+        [sessionId],
+      );
+      if (res.rows[0]) return { type: src.type, id: res.rows[0].id };
+    } catch {
+      /* table/colonne absente (base partielle) → on tente la suivante */
+    }
+  }
+  return null;
+}
+
 export async function listTasks(filter = {}) {
   await ensureSchema();
   let res;
@@ -4402,8 +4444,11 @@ export async function findPlanTask(planId) {
 }
 
 // --- Décisions humaines ---------------------------------------------------
-export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, detail, permissionId, requestedBy, sessionId, planId }) {
-  await assertTaskExists(taskId);
+export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, detail, permissionId, requestedBy, sessionId, planId, carrierType, carrierId }) {
+  // Décision RATTACHÉE À UNE TÂCHE (comportement historique) ou HORS TÂCHE
+  // (ADR-007 volet 1 : permission d'une session recette/cadrage/test/migration/
+  // sprint/batch/session libre). `taskId` null/absent ⇒ pas de garde de tâche.
+  if (taskId) await assertTaskExists(taskId);
   // Dédoublonnage : une même permission (même permission_id) → une seule décision.
   if (permissionId) {
     const existing = await pool().query(
@@ -4412,12 +4457,18 @@ export async function requestDecision({ taskId, kind, expiresAt, ttlMinutes, det
     );
     if (existing.rows[0]) return rowToDecision(existing.rows[0]);
   }
-  const decisionId = `DEC-${taskId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  // Entité porteuse : fournie explicitement, sinon résolue depuis l'origine de
+  // session (recette/cadrage/test/migration/sprint/batch).
+  let carrier = carrierType && carrierId ? { type: carrierType, id: carrierId } : null;
+  if (!carrier && sessionId) carrier = await findCarrierBySession(sessionId);
+  // Identifiant robuste même sans tâche (préfixe = tâche, entité porteuse, session ou générique).
+  const scope = taskId || carrier?.id || (sessionId ? `ses-${String(sessionId).slice(0, 12)}` : "hors-tache");
+  const decisionId = `DEC-${scope}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
   const expires = expiresAt || (ttlMinutes ? new Date(Date.now() + ttlMinutes * 60 * 1000).toISOString() : null);
   await pool().query(
-    `INSERT INTO decisions (decision_id, task_id, kind, status, requested_at, requested_by, session_id, expires_at, detail, permission_id, plan_id)
-     VALUES ($1,$2,$3,'awaiting',$4,$5,$6,$7,$8,$9,$10)`,
-    [decisionId, taskId, kind, nowIso(), requestedBy ?? null, sessionId ?? null, expires, detail ?? null, permissionId ?? null, planId ?? null],
+    `INSERT INTO decisions (decision_id, task_id, kind, status, requested_at, requested_by, session_id, expires_at, detail, permission_id, plan_id, carrier_type, carrier_id)
+     VALUES ($1,$2,$3,'awaiting',$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [decisionId, taskId ?? null, kind, nowIso(), requestedBy ?? null, sessionId ?? null, expires, detail ?? null, permissionId ?? null, planId ?? null, carrier?.type ?? null, carrier?.id ?? null],
   );
   return getDecision(decisionId);
 }
@@ -4460,6 +4511,8 @@ function rowToDecision(r) {
     detail: r.detail,
     permissionId: r.permission_id,
     planId: r.plan_id,
+    carrierType: r.carrier_type ?? null,
+    carrierId: r.carrier_id ?? null,
   };
 }
 

@@ -286,7 +286,7 @@ CREATE INDEX IF NOT EXISTS idx_deployments_task ON deployments(task_id);
 CREATE TABLE IF NOT EXISTS decisions (
   id             INTEGER GENERATED ALWAYS AS IDENTITY, -- ordre d'insertion (ex-rowid)
   decision_id    TEXT PRIMARY KEY,
-  task_id        TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  task_id        TEXT REFERENCES tasks(id) ON DELETE CASCADE, -- NULLABLE : décision hors tâche (ADR-007 volet 1)
   kind           TEXT NOT NULL DEFAULT 'validation',  -- validation | review | permission | cadrage
   status         TEXT NOT NULL DEFAULT 'awaiting',    -- awaiting | approved | rejected | expired
   requested_at   TEXT NOT NULL,
@@ -298,9 +298,17 @@ CREATE TABLE IF NOT EXISTS decisions (
   resolution     TEXT,
   detail         TEXT,
   permission_id  TEXT,
-  plan_id        TEXT
+  plan_id        TEXT,
+  carrier_type   TEXT,                          -- entité porteuse hors tâche : recette | cadrage | e2e_test | migration | sprint | batch
+  carrier_id     TEXT                           -- identifiant de l'entité porteuse (recette_id, cadrage_id, id…)
 );
+-- Évolution idempotente (bases EXISTANTES, le CREATE TABLE IF NOT EXISTS est
+-- neutre) : colonnes de l'ENTITÉ PORTEUSE (ADR-007 volet 1). Requises avant
+-- l'index ci-dessous.
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS carrier_type TEXT;
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS carrier_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_decisions_task ON decisions(task_id);
+CREATE INDEX IF NOT EXISTS idx_decisions_carrier ON decisions(carrier_type, carrier_id);
 
 -- Participants d'une tâche (agents enregistrés comme participants).
 CREATE TABLE IF NOT EXISTS participants (
