@@ -3,7 +3,7 @@
 // journal append-only (events).
 import pg from "pg";
 import Database from "better-sqlite3"; // lecture seule d'opencode.db (chaîne de sessions)
-import { readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join, dirname, basename, normalize } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -3997,26 +3997,67 @@ export async function findTaskBySession(sessionId) {
   return rowToTask(res.rows[0]);
 }
 
+// Résout, pour l'instance opencode EFFECTIVE, les chemins candidats de sa base
+// SQLite de sessions, par ordre de PRIORITÉ :
+//   1. OPENCODE_DB — injection explicite dans l'unité opencode@<user> ;
+//   2. $XDG_DATA_HOME/opencode/opencode.db — base de l'instance dédiée (posé
+//      par opencode-user-provision.mjs et l'EnvironmentFile de l'unité) ;
+//   3. ~/.local/share/opencode/opencode.db — repli historique (instance
+//      principale, quand aucun OPENCODE_DB ni XDG_DATA_HOME n'est positionné).
+// Les entrées non définies (ou vides) sont omises et la liste est DÉDUPLIQUÉE
+// en conservant l'ordre : le PREMIER chemin fournissant une tâche gagne.
+export function opencodeDbPathCandidates() {
+  const candidates = [
+    process.env.OPENCODE_DB,
+    process.env.XDG_DATA_HOME
+      ? join(process.env.XDG_DATA_HOME, "opencode", "opencode.db")
+      : undefined,
+    join(homedir(), ".local", "share", "opencode", "opencode.db"),
+  ];
+  const seen = new Set();
+  const out = [];
+  for (const c of candidates) {
+    if (typeof c !== "string" || c.length === 0) continue;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    out.push(c);
+  }
+  return out;
+}
+
 // Remonte la chaîne parent (sous-agent → … → orchestrateur) jusqu'à trouver la
 // tâche liée à l'une des sessions de la chaîne. Permet de rattacher une demande
 // de permission émise par un sous-agent à la tâche de l'orchestrateur.
+//
+// La chaîne est remontée dans la base opencode de l'instance EFFECTIVE
+// (XDG_DATA_HOME) puis, à défaut, dans celle de l'instance principale
+// (opencodeDbPathCandidates()). Chaque candidat est tenté isolément : un
+// chemin absent ou illisible n'empêche pas les suivants (non-régression).
 export async function findTaskBySessionChain(sessionId) {
   if (!sessionId) return null;
   const direct = await findTaskBySession(sessionId);
   if (direct) return direct;
-  try {
-    const path = process.env.OPENCODE_DB || join(homedir(), ".local", "share", "opencode", "opencode.db");
-    const db = new Database(path, { readonly: true });
-    let cur = sessionId;
-    for (let i = 0; i < 12; i++) {
-      const row = db.prepare("SELECT parent_id FROM session WHERE id = ?").get(cur);
-      if (!row || !row.parent_id) break;
-      cur = row.parent_id;
-      const t = await findTaskBySession(cur);
-      if (t) return t;
+  for (const path of opencodeDbPathCandidates().filter((p) => existsSync(p))) {
+    let db;
+    try {
+      db = new Database(path, { readonly: true });
+      let cur = sessionId;
+      for (let i = 0; i < 12; i++) {
+        const row = db.prepare("SELECT parent_id FROM session WHERE id = ?").get(cur);
+        if (!row || !row.parent_id) break;
+        cur = row.parent_id;
+        const t = await findTaskBySession(cur);
+        if (t) return t;
+      }
+    } catch {
+      /* base opencode illisible → on tente le candidat suivant */
+    } finally {
+      try {
+        db?.close();
+      } catch {
+        /* fermeture best-effort */
+      }
     }
-  } catch {
-    /* base opencode illisible → on reste sur null */
   }
   return null;
 }
